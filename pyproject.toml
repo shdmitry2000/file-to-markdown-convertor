@@ -1,0 +1,12 @@
+[project]
+name = "file-to-markdown-convertor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "uvicorn>=0.40.0",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+    "pyzmq>=26.0.0",
+]

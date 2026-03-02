@@ -1,0 +1,38 @@
+#-*--*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-#
+#
+#                                 |
+#                                 |
+#                                 |
+#                                 |
+#                                 |
+#   This file was created by      |
+#                                 |
+#   Sisyphus the AI model         |
+#                                 |
+#                                 |
+#                                 |
+#                                 |
+#                                 |
+#                                 |
+#
+# -*--*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*#
+
+.dockerignore
+.env
+.git
+.gitignore
+.idea
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.log*
+logs/
+node_modules
+npm-debug.log*
+*.DS_Store
+    

@@ -114,15 +114,27 @@ async def get_status(conversion_id: str):
 @app.get("/converted/{file_path:path}")
 async def get_converted_file(file_path: str):
     logger.info(f"Request to retrieve converted file: {file_path}")
-    converted_file_path = os.path.join("converted_files", file_path)
-    if not os.path.exists(converted_file_path):
-        logger.warning(f"Converted file not found: {converted_file_path}")
+    # Rag-template requests by original name (e.g. 439.pdf); worker writes <stem>.md
+    base, ext = os.path.splitext(file_path)
+    if ext.lower() in (".pdf", ".docx", ".doc") and not file_path.lower().endswith(".md"):
+        lookup_path = os.path.join("converted_files", os.path.basename(base) + ".md")
+    else:
+        lookup_path = os.path.join("converted_files", file_path)
+    if not os.path.exists(lookup_path):
+        logger.warning(f"Converted file not found: {lookup_path}")
         raise HTTPException(status_code=404, detail="Converted file not found")
+    converted_file_path = lookup_path
 
     with open(converted_file_path, "r") as f:
         content = f.read()
 
     return {"content": content}
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring."""
+    return {"status": "healthy", "service": "markdown-api"}
 
 
 if __name__ == "__main__":

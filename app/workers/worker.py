@@ -2,6 +2,7 @@ import zmq
 import json
 import os
 import time
+from pathlib import Path
 from docling.document_converter import DocumentConverter
 import frontmatter
 from datetime import datetime
@@ -28,10 +29,10 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
     )
 
     try:
-        # Create the output directory structure
-        relative_path = os.path.relpath(file_path, "files_to_convert")
-        converted_dir = os.path.join("converted_files", os.path.dirname(relative_path))
-        os.makedirs(converted_dir, exist_ok=True)
+        # Write to converted_files/<stem>.md so API can find via GET /converted/<original_name>
+        os.makedirs("converted_files", exist_ok=True)
+        stem = Path(file_path).stem
+        converted_file_path = os.path.join("converted_files", f"{stem}.md")
 
         # Convert the file
         converter = DocumentConverter()
@@ -53,9 +54,6 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
         post.metadata = metadata
 
         # Save the converted file with metadata header
-        base_name = os.path.basename(file_path)
-        file_name, _ = os.path.splitext(base_name)
-        converted_file_path = os.path.join(converted_dir, f"{file_name}.md")
 
         with open(converted_file_path, "w") as f:
             f.write(frontmatter.dumps(post))
@@ -78,11 +76,19 @@ def main():
     """
     parser = argparse.ArgumentParser(description="ZeroMQ worker for file conversion.")
     parser.add_argument(
-        "--host", type=str, default="api", help="The host of the ZeroMQ server."
+        "--host", type=str, default=None, help="The host of the ZeroMQ server."
     )
     args = parser.parse_args()
-    host = args.host
-    logger.info(f"Connecting to ZeroMQ host: {host}")
+    
+    # Auto-detect environment: use 'api' for Docker, 'localhost' for standalone
+    if args.host:
+        host = args.host
+    else:
+        # Check if running in Docker by looking for /.dockerenv or checking hostname
+        is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER', '').lower() == 'true'
+        host = "api" if is_docker else "localhost"
+    
+    logger.info(f"Connecting to ZeroMQ host: {host} (Docker mode: {host == 'api'})")
 
     context = zmq.Context()
 

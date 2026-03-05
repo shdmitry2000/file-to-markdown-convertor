@@ -38,6 +38,11 @@ RUN uv pip install --no-cache-dir \
 # This stage creates the final, small, production-ready image.
 FROM python:3.12-slim
 
+# Install curl for health checks
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
 # Create a non-root user for better security
 RUN useradd --create-home appuser
 USER appuser

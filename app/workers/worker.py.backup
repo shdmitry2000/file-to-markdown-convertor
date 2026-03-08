@@ -1,0 +1,172 @@
+import zmq
+import json
+import os
+import time
+from pathlib import Path
+from docling.document_converter import DocumentConverter
+import frontmatter
+from datetime import datetime
+import logging
+import argparse
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+def _resolve_file_path(file_path: str) -> str:
+    """Resolve file path for different environments.
+    
+    In standalone mode:
+        - Receives: /Users/.../data/projects/test/raw/439.pdf (actual path)
+        - Returns: /Users/.../data/projects/test/raw/439.pdf (unchanged)
+    
+    In Docker/K8s:
+        - Receives: /app/data/projects/test/raw/439.pdf (rag-template container path)
+        - PROJECTS_BASE_PATH=/app/projects (markdown-api mount point)
+        - Translates to: /app/projects/test/raw/439.pdf
+    
+    The translation remaps the projects base directory to match local mount.
+    """
+    # Get the projects base path for this environment
+    # K8s: /app/projects, Standalone: actual filesystem path
+    projects_base = os.getenv("PROJECTS_BASE_PATH", "")
+    
+    # If file already exists as-is, use it (standalone mode with correct paths)
+    if os.path.exists(file_path):
+        return file_path
+    
+    # Try path translation for Docker/K8s mode
+    # Common patterns to translate:
+    # /app/data/projects/... → PROJECTS_BASE_PATH/...
+    # /app/projects/... → PROJECTS_BASE_PATH/...
+    if projects_base:
+        for container_prefix in ["/app/data/projects", "/app/projects"]:
+            if file_path.startswith(container_prefix):
+                # Extract the relative part after the container prefix
+                relative_part = file_path[len(container_prefix):].lstrip("/")
+                translated_path = os.path.join(projects_base, relative_part)
+                if os.path.exists(translated_path):
+                    logger.info(f"Path translated: {file_path} -> {translated_path}")
+                    return translated_path
+    
+    # Return original path if no translation worked
+    return file_path
+
+
+def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_socket):
+    """
+    Converts a file to markdown and sends status updates back to the API.
+    
+    Handles path translation for different environments:
+    - Standalone: Receives absolute paths like /Users/.../data/projects/test/raw/439.pdf
+    - Docker/K8s: Receives container paths like /app/projects/test/raw/439.pdf
+    
+    Both map to the actual file location based on PROJECTS_BASE_PATH env var.
+    """
+    logger.info(f"Received task to convert {file_path} with ID {conversion_id}")
+    result_sender_socket.send_json(
+        {"conversion_id": conversion_id, "status": "processing"}
+    )
+
+    try:
+        # Resolve actual file path based on environment
+        actual_file_path = _resolve_file_path(file_path)
+        if not os.path.exists(actual_file_path):
+            error_msg = f"File not found at {actual_file_path} (original path: {file_path})"
+            logger.error(error_msg)
+            result_sender_socket.send_json(
+                {"conversion_id": conversion_id, "status": "failed", "error": error_msg}
+            )
+            return
+        
+        # Write to shared location so API can find via GET /converted/<original_name>
+        # Use CONVERTED_FILES_DIR env var or default to /app/converted_files (shared across pods)
+        converted_dir = os.getenv("CONVERTED_FILES_DIR", "/app/converted_files")
+        os.makedirs(converted_dir, exist_ok=True)
+        stem = Path(actual_file_path).stem
+        converted_file_path = os.path.join(converted_dir, f"{stem}.md")
+
+        # Convert the file using resolved path
+        converter = DocumentConverter()
+        result = converter.convert(actual_file_path)
+        markdown_content = result.document.export_to_markdown()
+
+        # Create metadata
+        metadata = {
+            "source_file": file_path,
+            "conversion_id": conversion_id,
+            "conversion_date": datetime.now().isoformat(),
+            "docling_name": repr(result.document.name),
+            "docling_origin": repr(result.document.origin),
+            "docling_num_pages": result.document.num_pages(),
+        }
+
+        # Create a frontmatter Post
+        post = frontmatter.Post(markdown_content)
+        post.metadata = metadata
+
+        # Save the converted file with metadata header
+
+        with open(converted_file_path, "w") as f:
+            f.write(frontmatter.dumps(post))
+
+        result_sender_socket.send_json(
+            {"conversion_id": conversion_id, "status": "completed"}
+        )
+        logger.info(f"Successfully converted {file_path} to {converted_file_path}")
+
+    except Exception as e:
+        logger.error(f"Failed to convert {file_path}: {e}", exc_info=True)
+        result_sender_socket.send_json(
+            {"conversion_id": conversion_id, "status": "failed", "error": str(e)}
+        )
+
+
+def main():
+    """
+    Main worker loop to process tasks from the queue.
+    """
+    parser = argparse.ArgumentParser(description="ZeroMQ worker for file conversion.")
+    parser.add_argument(
+        "--host", type=str, default=None, help="The host of the ZeroMQ server."
+    )
+    args = parser.parse_args()
+    
+    # Auto-detect environment: use 'api' for Docker, 'localhost' for standalone
+    if args.host:
+        host = args.host
+    else:
+        # Check if running in Docker by looking for /.dockerenv or checking hostname
+        is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER', '').lower() == 'true'
+        host = "api" if is_docker else "localhost"
+    
+    logger.info(f"Connecting to ZeroMQ host: {host} (Docker mode: {host == 'api'})")
+
+    context = zmq.Context()
+
+    task_receiver_socket = context.socket(zmq.PULL)
+    task_receiver_socket.connect(f"tcp://{host}:5555")
+
+    result_sender_socket = context.socket(zmq.PUSH)
+    result_sender_socket.connect(f"tcp://{host}:5556")
+
+    logger.info("Successfully connected to ZeroMQ sockets.")
+
+    while True:
+        message = task_receiver_socket.recv_string()
+        task = json.loads(message)
+
+        conversion_id = task["conversion_id"]
+        file_path = task["file_path"]
+
+        convert_file_to_markdown(file_path, conversion_id, result_sender_socket)
+
+
+if __name__ == "__main__":
+    # In a real application, you'd run multiple instances of this worker.
+    # For this example, we'll just run one.
+    logger.info(f"Worker with PID {os.getpid()} started.")
+    main()

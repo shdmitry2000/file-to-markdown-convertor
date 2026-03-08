@@ -114,12 +114,14 @@ async def get_status(conversion_id: str):
 @app.get("/converted/{file_path:path}")
 async def get_converted_file(file_path: str):
     logger.info(f"Request to retrieve converted file: {file_path}")
+    # Use CONVERTED_FILES_DIR env var or default to /app/converted_files (shared across pods)
+    converted_dir = os.getenv("CONVERTED_FILES_DIR", "/app/converted_files")
     # Rag-template requests by original name (e.g. 439.pdf); worker writes <stem>.md
     base, ext = os.path.splitext(file_path)
     if ext.lower() in (".pdf", ".docx", ".doc") and not file_path.lower().endswith(".md"):
-        lookup_path = os.path.join("converted_files", os.path.basename(base) + ".md")
+        lookup_path = os.path.join(converted_dir, os.path.basename(base) + ".md")
     else:
-        lookup_path = os.path.join("converted_files", file_path)
+        lookup_path = os.path.join(converted_dir, file_path)
     if not os.path.exists(lookup_path):
         logger.warning(f"Converted file not found: {lookup_path}")
         raise HTTPException(status_code=404, detail="Converted file not found")
@@ -133,8 +135,41 @@ async def get_converted_file(file_path: str):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for monitoring."""
-    return {"status": "healthy", "service": "markdown-api"}
+    """Health check endpoint for monitoring with diagnostic information."""
+    # Detect environment
+    is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER', '').lower() == 'true'
+    is_k8s = os.environ.get('KUBERNETES_SERVICE_HOST') is not None
+    
+    if is_k8s:
+        environment = "kubernetes"
+    elif is_docker:
+        environment = "docker"
+    else:
+        environment = "standalone"
+    
+    # Get path configuration
+    projects_base = os.getenv("PROJECTS_BASE_PATH", "not set")
+    converted_dir = os.getenv("CONVERTED_FILES_DIR", "/app/converted_files")
+    
+    # Check if paths are accessible
+    projects_accessible = os.path.exists(projects_base) if projects_base != "not set" else False
+    converted_accessible = os.path.exists(converted_dir)
+    
+    return {
+        "status": "healthy",
+        "service": "markdown-api",
+        "environment": environment,
+        "configuration": {
+            "projects_base_path": projects_base,
+            "projects_accessible": projects_accessible,
+            "converted_files_dir": converted_dir,
+            "converted_dir_accessible": converted_accessible
+        },
+        "zmq_ports": {
+            "task_queue": 5555,
+            "result_queue": 5556
+        }
+    }
 
 
 if __name__ == "__main__":

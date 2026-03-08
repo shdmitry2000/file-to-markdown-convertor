@@ -19,7 +19,7 @@
 
 # ---- Builder Stage ----
 # This stage installs dependencies into a clean location.
-FROM python:3.12-slim as builder
+FROM python:3.12-slim AS builder
 
 # Install uv, our build tool
 RUN pip install uv
@@ -38,20 +38,35 @@ RUN uv pip install --no-cache-dir \
 # This stage creates the final, small, production-ready image.
 FROM python:3.12-slim
 
-# Install curl for health checks
+# Install system dependencies for OpenCV and document processing
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    libxcb1 \
+    libxcb-render0 \
+    libxcb-shape0 \
+    libxcb-xfixes0 \
+    libxext6 \
+    libsm6 \
+    libice6 \
+    libglib2.0-0 \
+    libgomp1 \
+    libgl1 \
+    libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
-
-# Create a non-root user for better security
-RUN useradd --create-home appuser
-USER appuser
-WORKDIR /home/appuser/app
 
 # Copy the installed packages from the builder stage. This is the key to a small image.
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 # Copy the executables (like uvicorn) from the builder stage.
 COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Create a non-root user for better security
+RUN useradd --create-home appuser && \
+    mkdir -p /usr/local/lib/python3.12/site-packages/rapidocr/models && \
+    chmod -R 777 /usr/local/lib/python3.12/site-packages/rapidocr/models
+
+USER appuser
+WORKDIR /home/appuser/app
 
 # Copy the application code into the container
 COPY --chown=appuser:appuser ./app .

@@ -3,7 +3,9 @@ import json
 import os
 import time
 from pathlib import Path
-from docling.document_converter import DocumentConverter
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.base_models import InputFormat
 import frontmatter
 from datetime import datetime
 import logging
@@ -53,8 +55,23 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
         
         logger.info(f"[{conversion_id}] Converting: {file_path} -> {converted_file_path}")
 
-        # Convert the file
-        converter = DocumentConverter()
+        # Configure PDF pipeline with OCR setting from environment
+        # OCR is disabled by default (faster, no model downloads) but can be enabled if needed
+        do_ocr = os.getenv("DOCLING_DO_OCR", "false").lower() in ("true", "1", "yes")
+        
+        pdf_options = PdfPipelineOptions()
+        pdf_options.do_ocr = do_ocr
+        
+        # Convert the file with configured OCR setting
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
+            }
+        )
+        
+        if do_ocr:
+            logger.info(f"[{conversion_id}] OCR enabled - may download models on first run")
+        
         result = converter.convert(file_path)
         markdown_content = result.document.export_to_markdown()
 
@@ -110,6 +127,7 @@ def main():
     logger.info(f"Starting worker connecting to ZMQ host: {host}")
     logger.info(f"PROJECTS_BASE_PATH: {os.getenv('PROJECTS_BASE_PATH', 'not set')}")
     logger.info(f"CONVERTED_FILES_DIR: {os.getenv('CONVERTED_FILES_DIR', './data/converted_files')}")
+    logger.info(f"DOCLING_DO_OCR: {os.getenv('DOCLING_DO_OCR', 'false')} (OCR {'enabled' if os.getenv('DOCLING_DO_OCR', 'false').lower() in ('true', '1', 'yes') else 'disabled'})")
 
     context = zmq.Context()
 

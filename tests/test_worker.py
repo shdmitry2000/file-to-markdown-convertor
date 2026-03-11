@@ -241,5 +241,41 @@ def test_worker_handles_malformed_messages():
                 main()
 
 
+def test_convert_file_timeout(sample_pdf, monkeypatch):
+    """Test that conversion respects DOCLING_TIMEOUT_SECONDS."""
+    from app.workers.worker import convert_file_to_markdown
+    
+    monkeypatch.chdir(sample_pdf.parent.parent)
+    monkeypatch.setenv("DOCLING_TIMEOUT_SECONDS", "1")  # 1 second timeout
+    
+    mock_socket = MagicMock()
+    
+    # Mock docling to take longer than timeout
+    def slow_convert(*args, **kwargs):
+        time.sleep(2)  # Sleep 2 seconds (longer than 1 second timeout)
+        mock_result = MagicMock()
+        mock_result.document.export_to_markdown.return_value = "# Test"
+        mock_result.document.name = "test.pdf"
+        mock_result.document.origin = "PDF"
+        mock_result.document.num_pages.return_value = 1
+        return mock_result
+    
+    with patch('app.workers.worker.DocumentConverter') as mock_converter:
+        mock_converter.return_value.convert.side_effect = slow_convert
+        
+        conversion_id = "test-timeout-123"
+        convert_file_to_markdown(
+            str(sample_pdf),
+            conversion_id,
+            mock_socket
+        )
+    
+    # Verify timeout failure status sent
+    calls = [call[0][0] for call in mock_socket.send_json.call_args_list]
+    failed_calls = [c for c in calls if c.get('status') == 'failed']
+    assert len(failed_calls) > 0, "Expected failed status due to timeout"
+    assert any('timeout' in c.get('error', '').lower() for c in failed_calls), "Expected timeout error message"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

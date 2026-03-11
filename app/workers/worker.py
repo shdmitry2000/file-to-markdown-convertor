@@ -2,6 +2,7 @@ import zmq
 import json
 import os
 import time
+import threading
 from pathlib import Path
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -72,7 +73,42 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
         if do_ocr:
             logger.info(f"[{conversion_id}] OCR enabled - may download models on first run")
         
-        result = converter.convert(file_path)
+        # Add timeout for conversion (default 60 min)
+        CONVERSION_TIMEOUT_SECONDS = int(os.getenv("DOCLING_TIMEOUT_SECONDS", "3600"))
+        
+        # Use threading to implement timeout for synchronous conversion
+        conversion_result = [None]  # Mutable container to store result
+        conversion_error = [None]
+        
+        def convert_with_timeout():
+            try:
+                conversion_result[0] = converter.convert(file_path)
+            except Exception as e:
+                conversion_error[0] = e
+        
+        conversion_thread = threading.Thread(target=convert_with_timeout)
+        conversion_thread.daemon = True
+        conversion_thread.start()
+        conversion_thread.join(timeout=CONVERSION_TIMEOUT_SECONDS)
+        
+        if conversion_thread.is_alive():
+            # Timeout occurred
+            error_msg = f"Conversion exceeded {CONVERSION_TIMEOUT_SECONDS}s timeout"
+            logger.error(f"[{conversion_id}] {error_msg}")
+            result_sender_socket.send_json({
+                "conversion_id": conversion_id,
+                "status": "failed",
+                "error": error_msg
+            })
+            return
+        
+        if conversion_error[0]:
+            raise conversion_error[0]
+        
+        if conversion_result[0] is None:
+            raise ValueError("Conversion returned no result")
+        
+        result = conversion_result[0]
         markdown_content = result.document.export_to_markdown()
 
         # Create metadata

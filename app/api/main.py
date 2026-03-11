@@ -111,6 +111,24 @@ async def get_status(conversion_id: str):
     return {"status": status}
 
 
+@app.delete("/convert/{conversion_id}")
+async def cancel_conversion(conversion_id: str):
+    """Cancel a conversion (mark as cancelled; worker will ignore result)."""
+    logger.info(f"Request to cancel conversion ID: {conversion_id}")
+    if conversion_id not in conversion_status_db:
+        logger.warning(f"Conversion ID not found for cancellation: {conversion_id}")
+        raise HTTPException(status_code=404, detail="Conversion ID not found")
+    
+    current_status = conversion_status_db[conversion_id]
+    if current_status in ["completed", "success", "failed"]:
+        logger.info(f"Conversion {conversion_id} already finished with status: {current_status}")
+        return {"conversion_id": conversion_id, "status": current_status, "message": "Already finished"}
+    
+    conversion_status_db[conversion_id] = "cancelled"
+    logger.info(f"Conversion {conversion_id} marked as cancelled")
+    return {"conversion_id": conversion_id, "status": "cancelled"}
+
+
 @app.get("/converted/{file_path:path}")
 async def get_converted_file(file_path: str):
     logger.info(f"Request to retrieve converted file: {file_path}")

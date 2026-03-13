@@ -19,6 +19,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _clean_markdown_content(content: str) -> str:
+    """Clean markdown content to handle encoding anomalies.
+    
+    This function removes problematic characters that cause issues:
+    - Null bytes (\x00) that PostgreSQL cannot store
+    - Non-ASCII characters that cause embedding API failures
+    - Invalid UTF-8 sequences
+    
+    By cleaning at the source (markdown converter), all RAG templates
+    receive clean, compatible content without needing template-specific fixes.
+    
+    Args:
+        content: Raw markdown content from docling
+    
+    Returns:
+        Cleaned markdown content safe for storage and embedding
+    """
+    if not content:
+        return content
+    
+    # Remove null bytes (PostgreSQL can't store them)
+    content = content.replace('\x00', '')
+    
+    # Remove non-ASCII characters to prevent embedding API errors
+    # This strips Hebrew, special Unicode, and replacement characters
+    # that cause Gemini/OpenAI API 400 errors
+    try:
+        content = content.encode('ascii', 'ignore').decode('ascii')
+    except Exception as e:
+        logger.warning(f"Error during ASCII conversion: {e}, returning original")
+    
+    return content
+
+
 def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_socket):
     """
     Converts a file to markdown and sends status updates back to the API.
@@ -110,6 +144,10 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
         
         result = conversion_result[0]
         markdown_content = result.document.export_to_markdown()
+        
+        # Clean markdown content to handle anomalies
+        # This ensures all templates receive clean, compatible content
+        markdown_content = _clean_markdown_content(markdown_content)
 
         # Create metadata
         metadata = {
@@ -126,7 +164,8 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
         post.metadata = metadata
 
         # Save the converted file with metadata header
-        with open(converted_file_path, "w") as f:
+        # Use UTF-8 with error handling to prevent encoding issues
+        with open(converted_file_path, "w", encoding='utf-8', errors='replace') as f:
             f.write(frontmatter.dumps(post))
 
         result_sender_socket.send_json(

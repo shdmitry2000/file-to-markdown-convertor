@@ -20,12 +20,16 @@ logger = logging.getLogger(__name__)
 
 
 def _clean_markdown_content(content: str) -> str:
-    """Clean markdown content to handle encoding anomalies.
+    """Clean markdown content to handle problematic characters.
     
-    This function removes problematic characters that cause issues:
+    This function removes ONLY problematic characters that cause technical issues:
     - Null bytes (\x00) that PostgreSQL cannot store
-    - Non-ASCII characters that cause embedding API failures
-    - Invalid UTF-8 sequences
+    - Control characters (0x00-0x1F except newlines/tabs/CR, 0x7F-0x9F) that cause parsing issues
+    
+    PRESERVES all valid Unicode including:
+    - Hebrew (עברית), Arabic (العربية), Chinese (中文)
+    - All other valid UTF-8 characters
+    - Valid whitespace (newlines, tabs, carriage returns)
     
     By cleaning at the source (markdown converter), all RAG templates
     receive clean, compatible content without needing template-specific fixes.
@@ -39,16 +43,15 @@ def _clean_markdown_content(content: str) -> str:
     if not content:
         return content
     
+    import re
+    
     # Remove null bytes (PostgreSQL can't store them)
     content = content.replace('\x00', '')
     
-    # Remove non-ASCII characters to prevent embedding API errors
-    # This strips Hebrew, special Unicode, and replacement characters
-    # that cause Gemini/OpenAI API 400 errors
-    try:
-        content = content.encode('ascii', 'ignore').decode('ascii')
-    except Exception as e:
-        logger.warning(f"Error during ASCII conversion: {e}, returning original")
+    # Remove control characters that cause parsing issues
+    # Keep: \n (0x0A), \r (0x0D), \t (0x09)
+    # Remove: All other control chars (0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F-0x9F)
+    content = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F-\x9F]', '', content)
     
     return content
 

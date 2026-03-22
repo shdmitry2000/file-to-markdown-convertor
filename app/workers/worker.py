@@ -12,11 +12,21 @@ from datetime import datetime
 import logging
 import argparse
 
+# Import configuration
+from app.config import get_settings
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Load settings
+settings = get_settings()
+logger.info(f"Worker starting in {settings.ENVIRONMENT} mode")
+logger.info(f"Converted files directory: {settings.CONVERTED_FILES_DIR}")
+logger.info(f"ZeroMQ task URL: {settings.zeromq_task_url}")
+logger.info(f"ZeroMQ result URL: {settings.zeromq_result_url}")
 
 # ---------------------------------------------------------------------------
 # OpenTelemetry setup — initialized once at worker startup
@@ -262,7 +272,8 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                 result_sender_socket.send_json({"conversion_id": conversion_id, "status": "failed", "error": error_msg})
                 return
             
-            converted_dir = os.getenv("CONVERTED_FILES_DIR", "./data/converted_files")
+            # Use configured converted files directory
+            converted_dir = settings.CONVERTED_FILES_DIR
             os.makedirs(converted_dir, exist_ok=True)
             stem = Path(file_path).stem
             converted_file_path = os.path.join(converted_dir, f"{stem}.md")
@@ -272,11 +283,15 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
             from app.converters.pymupdf import PyMuPDFConverter
             from app.converters.markitdown import MarkItDownConverter
             from app.converters.vlm import VLMConverter
+            from app.converters.marker import MarkerConverter
+            from app.converters.docling import DoclingConverter
 
             converters_map = {
                 "pymupdf": PyMuPDFConverter,
                 "markitdown": MarkItDownConverter,
-                "vlm": VLMConverter
+                "vlm": VLMConverter,
+                "marker": MarkerConverter,
+                "docling": DoclingConverter
             }
             converter_cls = converters_map.get(converter_type)
             if not converter_cls:
@@ -317,24 +332,20 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
 
 def main():
     parser = argparse.ArgumentParser(description="ZeroMQ worker for file conversion.")
-    parser.add_argument("--host", type=str, default=None)
+    parser.add_argument("--host", type=str, default=None, help="ZeroMQ host (overrides auto-detection)")
     args = parser.parse_args()
     
-    # Auto-detect environment if no host specified
-    if args.host:
-        host = args.host
-    else:
-        # Detect Docker/K8s environment
-        is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER', '').lower() == 'true'
-        host = "api" if is_docker else "localhost"
+    # Use CLI arg, or fall back to settings (which auto-detects)
+    host = args.host if args.host else settings.ZEROMQ_HOST
     
-    logger.info(f"Worker connecting to host: {host}")
+    logger.info(f"Worker connecting to ZeroMQ host: {host}")
+    logger.info(f"Task port: {settings.ZEROMQ_TASK_PORT}, Result port: {settings.ZEROMQ_RESULT_PORT}")
     
     context = zmq.Context()
     task_receiver_socket = context.socket(zmq.PULL)
-    task_receiver_socket.connect(f"tcp://{host}:5585")
+    task_receiver_socket.connect(f"tcp://{host}:{settings.ZEROMQ_TASK_PORT}")
     result_sender_socket = context.socket(zmq.PUSH)
-    result_sender_socket.connect(f"tcp://{host}:5586")
+    result_sender_socket.connect(f"tcp://{host}:{settings.ZEROMQ_RESULT_PORT}")
 
     while True:
         message = task_receiver_socket.recv_string()

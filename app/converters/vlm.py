@@ -51,8 +51,8 @@ _RETRY_BASE_DELAY_S = 1.0  # seconds; doubles each attempt (1 s, 2 s, 4 s)
     name="vlm",
     label="VLM (Vision-Language Model)",
     description=(
-        "Rasterises each page and sends it to an OpenAI-compatible VLM. "
-        "Best quality for scanned PDFs. Requires a running model endpoint."
+        "Uses Vision-Language Model for full page-by-page image analysis. "
+        "Best for scanned PDFs, images, and complex visual content. Requires VLM endpoint."
     ),
 )
 class VLMConverter(PDFConverter):

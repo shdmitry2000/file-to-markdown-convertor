@@ -27,8 +27,14 @@ class MarkItDownConverter(PDFConverter):
 
     def __init__(self) -> None:
         from markitdown import MarkItDown
+        import inspect
 
-        self._converter = MarkItDown(enable_plugins=False)
+        # Check if MarkItDown supports enable_plugins parameter
+        sig = inspect.signature(MarkItDown.__init__)
+        if 'enable_plugins' in sig.parameters:
+            self._converter = MarkItDown(enable_plugins=False)
+        else:
+            self._converter = MarkItDown()
 
     def convert(self, pdf_path: Path) -> str:
         self.validate_path(pdf_path)

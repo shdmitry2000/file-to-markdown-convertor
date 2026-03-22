@@ -16,13 +16,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Import registry and converters to ensure they're registered
+# Import configuration and registry
+from app.config import get_settings
 from app.registry import registry
+
 # Import all converters so their @register_converter decorators run
 import app.converters.pymupdf      # noqa: F401
 import app.converters.markitdown   # noqa: F401
 import app.converters.vlm          # noqa: F401
 import app.converters.docling      # noqa: F401
+import app.converters.marker       # noqa: F401
+
+# Load settings
+settings = get_settings()
+logger.info(f"Starting in {settings.ENVIRONMENT} mode")
+logger.info(f"Converted files directory: {settings.CONVERTED_FILES_DIR}")
 
 
 @asynccontextmanager
@@ -88,11 +96,12 @@ def result_listener():
 
 class ConversionRequest(BaseModel):
     file_path: str
+    converter_type: str = "docling"  # Default to docling for backward compatibility
 
 
 @app.post("/convert")
 async def convert_file(request: ConversionRequest):
-    logger.info(f"Received conversion request for file: {request.file_path}")
+    logger.info(f"Received conversion request for file: {request.file_path} with converter: {request.converter_type}")
     file_path = request.file_path
     if not os.path.exists(file_path):
         logger.warning(f"File not found at path: {file_path}")
@@ -102,9 +111,13 @@ async def convert_file(request: ConversionRequest):
     logger.info(f"Generated conversion ID {conversion_id} for file {file_path}")
     conversion_status_db[conversion_id] = "pending"
 
-    task = {"conversion_id": conversion_id, "file_path": file_path}
+    task = {
+        "conversion_id": conversion_id,
+        "file_path": file_path,
+        "converter_type": request.converter_type
+    }
 
-    logger.info(f"Sending task {conversion_id} to the ZeroMQ queue.")
+    logger.info(f"Sending task {conversion_id} to the ZeroMQ queue with converter {request.converter_type}.")
     task_socket.send_string(json.dumps(task))
 
     return {"conversion_id": conversion_id}
@@ -141,8 +154,8 @@ async def cancel_conversion(conversion_id: str):
 @app.get("/converted/{file_path:path}")
 async def get_converted_file(file_path: str):
     logger.info(f"Request to retrieve converted file: {file_path}")
-    # Use CONVERTED_FILES_DIR env var or default to /app/converted_files (shared across pods)
-    converted_dir = os.getenv("CONVERTED_FILES_DIR", "/app/converted_files")
+    # Use configured converted files directory
+    converted_dir = settings.CONVERTED_FILES_DIR
     # Rag-template requests by original name (e.g. 439.pdf); worker writes <stem>.md
     base, ext = os.path.splitext(file_path)
     if ext.lower() in (".pdf", ".docx", ".doc") and not file_path.lower().endswith(".md"):
@@ -204,38 +217,25 @@ async def get_capabilities():
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring with diagnostic information."""
-    # Detect environment
-    is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER', '').lower() == 'true'
-    is_k8s = os.environ.get('KUBERNETES_SERVICE_HOST') is not None
-    
-    if is_k8s:
-        environment = "kubernetes"
-    elif is_docker:
-        environment = "docker"
-    else:
-        environment = "standalone"
-    
-    # Get path configuration
-    projects_base = os.getenv("PROJECTS_BASE_PATH", "not set")
-    converted_dir = os.getenv("CONVERTED_FILES_DIR", "/app/converted_files")
-    
     # Check if paths are accessible
+    projects_base = settings.PROJECTS_BASE_PATH or "not set"
     projects_accessible = os.path.exists(projects_base) if projects_base != "not set" else False
-    converted_accessible = os.path.exists(converted_dir)
+    converted_accessible = os.path.exists(settings.CONVERTED_FILES_DIR)
     
     return {
         "status": "healthy",
         "service": "markdown-api",
-        "environment": environment,
+        "environment": settings.ENVIRONMENT,
         "configuration": {
             "projects_base_path": projects_base,
             "projects_accessible": projects_accessible,
-            "converted_files_dir": converted_dir,
-            "converted_dir_accessible": converted_accessible
+            "converted_files_dir": settings.CONVERTED_FILES_DIR,
+            "converted_dir_accessible": converted_accessible,
+            "zeromq_host": settings.ZEROMQ_HOST
         },
         "zmq_ports": {
-            "task_queue": 5585,
-            "result_queue": 5586
+            "task_queue": settings.ZEROMQ_TASK_PORT,
+            "result_queue": settings.ZEROMQ_RESULT_PORT
         }
     }
 

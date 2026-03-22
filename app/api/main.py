@@ -7,6 +7,7 @@ import json
 from typing import Dict
 import threading
 import logging
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 # Configure logging
@@ -14,6 +15,14 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Import registry and converters to ensure they're registered
+from app.registry import registry
+# Import all converters so their @register_converter decorators run
+import app.converters.pymupdf      # noqa: F401
+import app.converters.markitdown   # noqa: F401
+import app.converters.vlm          # noqa: F401
+import app.converters.docling      # noqa: F401
 
 
 @asynccontextmanager
@@ -43,11 +52,11 @@ context = zmq.Context()
 
 # Socket to send tasks to workers
 task_socket = context.socket(zmq.PUSH)
-task_socket.bind("tcp://*:5555")
+task_socket.bind("tcp://*:5585")
 
 # Socket to receive results from workers
 result_socket = context.socket(zmq.PULL)
-result_socket.bind("tcp://*:5556")
+result_socket.bind("tcp://*:5586")
 
 
 def result_listener():
@@ -151,6 +160,47 @@ async def get_converted_file(file_path: str):
     return {"content": content}
 
 
+@app.get("/capabilities")
+async def get_capabilities():
+    """Return all available PDF converters.
+    
+    This endpoint exposes the registered converters so clients can discover
+    what conversion methods are available. The response updates automatically
+    as new converters are added and decorated with @register_converter.
+    
+    Response example::
+    
+        {
+          "converters": [
+            {
+              "name": "pymupdf",
+              "label": "PyMuPDF",
+              "description": "Fast, lightweight. Best for standard digital PDFs with selectable text."
+            },
+            {
+              "name": "markitdown",
+              "label": "MarkItDown",
+              "description": "Microsoft MarkItDown. Simple and reliable for standard PDFs."
+            },
+            {
+              "name": "vlm",
+              "label": "VLM (Vision-Language Model)",
+              "description": "Rasterises each page and sends it to an OpenAI-compatible VLM. Best quality for scanned PDFs. Requires a running model endpoint."
+            },
+            {
+              "name": "docling",
+              "label": "Docling",
+              "description": "Advanced document understanding. Best for complex documents with tables, figures."
+            }
+          ]
+        }
+    
+    Usage:
+        GET http://localhost:8000/capabilities
+    """
+    return registry.get_capabilities()
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring with diagnostic information."""
@@ -184,8 +234,8 @@ async def health_check():
             "converted_dir_accessible": converted_accessible
         },
         "zmq_ports": {
-            "task_queue": 5555,
-            "result_queue": 5556
+            "task_queue": 5585,
+            "result_queue": 5586
         }
     }
 

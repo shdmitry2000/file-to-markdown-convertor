@@ -68,7 +68,7 @@ def test_worker_explicit_host_override():
             
             # Verify connection to custom host
             calls = mock_socket.connect.call_args_list
-            assert any('custom-host:5555' in str(call) for call in calls)
+            assert any('custom-host:5585' in str(call) for call in calls)
 
 
 def test_convert_file_to_markdown_success(sample_pdf, converted_files_dir, monkeypatch):
@@ -139,6 +139,10 @@ def test_convert_file_creates_output_directory(sample_pdf, monkeypatch, tmp_path
     test_dir = tmp_path
     monkeypatch.chdir(test_dir)
     
+    # Set CONVERTED_FILES_DIR to use tmp_path
+    converted_dir = test_dir / "converted_files"
+    monkeypatch.setenv("CONVERTED_FILES_DIR", str(converted_dir))
+    
     # Create directories
     (test_dir / "files_to_convert" / "subdir").mkdir(parents=True)
     nested_file = test_dir / "files_to_convert" / "subdir" / "nested.pdf"
@@ -161,10 +165,8 @@ def test_convert_file_creates_output_directory(sample_pdf, monkeypatch, tmp_path
             mock_socket
         )
     
-    # Verify directory was created
-    expected_dir = test_dir / "converted_files" / "subdir"
-    assert expected_dir.exists()
-    expected_file = expected_dir / "nested.md"
+    # Verify directory was created - flat structure, not nested
+    expected_file = converted_dir / "nested.md"
     assert expected_file.exists()
 
 
@@ -174,6 +176,10 @@ def test_worker_metadata_in_output(sample_pdf, monkeypatch, tmp_path):
     
     test_dir = tmp_path
     monkeypatch.chdir(test_dir)
+    
+    # Set CONVERTED_FILES_DIR to use tmp_path
+    converted_dir = test_dir / "converted_files"
+    monkeypatch.setenv("CONVERTED_FILES_DIR", str(converted_dir))
     
     # Create directories
     (test_dir / "files_to_convert").mkdir()
@@ -200,7 +206,7 @@ def test_worker_metadata_in_output(sample_pdf, monkeypatch, tmp_path):
         )
     
     # Read the output file
-    output_file = test_dir / "converted_files" / "test_document.md"
+    output_file = converted_dir / "test_document.md"
     assert output_file.exists(), f"Output file not found at {output_file}"
     
     content = output_file.read_text()

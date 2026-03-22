@@ -212,5 +212,37 @@ def test_multiple_concurrent_conversions(client, tmp_path):
     assert all(len(cid) > 0 for cid in conversion_ids)
 
 
+def test_capabilities_endpoint(client):
+    """Test /capabilities endpoint returns registered converters."""
+    response = client.get("/capabilities")
+    
+    assert response.status_code == 200
+    data = response.json()
+    
+    # Verify response structure
+    assert "converters" in data
+    converters = data["converters"]
+    assert isinstance(converters, list)
+    assert len(converters) > 0
+    
+    # Verify expected converters are present
+    converter_names = [c["name"] for c in converters]
+    assert "pymupdf" in converter_names
+    assert "markitdown" in converter_names
+    assert "vlm" in converter_names
+    assert "docling" in converter_names
+    
+    # Verify each converter has required fields
+    for converter in converters:
+        assert "name" in converter
+        assert "label" in converter
+        assert "description" in converter
+        assert isinstance(converter["name"], str)
+        assert isinstance(converter["label"], str)
+        assert isinstance(converter["description"], str)
+        assert len(converter["name"]) > 0
+        assert len(converter["label"]) > 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

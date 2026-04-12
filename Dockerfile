@@ -24,14 +24,13 @@ FROM python:3.12-slim AS builder
 # Install uv, our build tool
 RUN pip install uv
 
-# Copy project file to cache dependency installation
+# Copy project file and app code for building
 COPY pyproject.toml .
+COPY ./app ./app
 
-# Install dependencies system-wide within this temporary stage.
-# This makes it easy to find and copy the installed packages.
+# Install ALL dependencies from pyproject.toml
 ENV UV_SYSTEM_PYTHON=true
-RUN uv pip install --no-cache-dir \
-    fastapi uvicorn pyzmq docling python-frontmatter
+RUN uv pip install --no-cache-dir .
 
 
 # ---- Final Stage ----
@@ -69,10 +68,13 @@ USER appuser
 WORKDIR /home/appuser/app
 
 # Copy the application code into the container
-COPY --chown=appuser:appuser ./app .
+COPY --chown=appuser:appuser ./app /home/appuser/app
+
+# Set PYTHONPATH so 'app' module can be found
+ENV PYTHONPATH=/home/appuser
 
 # Expose the port the app runs on
 EXPOSE 8000
 
 # Specify the command to run on container startup
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

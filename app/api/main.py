@@ -58,13 +58,15 @@ conversion_status_db: Dict[str, str] = {}
 # ZeroMQ setup
 context = zmq.Context()
 
-# Socket to send tasks to workers
+# Socket to send tasks to workers (load ports from settings)
 task_socket = context.socket(zmq.PUSH)
-task_socket.bind("tcp://*:5585")
+task_socket.bind(f"tcp://*:{settings.ZMQ_TASK_PORT}")
+logger.info(f"Task socket bound to port {settings.ZMQ_TASK_PORT}")
 
 # Socket to receive results from workers
 result_socket = context.socket(zmq.PULL)
-result_socket.bind("tcp://*:5586")
+result_socket.bind(f"tcp://*:{settings.ZMQ_RESULT_PORT}")
+logger.info(f"Result socket bound to port {settings.ZMQ_RESULT_PORT}")
 
 
 def result_listener():
@@ -234,8 +236,8 @@ async def health_check():
             "zeromq_host": settings.ZEROMQ_HOST
         },
         "zmq_ports": {
-            "task_queue": settings.ZEROMQ_TASK_PORT,
-            "result_queue": settings.ZEROMQ_RESULT_PORT
+            "task_queue": settings.ZMQ_TASK_PORT,
+            "result_queue": settings.ZMQ_RESULT_PORT
         }
     }
 

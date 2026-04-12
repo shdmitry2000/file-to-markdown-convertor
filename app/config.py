@@ -58,11 +58,11 @@ class WorkerSettings(BaseSettings):
     ZEROMQ_HOST: str | None = None
     """ZeroMQ host. Auto-configured based on environment if not set."""
     
-    ZEROMQ_TASK_PORT: int = 5585
-    """ZeroMQ port for task queue (PUSH/PULL)"""
+    ZMQ_TASK_PORT: int = 5555
+    """ZeroMQ port for task queue (PUSH/PULL). Configurable via env var."""
     
-    ZEROMQ_RESULT_PORT: int = 5586
-    """ZeroMQ port for result queue (PUSH/PULL)"""
+    ZMQ_RESULT_PORT: int = 5556
+    """ZeroMQ port for result queue (PUSH/PULL). Configurable via env var."""
     
     # ── Logging ────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
@@ -103,12 +103,12 @@ class WorkerSettings(BaseSettings):
     @property
     def zeromq_task_url(self) -> str:
         """Full ZeroMQ URL for task queue."""
-        return f"tcp://{self.ZEROMQ_HOST}:{self.ZEROMQ_TASK_PORT}"
+        return f"tcp://{self.ZEROMQ_HOST}:{self.ZMQ_TASK_PORT}"
     
     @property
     def zeromq_result_url(self) -> str:
         """Full ZeroMQ URL for result queue."""
-        return f"tcp://{self.ZEROMQ_HOST}:{self.ZEROMQ_RESULT_PORT}"
+        return f"tcp://{self.ZEROMQ_HOST}:{self.ZMQ_RESULT_PORT}"
 
 
 @lru_cache

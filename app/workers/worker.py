@@ -339,13 +339,13 @@ def main():
     host = args.host if args.host else settings.ZEROMQ_HOST
     
     logger.info(f"Worker connecting to ZeroMQ host: {host}")
-    logger.info(f"Task port: {settings.ZEROMQ_TASK_PORT}, Result port: {settings.ZEROMQ_RESULT_PORT}")
+    logger.info(f"Task port: {settings.ZMQ_TASK_PORT}, Result port: {settings.ZMQ_RESULT_PORT}")
     
     context = zmq.Context()
     task_receiver_socket = context.socket(zmq.PULL)
-    task_receiver_socket.connect(f"tcp://{host}:{settings.ZEROMQ_TASK_PORT}")
+    task_receiver_socket.connect(f"tcp://{host}:{settings.ZMQ_TASK_PORT}")
     result_sender_socket = context.socket(zmq.PUSH)
-    result_sender_socket.connect(f"tcp://{host}:{settings.ZEROMQ_RESULT_PORT}")
+    result_sender_socket.connect(f"tcp://{host}:{settings.ZMQ_RESULT_PORT}")
 
     while True:
         message = task_receiver_socket.recv_string()

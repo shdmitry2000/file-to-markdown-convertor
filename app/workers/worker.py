@@ -11,6 +11,7 @@ import frontmatter
 from datetime import datetime
 import logging
 import argparse
+import uuid
 
 # Import configuration
 from app.config import get_settings
@@ -223,9 +224,11 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                 post = frontmatter.Post(markdown_content)
                 post.metadata = metadata
 
-                # Save the converted file with metadata header
-                with open(converted_file_path, "w", encoding='utf-8', errors='replace') as f:
+                # Save the converted file atomically
+                tmp_file_path = f"{converted_file_path}.tmp_{uuid.uuid4().hex}"
+                with open(tmp_file_path, "w", encoding='utf-8', errors='replace') as f:
                     f.write(frontmatter.dumps(post))
+                os.replace(tmp_file_path, converted_file_path)
 
             result_sender_socket.send_json(
                 {"conversion_id": conversion_id, "status": "completed"}
@@ -314,8 +317,11 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                 post = frontmatter.Post(markdown_content)
                 post.metadata = metadata
 
-                with open(converted_file_path, "w", encoding='utf-8', errors='replace') as f:
+                # Save the converted file atomically
+                tmp_file_path = f"{converted_file_path}.tmp_{uuid.uuid4().hex}"
+                with open(tmp_file_path, "w", encoding='utf-8', errors='replace') as f:
                     f.write(frontmatter.dumps(post))
+                os.replace(tmp_file_path, converted_file_path)
 
             result_sender_socket.send_json({"conversion_id": conversion_id, "status": "completed"})
             logger.info(f"[{conversion_id}] Successfully converted via {converter_type} to {converted_file_path}")

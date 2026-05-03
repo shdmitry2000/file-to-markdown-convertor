@@ -1,9 +1,12 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import Response
 from pydantic import BaseModel
 import zmq
 import uuid
 import os
 import json
+import time
+import asyncio
 from typing import Dict
 import threading
 import logging
@@ -54,6 +57,10 @@ app = FastAPI(lifespan=lifespan)
 
 # In-memory database to store conversion status
 conversion_status_db: Dict[str, str] = {}
+conversion_details_db: Dict[str, Dict] = {}  # Stores detailed info about conversions
+pending_conversions_db: Dict[str, Dict] = {}  # Pending conversions with metadata
+active_conversions_db: Dict[str, Dict] = {}  # Active conversions with metadata
+last_completion_timestamp = time.time()  # Track last successful conversion
 
 # ZeroMQ setup
 context = zmq.Context()
@@ -71,6 +78,7 @@ logger.info(f"Result socket bound to port {settings.ZMQ_RESULT_PORT}")
 
 def result_listener():
     """Listens for results from workers and updates the status database."""
+    global last_completion_timestamp
     logger.info("Result listener thread started")
     while True:
         try:
@@ -81,6 +89,16 @@ def result_listener():
                 if isinstance(conversion_id, str) and isinstance(status, str):
                     logger.info(f"Received status update for {conversion_id}: {status}")
                     conversion_status_db[conversion_id] = status
+                    
+                    # Update last completion timestamp if conversion finished
+                    if status in ["completed", "success", "failed", "error"]:
+                        last_completion_timestamp = time.time()
+                        
+                        # Move from active to completed
+                        if conversion_id in active_conversions_db:
+                            del active_conversions_db[conversion_id]
+                        if conversion_id in pending_conversions_db:
+                            del pending_conversions_db[conversion_id]
             else:
                 logger.warning(f"Received non-dict message: {result}")
         except zmq.ZMQError as e:
@@ -175,6 +193,201 @@ async def get_converted_file(file_path: str):
     return {"content": content}
 
 
+# ==================== DEBUG ENDPOINTS ====================
+
+@app.post("/debug/convert")
+async def debug_convert_file(file: UploadFile = File(...)):
+    """Upload a PDF and test conversion with timing."""
+    logger.info(f"Debug conversion request for file: {file.filename}")
+    start_time = time.time()
+    
+    # Save uploaded file temporarily
+    temp_path = Path(settings.CONVERTED_FILES_DIR) / f"debug_{file.filename}"
+    with open(temp_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    file_size = temp_path.stat().st_size
+    conversion_id = str(uuid.uuid4())
+    logger.info(f"Generated debug conversion ID {conversion_id} for {file.filename}")
+    
+    # Send to worker
+    task = {
+        "conversion_id": conversion_id,
+        "file_path": str(temp_path),
+        "converter_type": "docling"
+    }
+    
+    task_socket.send_string(json.dumps(task))
+    conversion_status_db[conversion_id] = "pending"
+    conversion_details_db[conversion_id] = {
+        "filename": file.filename,
+        "file_size": file_size,
+        "started_at": start_time
+    }
+    pending_conversions_db[conversion_id] = {
+        "filename": file.filename,
+        "queued_at": start_time
+    }
+    
+    # Poll for completion (max 10 minutes)
+    max_polls = 300  # 10 min / 2s = 300 polls
+    poll_interval = 2.0
+    
+    for i in range(max_polls):
+        await asyncio.sleep(poll_interval)
+        status = conversion_status_db.get(conversion_id)
+        
+        if status in ["completed", "success", "failed", "error"]:
+            elapsed = time.time() - start_time
+            
+            # Try to find output path
+            output_path = None
+            converted_dir = Path(settings.CONVERTED_FILES_DIR)
+            stem = temp_path.stem.replace("debug_", "")
+            potential_output = converted_dir / f"{stem}.md"
+            if potential_output.exists():
+                output_path = str(potential_output)
+                conversion_details_db[conversion_id]["output_path"] = output_path
+            
+            return {
+                "conversion_id": conversion_id,
+                "filename": file.filename,
+                "file_size": file_size,
+                "status": status,
+                "conversion_time_seconds": round(elapsed, 2),
+                "converter_type": "docling",
+                "output_available": output_path is not None
+            }
+        
+        # Move to active on first poll
+        if i == 0 and conversion_id in pending_conversions_db:
+            active_conversions_db[conversion_id] = pending_conversions_db.pop(conversion_id)
+            active_conversions_db[conversion_id]["started_at"] = time.time()
+    
+    return {
+        "conversion_id": conversion_id,
+        "filename": file.filename,
+        "status": "timeout",
+        "conversion_time_seconds": max_polls * poll_interval,
+        "error": "Conversion timed out after 10 minutes"
+    }
+
+
+@app.get("/debug/conversion/{conversion_id}/result")
+async def get_converted_result(conversion_id: str, download: bool = False):
+    """View or download converted markdown."""
+    logger.info(f"Request for conversion result: {conversion_id}")
+    
+    if conversion_id not in conversion_status_db:
+        raise HTTPException(status_code=404, detail="Conversion ID not found")
+    
+    status = conversion_status_db.get(conversion_id)
+    if status not in ["completed", "success"]:
+        raise HTTPException(status_code=400, detail=f"Conversion not completed (status: {status})")
+    
+    details = conversion_details_db.get(conversion_id, {})
+    output_path = details.get("output_path")
+    
+    # Try to find output file if not stored
+    if not output_path or not Path(output_path).exists():
+        # Try to reconstruct path from filename
+        filename = details.get("filename", "")
+        if filename:
+            converted_dir = Path(settings.CONVERTED_FILES_DIR)
+            stem = Path(filename).stem
+            potential_paths = [
+                converted_dir / f"{stem}.md",
+                converted_dir / f"debug_{stem}.md"
+            ]
+            for p in potential_paths:
+                if p.exists():
+                    output_path = str(p)
+                    break
+    
+    if not output_path or not Path(output_path).exists():
+        raise HTTPException(status_code=404, detail="Converted file not found")
+    
+    with open(output_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    if download:
+        return Response(
+            content=content,
+            media_type="text/markdown",
+            headers={"Content-Disposition": f"attachment; filename={Path(output_path).name}"}
+        )
+    
+    return {
+        "conversion_id": conversion_id,
+        "filename": details.get("filename"),
+        "markdown_length": len(content),
+        "markdown_content": content,
+        "output_path": output_path
+    }
+
+
+@app.get("/debug/queue")
+async def get_queue_status():
+    """View pending and active conversions."""
+    logger.info("Request for queue status")
+    
+    current_time = time.time()
+    
+    return {
+        "pending": [
+            {
+                "conversion_id": conv_id,
+                "filename": details.get("filename", "unknown"),
+                "queued_at": details.get("queued_at"),
+                "wait_time_seconds": int(current_time - details.get("queued_at", current_time))
+            }
+            for conv_id, details in pending_conversions_db.items()
+        ],
+        "active": [
+            {
+                "conversion_id": conv_id,
+                "filename": details.get("filename", "unknown"),
+                "started_at": details.get("started_at"),
+                "duration_seconds": int(current_time - details.get("started_at", current_time))
+            }
+            for conv_id, details in active_conversions_db.items()
+        ],
+        "stats": {
+            "pending_count": len(pending_conversions_db),
+            "active_count": len(active_conversions_db),
+            "total_tracked": len(conversion_status_db)
+        }
+    }
+
+
+@app.post("/debug/queue/{conversion_id}/cancel")
+async def cancel_conversion_debug(conversion_id: str):
+    """Cancel a pending or active conversion."""
+    logger.info(f"Request to cancel conversion: {conversion_id}")
+    
+    if conversion_id in pending_conversions_db:
+        del pending_conversions_db[conversion_id]
+        conversion_status_db[conversion_id] = "cancelled"
+        logger.info(f"Removed {conversion_id} from pending queue")
+        return {"success": True, "message": "Removed from queue"}
+    
+    if conversion_id in active_conversions_db:
+        del active_conversions_db[conversion_id]
+        conversion_status_db[conversion_id] = "cancelled"
+        logger.info(f"Marked {conversion_id} as cancelled (was active)")
+        return {"success": True, "message": "Marked as cancelled"}
+    
+    if conversion_id in conversion_status_db:
+        status = conversion_status_db[conversion_id]
+        return {"success": False, "message": f"Conversion already {status}"}
+    
+    raise HTTPException(status_code=404, detail="Conversion not found")
+
+
+# ==================== END DEBUG ENDPOINTS ====================
+
+
 @app.get("/capabilities")
 async def get_capabilities():
     """Return all available PDF converters.
@@ -224,6 +437,9 @@ async def health_check():
     projects_accessible = os.path.exists(projects_base) if projects_base != "not set" else False
     converted_accessible = os.path.exists(settings.CONVERTED_FILES_DIR)
     
+    # Calculate last activity
+    seconds_since_last = int(time.time() - last_completion_timestamp)
+    
     return {
         "status": "healthy",
         "service": "markdown-api",
@@ -238,6 +454,11 @@ async def health_check():
         "zmq_ports": {
             "task_queue": settings.ZMQ_TASK_PORT,
             "result_queue": settings.ZMQ_RESULT_PORT
+        },
+        "queue": {
+            "pending": len(pending_conversions_db),
+            "active": len(active_conversions_db),
+            "last_completion_seconds_ago": seconds_since_last
         }
     }
 

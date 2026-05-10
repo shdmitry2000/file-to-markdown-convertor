@@ -54,6 +54,99 @@ def _setup_telemetry():
 tracer = _setup_telemetry()
 
 
+# ---------------------------------------------------------------------------
+# Converter singletons
+# ---------------------------------------------------------------------------
+# Building a DocumentConverter triggers heavy model loads on first .convert().
+# Holding one instance per worker process keeps that cost paid once at startup
+# instead of on every request.
+# ---------------------------------------------------------------------------
+
+_DOCLING_CONVERTER: DocumentConverter | None = None
+_DOCLING_DO_OCR: bool = False
+_PLUGIN_CONVERTERS: dict = {}
+
+
+def _get_docling_converter() -> DocumentConverter:
+    """Return the singleton DocumentConverter, building it on first call.
+
+    OCR mode is fixed at first call from the DOCLING_DO_OCR env var.
+    """
+    global _DOCLING_CONVERTER, _DOCLING_DO_OCR
+    if _DOCLING_CONVERTER is None:
+        _DOCLING_DO_OCR = os.getenv("DOCLING_DO_OCR", "false").lower() in ("true", "1", "yes")
+        pdf_options = PdfPipelineOptions()
+        pdf_options.do_ocr = _DOCLING_DO_OCR
+        _DOCLING_CONVERTER = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
+            }
+        )
+        logger.info(
+            f"DocumentConverter initialized (OCR={'on' if _DOCLING_DO_OCR else 'off'})"
+        )
+    return _DOCLING_CONVERTER
+
+
+def _get_plugin_converter(converter_type: str):
+    """Return a cached plugin converter instance (pymupdf/markitdown/vlm/marker/docling)."""
+    if converter_type in _PLUGIN_CONVERTERS:
+        return _PLUGIN_CONVERTERS[converter_type]
+
+    from app.converters.pymupdf import PyMuPDFConverter
+    from app.converters.markitdown import MarkItDownConverter
+    from app.converters.vlm import VLMConverter
+    from app.converters.marker import MarkerConverter
+    from app.converters.docling import DoclingConverter
+
+    converters_map = {
+        "pymupdf": PyMuPDFConverter,
+        "markitdown": MarkItDownConverter,
+        "vlm": VLMConverter,
+        "marker": MarkerConverter,
+        "docling": DoclingConverter,
+    }
+    cls = converters_map.get(converter_type)
+    if not cls:
+        raise ValueError(f"Unknown converter type: {converter_type}")
+    _PLUGIN_CONVERTERS[converter_type] = cls()
+    return _PLUGIN_CONVERTERS[converter_type]
+
+
+def _warmup_docling() -> None:
+    """Generate a tiny PDF and run one conversion so docling loads its models
+    before the worker starts accepting tasks. Best-effort: failures log a
+    warning and let the worker continue (first real request will then pay
+    the warmup cost)."""
+    import tempfile
+    t0 = time.time()
+    try:
+        import pymupdf  # transitive via pymupdf4llm
+    except ImportError:
+        logger.warning("pymupdf not available — skipping warmup; first request will be slow.")
+        _get_docling_converter()
+        return
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            warmup_path = Path(tmp) / "warmup.pdf"
+            doc = pymupdf.open()
+            page = doc.new_page()
+            page.insert_text((72, 72), "warmup")
+            doc.save(str(warmup_path))
+            doc.close()
+
+            converter = _get_docling_converter()
+            converter.convert(str(warmup_path))
+        logger.info(f"Docling warmup completed in {time.time() - t0:.1f}s — worker ready")
+    except Exception as e:
+        logger.warning(
+            f"Warmup conversion failed after {time.time() - t0:.1f}s: {e}. "
+            "Worker will continue; first request may be slow.",
+            exc_info=True,
+        )
+
+
 def _clean_markdown_content(content: str) -> str:
     """Clean markdown content to handle problematic characters.
     
@@ -132,22 +225,11 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
             
             logger.info(f"[{conversion_id}] Converting: {file_path} -> {converted_file_path}")
 
-            # Configure PDF pipeline with OCR setting from environment
-            do_ocr = os.getenv("DOCLING_DO_OCR", "false").lower() in ("true", "1", "yes")
+            # Reuse the per-process singleton — OCR mode was fixed at worker startup
+            # from DOCLING_DO_OCR. Changing OCR per request requires a worker restart.
+            converter = _get_docling_converter()
+            do_ocr = _DOCLING_DO_OCR
             span.set_attribute("docling.ocr_enabled", do_ocr)
-            
-            pdf_options = PdfPipelineOptions()
-            pdf_options.do_ocr = do_ocr
-            
-            # Convert the file with configured OCR setting
-            converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
-                }
-            )
-            
-            if do_ocr:
-                logger.info(f"[{conversion_id}] OCR enabled - may download models on first run")
             
             # Add timeout for conversion (default 2 hours for large/complex PDFs)
             CONVERSION_TIMEOUT_SECONDS = int(os.getenv("DOCLING_TIMEOUT_SECONDS", "7200"))
@@ -282,25 +364,8 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
             converted_file_path = os.path.join(converted_dir, f"{stem}.md")
             span.set_attribute("output.path", converted_file_path)
             
-            # Load dynamic converter from new converted backend
-            from app.converters.pymupdf import PyMuPDFConverter
-            from app.converters.markitdown import MarkItDownConverter
-            from app.converters.vlm import VLMConverter
-            from app.converters.marker import MarkerConverter
-            from app.converters.docling import DoclingConverter
+            converter = _get_plugin_converter(converter_type)
 
-            converters_map = {
-                "pymupdf": PyMuPDFConverter,
-                "markitdown": MarkItDownConverter,
-                "vlm": VLMConverter,
-                "marker": MarkerConverter,
-                "docling": DoclingConverter
-            }
-            converter_cls = converters_map.get(converter_type)
-            if not converter_cls:
-                raise ValueError(f"Unknown converter type: {converter_type}")
-            converter = converter_cls()
-            
             markdown_content = converter.convert(Path(file_path))
             markdown_content = _clean_markdown_content(markdown_content)
             span.set_attribute("output.markdown_length", len(markdown_content))
@@ -344,9 +409,17 @@ def main():
     # Use CLI arg, or fall back to settings (which auto-detects)
     host = args.host if args.host else settings.ZEROMQ_HOST
     
+    # Warm up docling BEFORE connecting to the task queue so we don't pull
+    # work while still loading models. Connecting after warmup is the
+    # readiness gate — a cold worker simply isn't subscribed yet.
+    if os.getenv("DOCLING_SKIP_WARMUP", "false").lower() not in ("true", "1", "yes"):
+        _warmup_docling()
+    else:
+        logger.info("DOCLING_SKIP_WARMUP set — skipping warmup")
+
     logger.info(f"Worker connecting to ZeroMQ host: {host}")
     logger.info(f"Task port: {settings.ZMQ_TASK_PORT}, Result port: {settings.ZMQ_RESULT_PORT}")
-    
+
     context = zmq.Context()
     task_receiver_socket = context.socket(zmq.PULL)
     task_receiver_socket.connect(f"tcp://{host}:{settings.ZMQ_TASK_PORT}")

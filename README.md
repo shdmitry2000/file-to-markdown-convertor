@@ -293,6 +293,6 @@ See main project LICENSE.
 
 ## See Also
 
-- [WORKER_FIX.md](./WORKER_FIX.md) - Details on Docker/standalone fix
+- [WORKER_FIX.md](./docs/archive/WORKER_FIX.md) - Details on Docker/standalone fix (archived)
 - [Docling Documentation](https://github.com/DS4SD/docling)
 - [ZeroMQ Guide](https://zeromq.org/get-started/)

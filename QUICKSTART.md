@@ -230,8 +230,8 @@ Converted markdown content here...
 ## 🔗 Related Documentation
 
 - [README.md](./README.md) - Full documentation
-- [WORKER_FIX.md](./WORKER_FIX.md) - Technical details of the fix
-- [TEST_RESULTS.md](./TEST_RESULTS.md) - Test results summary
+- [docs/archive/WORKER_FIX.md](./docs/archive/WORKER_FIX.md) - Technical details of the fix (archived)
+- [docs/archive/TEST_RESULTS.md](./docs/archive/TEST_RESULTS.md) - Test results summary (archived)
 
 ## ✨ Success Criteria
 

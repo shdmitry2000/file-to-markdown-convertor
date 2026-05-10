@@ -18,6 +18,31 @@ A distributed file conversion service that converts PDF and other documents to M
 - **Workers**: Pull tasks, convert files using Docling, push results back
 - **ZeroMQ**: Message queue for task distribution and result collection
 
+### Kubernetes / ZeroMQ (recommended layout)
+
+Split-brain or silent hangs usually come from **(a)** routing conversion HTTP and ZeroMQ to **different API replicas**, **(b)** kube-proxy long-lived TCP oddities, or **(c)** workers reconnecting while PUSH queued tasks behave oddly.
+
+**Robust pattern (matches this repo’s `docker-compose.yml` idea — API + worker in one lifecycle unit):**
+
+1. Run **`markdown-worker` as a second container in the same Pod as `markdown-api`** (sidecar).
+2. Bind/listen addresses unchanged (`tcp://*:5555` / `*:5556` on the API container).
+3. Point the worker at loopback only:
+
+   - `MARKDOWN_ZMQ_PEER_HOST=127.0.0.1` **or**
+   - `ZMQ_HOST=127.0.0.1` / `ZEROMQ_HOST=127.0.0.1`
+
+Then ZeroMQ never crosses ClusterIP or multiple replicas.
+
+**If you keep separate Deployments instead:**
+
+- **`markdown-api` replicas must stay `1`** until conversion status moves off in-memory maps into Redis/shared storage.
+- Expose ZMQ ports on the Service **only if workers are separate Pods**; after Helm edits restart API **then** workers (clean handshake).
+
+Environment notes:
+
+- Kubernetes defaults assume **`markdown-api`** as the DNS name (`docker-compose` may still use `api`; override with `ZMQ_HOST` if needed).
+- Helm keys **`ZMQ_HOST`** are honored (`ZEROMQ_HOST` is an alias).
+
 ## Features
 
 - ✅ Automatic Docker/Standalone mode detection

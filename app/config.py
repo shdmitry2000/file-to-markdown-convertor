@@ -15,6 +15,7 @@ Configuration priority:
 import os
 from pathlib import Path
 from functools import lru_cache
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -55,8 +56,16 @@ class WorkerSettings(BaseSettings):
     """Base path for project files (used in Docker/K8s for shared volumes)"""
     
     # ── ZeroMQ Configuration ───────────────────────────────────
-    ZEROMQ_HOST: str | None = None
-    """ZeroMQ host. Auto-configured based on environment if not set."""
+    ZEROMQ_HOST: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ZEROMQ_HOST", "ZMQ_HOST"),
+    )
+    """Peer hostname/IP for task + result sockets (worker connects here).
+
+    Helm charts often set ``ZMQ_HOST``; standalone docs use ``ZEROMQ_HOST``.
+    For Kubernetes the robust setup is **worker sidecar + ``127.0.0.1``**
+    (see README — avoids kube-proxy / multi-replica split brain).
+    """
     
     ZMQ_TASK_PORT: int = 5555
     """ZeroMQ port for task queue (PUSH/PULL). Configurable via env var."""
@@ -92,13 +101,21 @@ class WorkerSettings(BaseSettings):
     
     def _configure_zeromq(self):
         """Auto-configure ZeroMQ host based on environment if not explicitly set."""
-        if self.ZEROMQ_HOST is None:
-            if self.ENVIRONMENT in ['kubernetes', 'docker']:
-                # Docker/K8s: Connect to API service by hostname
-                self.ZEROMQ_HOST = "api"
-            else:
-                # Standalone: Connect to localhost
-                self.ZEROMQ_HOST = "localhost"
+        peer_override = os.environ.get("MARKDOWN_ZMQ_PEER_HOST")
+        if peer_override:
+            self.ZEROMQ_HOST = peer_override.strip()
+            return
+
+        if self.ZEROMQ_HOST is not None:
+            return
+
+        if self.ENVIRONMENT == "kubernetes":
+            # Compose historically used service name `api`; cluster DNS uses `markdown-api`.
+            self.ZEROMQ_HOST = "markdown-api"
+        elif self.ENVIRONMENT == "docker":
+            self.ZEROMQ_HOST = "api"
+        else:
+            self.ZEROMQ_HOST = "localhost"
     
     @property
     def zeromq_task_url(self) -> str:

@@ -187,7 +187,7 @@ async def get_converted_file(file_path: str):
         raise HTTPException(status_code=404, detail="Converted file not found")
     converted_file_path = lookup_path
 
-    with open(converted_file_path, "r") as f:
+    with open(converted_file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
     return {"content": content}

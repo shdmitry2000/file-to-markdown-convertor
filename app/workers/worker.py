@@ -2,11 +2,9 @@ import zmq
 import json
 import os
 import time
-import threading
+import multiprocessing
+import queue as queue_module
 from pathlib import Path
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.datamodel.base_models import InputFormat
 import frontmatter
 from datetime import datetime
 import logging
@@ -15,6 +13,20 @@ import uuid
 
 # Import configuration
 from app.config import get_settings
+
+
+def _read_do_ocr() -> bool:
+    """Read DOCLING_DO_OCR env var. Defaults to OFF.
+
+    Read once per request in the parent so the OTel span and the value
+    handed to the subprocess always agree.
+    """
+    return os.getenv("DOCLING_DO_OCR", "false").lower() in ("true", "1", "yes")
+
+
+def _read_timeout_seconds() -> int:
+    """Conversion hard timeout in seconds. Default 2h."""
+    return int(os.getenv("DOCLING_TIMEOUT_SECONDS", "7200"))
 
 # Configure logging
 logging.basicConfig(
@@ -54,99 +66,6 @@ def _setup_telemetry():
 tracer = _setup_telemetry()
 
 
-# ---------------------------------------------------------------------------
-# Converter singletons
-# ---------------------------------------------------------------------------
-# Building a DocumentConverter triggers heavy model loads on first .convert().
-# Holding one instance per worker process keeps that cost paid once at startup
-# instead of on every request.
-# ---------------------------------------------------------------------------
-
-_DOCLING_CONVERTER: DocumentConverter | None = None
-_DOCLING_DO_OCR: bool = False
-_PLUGIN_CONVERTERS: dict = {}
-
-
-def _get_docling_converter() -> DocumentConverter:
-    """Return the singleton DocumentConverter, building it on first call.
-
-    OCR mode is fixed at first call from the DOCLING_DO_OCR env var.
-    """
-    global _DOCLING_CONVERTER, _DOCLING_DO_OCR
-    if _DOCLING_CONVERTER is None:
-        _DOCLING_DO_OCR = os.getenv("DOCLING_DO_OCR", "false").lower() in ("true", "1", "yes")
-        pdf_options = PdfPipelineOptions()
-        pdf_options.do_ocr = _DOCLING_DO_OCR
-        _DOCLING_CONVERTER = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
-            }
-        )
-        logger.info(
-            f"DocumentConverter initialized (OCR={'on' if _DOCLING_DO_OCR else 'off'})"
-        )
-    return _DOCLING_CONVERTER
-
-
-def _get_plugin_converter(converter_type: str):
-    """Return a cached plugin converter instance (pymupdf/markitdown/vlm/marker/docling)."""
-    if converter_type in _PLUGIN_CONVERTERS:
-        return _PLUGIN_CONVERTERS[converter_type]
-
-    from app.converters.pymupdf import PyMuPDFConverter
-    from app.converters.markitdown import MarkItDownConverter
-    from app.converters.vlm import VLMConverter
-    from app.converters.marker import MarkerConverter
-    from app.converters.docling import DoclingConverter
-
-    converters_map = {
-        "pymupdf": PyMuPDFConverter,
-        "markitdown": MarkItDownConverter,
-        "vlm": VLMConverter,
-        "marker": MarkerConverter,
-        "docling": DoclingConverter,
-    }
-    cls = converters_map.get(converter_type)
-    if not cls:
-        raise ValueError(f"Unknown converter type: {converter_type}")
-    _PLUGIN_CONVERTERS[converter_type] = cls()
-    return _PLUGIN_CONVERTERS[converter_type]
-
-
-def _warmup_docling() -> None:
-    """Generate a tiny PDF and run one conversion so docling loads its models
-    before the worker starts accepting tasks. Best-effort: failures log a
-    warning and let the worker continue (first real request will then pay
-    the warmup cost)."""
-    import tempfile
-    t0 = time.time()
-    try:
-        import pymupdf  # transitive via pymupdf4llm
-    except ImportError:
-        logger.warning("pymupdf not available — skipping warmup; first request will be slow.")
-        _get_docling_converter()
-        return
-
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            warmup_path = Path(tmp) / "warmup.pdf"
-            doc = pymupdf.open()
-            page = doc.new_page()
-            page.insert_text((72, 72), "warmup")
-            doc.save(str(warmup_path))
-            doc.close()
-
-            converter = _get_docling_converter()
-            converter.convert(str(warmup_path))
-        logger.info(f"Docling warmup completed in {time.time() - t0:.1f}s — worker ready")
-    except Exception as e:
-        logger.warning(
-            f"Warmup conversion failed after {time.time() - t0:.1f}s: {e}. "
-            "Worker will continue; first request may be slow.",
-            exc_info=True,
-        )
-
-
 def _clean_markdown_content(content: str) -> str:
     """Clean markdown content to handle problematic characters.
     
@@ -184,9 +103,153 @@ def _clean_markdown_content(content: str) -> str:
     return content
 
 
+def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, result_queue) -> None:
+    """Subprocess target: run a single conversion and put the result on `result_queue`.
+
+    Module-level so multiprocessing can pickle it under the `spawn` start method,
+    and so tests can swap in their own callable without monkeypatching.
+    """
+    try:
+        if converter_type == "docling" or not converter_type:
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.datamodel.base_models import InputFormat
+
+            pdf_options = PdfPipelineOptions()
+            pdf_options.do_ocr = do_ocr
+            converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
+                }
+            )
+            result = converter.convert(file_path)
+            markdown = result.document.export_to_markdown()
+            num_pages = result.document.num_pages()
+            doc_name = repr(result.document.name)
+            doc_origin = repr(result.document.origin)
+        else:
+            from app.converters.pymupdf import PyMuPDFConverter
+            from app.converters.markitdown import MarkItDownConverter
+            from app.converters.vlm import VLMConverter
+            from app.converters.marker import MarkerConverter
+
+            converters_map = {
+                "pymupdf": PyMuPDFConverter,
+                "markitdown": MarkItDownConverter,
+                "vlm": VLMConverter,
+                "marker": MarkerConverter,
+            }
+            cls = converters_map.get(converter_type)
+            if not cls:
+                raise ValueError(f"Unknown converter type: {converter_type}")
+
+            converter = cls()
+            markdown = converter.convert(Path(file_path))
+            num_pages = max(1, len(markdown) // 2000)
+            doc_name = str(Path(file_path).name)
+            doc_origin = f"converter:{converter_type}"
+
+        result_queue.put(("success", {
+            "markdown": markdown,
+            "num_pages": num_pages,
+            "doc_name": doc_name,
+            "doc_origin": doc_origin,
+            "converter_used": converter_type,
+        }))
+    except Exception as e:
+        import traceback
+        result_queue.put(("error", str(e), traceback.format_exc()))
+
+
+def _run_converter_with_timeout(
+    file_path: str,
+    conversion_id: str,
+    converter_type: str,
+    timeout_seconds: int,
+    do_ocr: bool = False,
+    *,
+    _target=None,
+) -> dict:
+    """Run a conversion in a separate process with a hard timeout.
+
+    Args:
+        file_path: Path to file to convert.
+        conversion_id: Used for log correlation.
+        converter_type: docling | pymupdf | markitdown | marker | vlm.
+        timeout_seconds: Hard wall-clock limit; process is killed if exceeded.
+        do_ocr: Forwarded to the docling pipeline. Caller decides — there is no
+            implicit env lookup here, so the parent's OTel attributes and the
+            subprocess always see the same value.
+        _target: Test hook; defaults to `_convert_in_subprocess`.
+
+    Why we drain the queue before joining: a child that put() a large payload
+    (multi-MB markdown) blocks until the OS pipe is drained. If we join() first
+    we deadlock until the timeout, then kill a process that actually succeeded.
+    Reading from the queue first unblocks the put and lets the child exit.
+    """
+    target = _target or _convert_in_subprocess
+    result_queue = multiprocessing.Queue()
+
+    process = multiprocessing.Process(
+        target=target,
+        args=(file_path, converter_type, do_ocr, result_queue),
+    )
+    process.start()
+
+    # Drain the queue first; poll so we can also notice early subprocess death.
+    deadline = time.monotonic() + timeout_seconds
+    item = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            item = result_queue.get(timeout=min(2.0, remaining))
+            break
+        except queue_module.Empty:
+            if not process.is_alive():
+                # Crashed / killed without producing a result.
+                break
+
+    if item is None:
+        if process.is_alive():
+            logger.warning(
+                f"[{conversion_id}] Conversion timeout ({timeout_seconds}s), terminating process..."
+            )
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            raise TimeoutError(
+                f"Conversion exceeded {timeout_seconds}s timeout and was terminated"
+            )
+        # Process exited without producing a result — surface the exit code.
+        process.join(timeout=1)
+        raise Exception(
+            f"Conversion process exited (code={process.exitcode}) without producing a result"
+        )
+
+    # Got a result; let the child exit cleanly.
+    process.join(timeout=10)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+    if item[0] == "error":
+        error_msg = item[1]
+        traceback_info = item[2] if len(item) > 2 else ""
+        logger.error(f"[{conversion_id}] Subprocess error:\n{error_msg}\n{traceback_info}")
+        raise Exception(error_msg)
+    return item[1]
+
+
 def _convert_with_docling(file_path: str, conversion_id: str, result_sender_socket):
     """
-    Original Docling conversion logic exactly unchanged (isolated).
+    Docling conversion with timeout protection via multiprocessing.
     """
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
@@ -225,39 +288,36 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
             
             logger.info(f"[{conversion_id}] Converting: {file_path} -> {converted_file_path}")
 
-            # Reuse the per-process singleton — OCR mode was fixed at worker startup
-            # from DOCLING_DO_OCR. Changing OCR per request requires a worker restart.
-            converter = _get_docling_converter()
-            do_ocr = _DOCLING_DO_OCR
-            span.set_attribute("docling.ocr_enabled", do_ocr)
-            
-            # Add timeout for conversion (default 2 hours for large/complex PDFs)
-            CONVERSION_TIMEOUT_SECONDS = int(os.getenv("DOCLING_TIMEOUT_SECONDS", "7200"))
+            do_ocr = _read_do_ocr()
+            CONVERSION_TIMEOUT_SECONDS = _read_timeout_seconds()
             span.set_attribute("docling.timeout_seconds", CONVERSION_TIMEOUT_SECONDS)
-            
-            # Use threading to implement timeout for synchronous conversion
-            conversion_result = [None]  # Mutable container to store result
-            conversion_error = [None]
-            
-            def convert_with_timeout():
-                try:
-                    conversion_result[0] = converter.convert(file_path)
-                except Exception as e:
-                    conversion_error[0] = e
-            
+            span.set_attribute("docling.ocr_enabled", do_ocr)
+
             # ── Docling conversion span ──────────────────────────────────
             with tracer.start_as_current_span("docling.convert") as docling_span:
                 docling_span.set_attribute("file.path", file_path)
                 docling_span.set_attribute("ocr_enabled", do_ocr)
 
-                conversion_thread = threading.Thread(target=convert_with_timeout)
-                conversion_thread.daemon = True
-                conversion_thread.start()
-                conversion_thread.join(timeout=CONVERSION_TIMEOUT_SECONDS)
-                
-                if conversion_thread.is_alive():
-                    # Timeout occurred
-                    error_msg = f"Conversion exceeded {CONVERSION_TIMEOUT_SECONDS}s timeout"
+                try:
+                    result_data = _run_converter_with_timeout(
+                        file_path=file_path,
+                        conversion_id=conversion_id,
+                        converter_type="docling",
+                        timeout_seconds=CONVERSION_TIMEOUT_SECONDS,
+                        do_ocr=do_ocr,
+                    )
+                    
+                    markdown_content = result_data["markdown"]
+                    num_pages = result_data["num_pages"]
+                    doc_name = result_data["doc_name"]
+                    doc_origin = result_data["doc_origin"]
+                    
+                    docling_span.set_attribute("document.num_pages", num_pages)
+                    span.set_attribute("document.num_pages", num_pages)
+                    logger.info(f"[{conversion_id}] Docling converted {num_pages} pages")
+                    
+                except TimeoutError as e:
+                    error_msg = str(e)
                     logger.error(f"[{conversion_id}] {error_msg}")
                     docling_span.set_attribute("error", True)
                     docling_span.set_attribute("error.message", error_msg)
@@ -268,21 +328,17 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                         "error": error_msg
                     })
                     return
-                
-                if conversion_error[0]:
-                    docling_span.record_exception(conversion_error[0])
-                    raise conversion_error[0]
-                
-                if conversion_result[0] is None:
-                    raise ValueError("Conversion returned no result")
-                
-                result = conversion_result[0]
-                num_pages = result.document.num_pages()
-                docling_span.set_attribute("document.num_pages", num_pages)
-                span.set_attribute("document.num_pages", num_pages)
-                logger.info(f"[{conversion_id}] Docling converted {num_pages} pages")
-
-            markdown_content = result.document.export_to_markdown()
+                except Exception as e:
+                    logger.error(f"[{conversion_id}] Conversion error: {e}")
+                    docling_span.record_exception(e)
+                    docling_span.set_attribute("error", True)
+                    span.set_attribute("error", True)
+                    result_sender_socket.send_json({
+                        "conversion_id": conversion_id,
+                        "status": "failed",
+                        "error": str(e)
+                    })
+                    return
             
             # Clean markdown content to handle anomalies
             markdown_content = _clean_markdown_content(markdown_content)
@@ -297,9 +353,9 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                     "source_file": file_path,
                     "conversion_id": conversion_id,
                     "conversion_date": datetime.now().isoformat(),
-                    "docling_name": repr(result.document.name),
-                    "docling_origin": repr(result.document.origin),
-                    "docling_num_pages": result.document.num_pages(),
+                    "docling_name": doc_name,
+                    "docling_origin": doc_origin,
+                    "docling_num_pages": num_pages,
                 }
 
                 # Create a frontmatter Post
@@ -336,7 +392,7 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
     if converter_type == "docling" or not converter_type:
         return _convert_with_docling(file_path, conversion_id, result_sender_socket)
         
-    # Use PyMuPDF, MarkItDown, etc plugin
+    # Use PyMuPDF, MarkItDown, Marker, VLM, etc plugin with timeout protection
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
     with tracer.start_as_current_span("convert_file") as span:
@@ -364,9 +420,36 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
             converted_file_path = os.path.join(converted_dir, f"{stem}.md")
             span.set_attribute("output.path", converted_file_path)
             
-            converter = _get_plugin_converter(converter_type)
+            CONVERSION_TIMEOUT_SECONDS = _read_timeout_seconds()
+            span.set_attribute("converter.timeout_seconds", CONVERSION_TIMEOUT_SECONDS)
 
-            markdown_content = converter.convert(Path(file_path))
+            with tracer.start_as_current_span("converter.convert") as converter_span:
+                converter_span.set_attribute("converter_type", converter_type)
+
+                try:
+                    result_data = _run_converter_with_timeout(
+                        file_path=file_path,
+                        conversion_id=conversion_id,
+                        converter_type=converter_type,
+                        timeout_seconds=CONVERSION_TIMEOUT_SECONDS,
+                    )
+                    
+                    markdown_content = result_data["markdown"]
+                    num_pages = result_data.get("num_pages", 0)
+                    converter_span.set_attribute("document.num_pages", num_pages)
+                    
+                except TimeoutError as e:
+                    error_msg = f"{converter_type} conversion: {str(e)}"
+                    logger.error(f"[{conversion_id}] {error_msg}")
+                    converter_span.set_attribute("error", True)
+                    converter_span.set_attribute("error.message", error_msg)
+                    result_sender_socket.send_json({
+                        "conversion_id": conversion_id,
+                        "status": "failed",
+                        "error": error_msg
+                    })
+                    return
+
             markdown_content = _clean_markdown_content(markdown_content)
             span.set_attribute("output.markdown_length", len(markdown_content))
 
@@ -377,7 +460,8 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                     "source_file": file_path,
                     "conversion_id": conversion_id,
                     "conversion_date": datetime.now().isoformat(),
-                    "converter_used": converter_type
+                    "converter_used": converter_type,
+                    "num_pages": num_pages
                 }
                 post = frontmatter.Post(markdown_content)
                 post.metadata = metadata
@@ -408,14 +492,6 @@ def main():
     
     # Use CLI arg, or fall back to settings (which auto-detects)
     host = args.host if args.host else settings.ZEROMQ_HOST
-    
-    # Warm up docling BEFORE connecting to the task queue so we don't pull
-    # work while still loading models. Connecting after warmup is the
-    # readiness gate — a cold worker simply isn't subscribed yet.
-    if os.getenv("DOCLING_SKIP_WARMUP", "false").lower() not in ("true", "1", "yes"):
-        _warmup_docling()
-    else:
-        logger.info("DOCLING_SKIP_WARMUP set — skipping warmup")
 
     logger.info(f"Worker connecting to ZeroMQ host: {host}")
     logger.info(f"Task port: {settings.ZMQ_TASK_PORT}, Result port: {settings.ZMQ_RESULT_PORT}")
@@ -435,4 +511,6 @@ def main():
         convert_file_to_markdown(file_path, conversion_id, result_sender_socket, converter_type)
 
 if __name__ == "__main__":
+    # Required for multiprocessing on some platforms
+    multiprocessing.set_start_method('spawn', force=True)
     main()

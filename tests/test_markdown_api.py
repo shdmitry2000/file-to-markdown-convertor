@@ -119,7 +119,7 @@ def test_get_converted_file_success(client, tmp_path, monkeypatch):
     
     # Mock os.path.exists and file reading
     monkeypatch.setattr("os.path.exists", lambda p: True)
-    monkeypatch.setattr("builtins.open", lambda p, mode: test_file.open(mode))
+    monkeypatch.setattr("builtins.open", lambda p, mode, **kwargs: test_file.open(mode, **kwargs))
     
     response = client.get("/converted/test_doc.md")
     
@@ -176,7 +176,7 @@ async def test_conversion_flow_integration(client, test_file, monkeypatch):
     test_md_content = "# Converted Document"
     monkeypatch.setattr("os.path.exists", lambda p: True)
     
-    def mock_open(path, mode):
+    def mock_open(path, mode, **kwargs):
         from io import StringIO
         return StringIO(test_md_content)
     

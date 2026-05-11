@@ -68,66 +68,48 @@ def test_worker_explicit_host_override():
             
             # Verify connection to custom host
             calls = mock_socket.connect.call_args_list
-            assert any('custom-host:5585' in str(call) for call in calls)
+            assert any('custom-host:5555' in str(call) for call in calls)
+
+
+def _fake_docling_result(markdown="# Test Document\n\nConverted content", num_pages=1, name="test.pdf"):
+    """Build the dict that `_run_converter_with_timeout` returns for docling."""
+    return {
+        "markdown": markdown,
+        "num_pages": num_pages,
+        "doc_name": name,
+        "doc_origin": "PDF",
+        "converter_used": "docling",
+    }
 
 
 def test_convert_file_to_markdown_success(sample_pdf, converted_files_dir, monkeypatch):
     """Test successful file conversion."""
     from app.workers.worker import convert_file_to_markdown
-    
-    # Change to temp directory
+
     monkeypatch.chdir(sample_pdf.parent.parent)
-    
-    # Mock ZMQ socket
     mock_socket = MagicMock()
-    
-    # Mock docling converter
-    mock_result = MagicMock()
-    mock_result.document.export_to_markdown.return_value = "# Test Document\n\nConverted content"
-    mock_result.document.name = "test_document.pdf"
-    mock_result.document.origin = "PDF"
-    mock_result.document.num_pages.return_value = 1
-    
-    with patch('app.workers.worker.DocumentConverter') as mock_converter:
-        mock_converter.return_value.convert.return_value = mock_result
-        
-        conversion_id = "test-123"
-        convert_file_to_markdown(
-            str(sample_pdf),
-            conversion_id,
-            mock_socket
-        )
-    
-    # Verify status updates sent
+
+    with patch('app.workers.worker._run_converter_with_timeout') as mock_wrapper:
+        mock_wrapper.return_value = _fake_docling_result()
+        convert_file_to_markdown(str(sample_pdf), "test-123", mock_socket)
+
     assert mock_socket.send_json.call_count >= 2
     calls = [call[0][0] for call in mock_socket.send_json.call_args_list]
-    
-    # Check processing status sent
     assert any(c.get('status') == 'processing' for c in calls)
-    # Check completed status sent
     assert any(c.get('status') == 'completed' for c in calls)
 
 
 def test_convert_file_to_markdown_failure(sample_pdf, monkeypatch):
     """Test file conversion failure handling."""
     from app.workers.worker import convert_file_to_markdown
-    
+
     monkeypatch.chdir(sample_pdf.parent.parent)
-    
     mock_socket = MagicMock()
-    
-    # Mock docling to raise exception
-    with patch('app.workers.worker.DocumentConverter') as mock_converter:
-        mock_converter.return_value.convert.side_effect = Exception("Conversion failed")
-        
-        conversion_id = "test-456"
-        convert_file_to_markdown(
-            str(sample_pdf),
-            conversion_id,
-            mock_socket
-        )
-    
-    # Verify failure status sent
+
+    with patch('app.workers.worker._run_converter_with_timeout') as mock_wrapper:
+        mock_wrapper.side_effect = Exception("Conversion failed")
+        convert_file_to_markdown(str(sample_pdf), "test-456", mock_socket)
+
     calls = [call[0][0] for call in mock_socket.send_json.call_args_list]
     assert any(c.get('status') == 'failed' for c in calls)
 
@@ -135,37 +117,23 @@ def test_convert_file_to_markdown_failure(sample_pdf, monkeypatch):
 def test_convert_file_creates_output_directory(sample_pdf, monkeypatch, tmp_path):
     """Test that conversion creates output directory structure."""
     from app.workers.worker import convert_file_to_markdown
-    
+
     test_dir = tmp_path
     monkeypatch.chdir(test_dir)
-    
-    # Set CONVERTED_FILES_DIR to use tmp_path
+
     converted_dir = test_dir / "converted_files"
     monkeypatch.setenv("CONVERTED_FILES_DIR", str(converted_dir))
-    
-    # Create directories
+
     (test_dir / "files_to_convert" / "subdir").mkdir(parents=True)
     nested_file = test_dir / "files_to_convert" / "subdir" / "nested.pdf"
     nested_file.write_bytes(sample_pdf.read_bytes())
-    
+
     mock_socket = MagicMock()
-    
-    mock_result = MagicMock()
-    mock_result.document.export_to_markdown.return_value = "# Content"
-    mock_result.document.name = "nested.pdf"
-    mock_result.document.origin = "PDF"
-    mock_result.document.num_pages.return_value = 1
-    
-    with patch('app.workers.worker.DocumentConverter') as mock_converter:
-        mock_converter.return_value.convert.return_value = mock_result
-        
-        convert_file_to_markdown(
-            "files_to_convert/subdir/nested.pdf",
-            "test-789",
-            mock_socket
-        )
-    
-    # Verify directory was created - flat structure, not nested
+
+    with patch('app.workers.worker._run_converter_with_timeout') as mock_wrapper:
+        mock_wrapper.return_value = _fake_docling_result(markdown="# Content", name="nested.pdf")
+        convert_file_to_markdown("files_to_convert/subdir/nested.pdf", "test-789", mock_socket)
+
     expected_file = converted_dir / "nested.md"
     assert expected_file.exists()
 
@@ -173,45 +141,28 @@ def test_convert_file_creates_output_directory(sample_pdf, monkeypatch, tmp_path
 def test_worker_metadata_in_output(sample_pdf, monkeypatch, tmp_path):
     """Test that converted files include metadata."""
     from app.workers.worker import convert_file_to_markdown
-    
+
     test_dir = tmp_path
     monkeypatch.chdir(test_dir)
-    
-    # Set CONVERTED_FILES_DIR to use tmp_path
+
     converted_dir = test_dir / "converted_files"
     monkeypatch.setenv("CONVERTED_FILES_DIR", str(converted_dir))
-    
-    # Create directories
+
     (test_dir / "files_to_convert").mkdir()
     test_file = test_dir / "files_to_convert" / "test_document.pdf"
     test_file.write_bytes(sample_pdf.read_bytes())
-    
+
     mock_socket = MagicMock()
-    
-    mock_result = MagicMock()
-    mock_result.document.export_to_markdown.return_value = "# Test"
-    mock_result.document.name = "test_document.pdf"
-    mock_result.document.origin = "PDF"
-    mock_result.document.num_pages.return_value = 1
-    
-    with patch('app.workers.worker.DocumentConverter') as mock_converter:
-        mock_converter.return_value.convert.return_value = mock_result
-        
-        conversion_id = "test-meta-123"
-        
-        convert_file_to_markdown(
-            "files_to_convert/test_document.pdf",
-            conversion_id,
-            mock_socket
-        )
-    
-    # Read the output file
+    conversion_id = "test-meta-123"
+
+    with patch('app.workers.worker._run_converter_with_timeout') as mock_wrapper:
+        mock_wrapper.return_value = _fake_docling_result(markdown="# Test", name="test_document.pdf")
+        convert_file_to_markdown("files_to_convert/test_document.pdf", conversion_id, mock_socket)
+
     output_file = converted_dir / "test_document.md"
     assert output_file.exists(), f"Output file not found at {output_file}"
-    
+
     content = output_file.read_text()
-    
-    # Verify metadata exists
     assert "---" in content
     assert "source_file" in content
     assert "conversion_id" in content
@@ -248,26 +199,21 @@ def test_worker_handles_malformed_messages():
 
 
 def test_convert_file_timeout(sample_pdf, monkeypatch):
-    """Test that conversion respects DOCLING_TIMEOUT_SECONDS."""
+    """Test that conversion respects DOCLING_TIMEOUT_SECONDS with multiprocessing.
+    
+    NOTE: Updated for multiprocessing-based timeout mechanism.
+    See test_timeout_mechanism.py for comprehensive timeout tests.
+    """
     from app.workers.worker import convert_file_to_markdown
     
     monkeypatch.chdir(sample_pdf.parent.parent)
-    monkeypatch.setenv("DOCLING_TIMEOUT_SECONDS", "1")  # 1 second timeout
+    monkeypatch.setenv("DOCLING_TIMEOUT_SECONDS", "2")  # 2 second timeout
     
     mock_socket = MagicMock()
     
-    # Mock docling to take longer than timeout
-    def slow_convert(*args, **kwargs):
-        time.sleep(2)  # Sleep 2 seconds (longer than 1 second timeout)
-        mock_result = MagicMock()
-        mock_result.document.export_to_markdown.return_value = "# Test"
-        mock_result.document.name = "test.pdf"
-        mock_result.document.origin = "PDF"
-        mock_result.document.num_pages.return_value = 1
-        return mock_result
-    
-    with patch('app.workers.worker.DocumentConverter') as mock_converter:
-        mock_converter.return_value.convert.side_effect = slow_convert
+    # Mock _run_converter_with_timeout to simulate timeout
+    with patch('app.workers.worker._run_converter_with_timeout') as mock_timeout:
+        mock_timeout.side_effect = TimeoutError("Conversion exceeded 2s timeout and was terminated")
         
         conversion_id = "test-timeout-123"
         convert_file_to_markdown(

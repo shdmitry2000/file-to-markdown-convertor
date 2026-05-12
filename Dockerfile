@@ -32,6 +32,19 @@ COPY ./app ./app
 ENV UV_SYSTEM_PYTHON=true
 RUN uv pip install --no-cache-dir .
 
+# Pre-download docling models (layout + table extraction, WITHOUT OCR)
+# Initialize DocumentConverter with OCR disabled to trigger selective model downloads.
+# This downloads only: layout models + table extraction (~500-800MB), skips OCR models (~2GB).
+RUN python3 -c "\
+from docling.document_converter import DocumentConverter; \
+from docling.datamodel.pipeline_options import PdfPipelineOptions; \
+opts = PdfPipelineOptions(); \
+opts.do_ocr = False; \
+opts.do_table_structure = True; \
+converter = DocumentConverter(pdf_options=opts); \
+print('Docling models downloaded (layout + table, without OCR)'); \
+"
+
 
 # ---- Final Stage ----
 # This stage creates the final, small, production-ready image.
@@ -58,6 +71,10 @@ RUN apt-get update && \
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 # Copy the executables (like uvicorn) from the builder stage.
 COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy pre-downloaded docling models (layout + table extraction, WITHOUT OCR)
+# This makes the image production-ready with ~500-800MB of models instead of 2.5GB.
+COPY --from=builder /root/.cache/docling /home/appuser/.cache/docling
 
 # Create a non-root user for better security
 RUN useradd --create-home appuser && \

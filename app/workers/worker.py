@@ -24,6 +24,14 @@ def _read_do_ocr() -> bool:
     return os.getenv("DOCLING_DO_OCR", "false").lower() in ("true", "1", "yes")
 
 
+def _read_do_table_structure() -> bool:
+    """Read DOCLING_DO_TABLE_STRUCTURE env var. Defaults to ON.
+    
+    Table extraction is 4x slower but preserves table structure in markdown.
+    """
+    return os.getenv("DOCLING_DO_TABLE_STRUCTURE", "true").lower() in ("true", "1", "yes")
+
+
 def _read_timeout_seconds() -> int:
     """Conversion hard timeout in seconds. Default 2h."""
     return int(os.getenv("DOCLING_TIMEOUT_SECONDS", "7200"))
@@ -103,7 +111,7 @@ def _clean_markdown_content(content: str) -> str:
     return content
 
 
-def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, result_queue) -> None:
+def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, result_queue, do_table_structure: bool = True) -> None:
     """Subprocess target: run a single conversion and put the result on `result_queue`.
 
     Module-level so multiprocessing can pickle it under the `spawn` start method,
@@ -117,6 +125,7 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
 
             pdf_options = PdfPipelineOptions()
             pdf_options.do_ocr = do_ocr
+            pdf_options.do_table_structure = do_table_structure
             converter = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
@@ -167,6 +176,7 @@ def _run_converter_with_timeout(
     converter_type: str,
     timeout_seconds: int,
     do_ocr: bool = False,
+    do_table_structure: bool = True,
     *,
     _target=None,
 ) -> dict:
@@ -180,6 +190,7 @@ def _run_converter_with_timeout(
         do_ocr: Forwarded to the docling pipeline. Caller decides — there is no
             implicit env lookup here, so the parent's OTel attributes and the
             subprocess always see the same value.
+        do_table_structure: Enable table structure extraction (4x slower).
         _target: Test hook; defaults to `_convert_in_subprocess`.
 
     Why we drain the queue before joining: a child that put() a large payload
@@ -192,7 +203,7 @@ def _run_converter_with_timeout(
 
     process = multiprocessing.Process(
         target=target,
-        args=(file_path, converter_type, do_ocr, result_queue),
+        args=(file_path, converter_type, do_ocr, result_queue, do_table_structure),
     )
     process.start()
 
@@ -289,14 +300,21 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
             logger.info(f"[{conversion_id}] Converting: {file_path} -> {converted_file_path}")
 
             do_ocr = _read_do_ocr()
+            do_table_structure = _read_do_table_structure()
             CONVERSION_TIMEOUT_SECONDS = _read_timeout_seconds()
+            
+            # Log config for debugging
+            logger.info(f"[{conversion_id}] Docling config: OCR={do_ocr}, Tables={do_table_structure}, Timeout={CONVERSION_TIMEOUT_SECONDS}s")
+            
             span.set_attribute("docling.timeout_seconds", CONVERSION_TIMEOUT_SECONDS)
             span.set_attribute("docling.ocr_enabled", do_ocr)
+            span.set_attribute("docling.table_structure_enabled", do_table_structure)
 
             # ── Docling conversion span ──────────────────────────────────
             with tracer.start_as_current_span("docling.convert") as docling_span:
                 docling_span.set_attribute("file.path", file_path)
                 docling_span.set_attribute("ocr_enabled", do_ocr)
+                docling_span.set_attribute("table_structure_enabled", do_table_structure)
 
                 try:
                     result_data = _run_converter_with_timeout(
@@ -305,6 +323,7 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                         converter_type="docling",
                         timeout_seconds=CONVERSION_TIMEOUT_SECONDS,
                         do_ocr=do_ocr,
+                        do_table_structure=do_table_structure,
                     )
                     
                     markdown_content = result_data["markdown"]

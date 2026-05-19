@@ -30,20 +30,27 @@ COPY ./app ./app
 
 # Install ALL dependencies from pyproject.toml
 ENV UV_SYSTEM_PYTHON=true
+# Docling v2 pulls layout/table weights via Hugging Face — pin cache path for reproducible COPY.
+ENV HF_HOME=/root/.cache/huggingface
+RUN mkdir -p "${HF_HOME}"
 RUN uv pip install --no-cache-dir .
 
 # Pre-download docling models (layout + table extraction, WITHOUT OCR)
-# Initialize DocumentConverter with OCR disabled to trigger selective model downloads.
-# This downloads only: layout models + table extraction (~500-800MB), skips OCR models (~2GB).
+# Match runtime API (DocumentConverter + PdfFormatOption + InputFormat).
 RUN python3 -c "\
-from docling.document_converter import DocumentConverter; \
+from docling.document_converter import DocumentConverter, PdfFormatOption; \
 from docling.datamodel.pipeline_options import PdfPipelineOptions; \
+from docling.datamodel.base_models import InputFormat; \
 opts = PdfPipelineOptions(); \
 opts.do_ocr = False; \
 opts.do_table_structure = True; \
-converter = DocumentConverter(pdf_options=opts); \
+converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}); \
 print('Docling models downloaded (layout + table, without OCR)'); \
 "
+
+# Bundle whatever landed under /root/.cache (HF hub, docling, etc.) for the runtime stage.
+RUN mkdir -p /export/root-cache && \
+    if [ -d /root/.cache ]; then cp -a /root/.cache/. /export/root-cache/; else true; fi
 
 
 # ---- Final Stage ----
@@ -72,9 +79,12 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 # Copy the executables (like uvicorn) from the builder stage.
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy pre-downloaded docling models (layout + table extraction, WITHOUT OCR)
-# This makes the image production-ready with ~500-800MB of models instead of 2.5GB.
-COPY --from=builder /root/.cache/docling /home/appuser/.cache/docling
+# Copy pre-downloaded caches (HF / docling artifacts from builder)
+RUN mkdir -p /home/appuser/.cache
+COPY --from=builder /export/root-cache/ /home/appuser/.cache/
+
+# Match builder: docling uses Hugging Face hub for weights
+ENV HF_HOME=/home/appuser/.cache/huggingface
 
 # Create a non-root user for better security
 RUN useradd --create-home appuser && \

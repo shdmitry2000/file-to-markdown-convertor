@@ -49,6 +49,15 @@ class ConverterMeta:
     description: str = ""
 
 
+@dataclass
+class ChunkerMeta:
+    name: str              # enum value, e.g. "docling_hybrid"
+    label: str             # human-readable, e.g. "Docling HybridChunker"
+    description: str = ""
+    # Map name → callable returning a Chunker instance (lazy import).
+    factory: object = None
+
+
 # ---------------------------------------------------------------------------
 # Registry singleton
 # ---------------------------------------------------------------------------
@@ -62,6 +71,8 @@ class _CapabilityRegistry:
         self._splitters: Dict[str, SplitterLibraryMeta] = {}
         # converter_name → ConverterMeta
         self._converters: Dict[str, ConverterMeta] = {}
+        # chunker_name → ChunkerMeta
+        self._chunkers: Dict[str, "ChunkerMeta"] = {}
 
     # ------------------------------------------------------------------
     # Registration API
@@ -97,6 +108,25 @@ class _CapabilityRegistry:
                 name=name, label=label, description=description
             )
 
+    def add_chunker(
+        self,
+        name: str,
+        label: str,
+        factory,
+        description: str = "",
+    ) -> None:
+        if name not in self._chunkers:
+            self._chunkers[name] = ChunkerMeta(
+                name=name, label=label, description=description, factory=factory,
+            )
+
+    def get_chunker(self, name: str):
+        """Return a new chunker instance, or None if unknown."""
+        meta = self._chunkers.get(name)
+        if meta is None or meta.factory is None:
+            return None
+        return meta.factory()
+
     # ------------------------------------------------------------------
     # Query API
     # ------------------------------------------------------------------
@@ -126,6 +156,15 @@ class _CapabilityRegistry:
                     "description": c.description,
                 }
                 for c in self._converters.values()
+            ],
+        }
+
+    def get_chunker_capabilities(self) -> Dict[str, Any]:
+        """Return chunker capabilities served at /chunk/capabilities."""
+        return {
+            "chunkers": [
+                {"name": c.name, "label": c.label, "description": c.description}
+                for c in self._chunkers.values()
             ],
         }
 
@@ -167,6 +206,22 @@ def register_splitter(
             description=description,
         )
         return fn
+    return decorator
+
+
+def register_chunker(name: str, label: str, description: str = ""):
+    """Class decorator for chunker classes — registers on import.
+
+    The class must be callable with no args to produce a chunker instance.
+    Use it like::
+
+        @register_chunker(name="docling_hybrid", label="Docling HybridChunker", ...)
+        class DoclingHybridChunkerImpl:
+            def chunk(self, markdown: str, params: dict) -> list[dict]: ...
+    """
+    def decorator(cls):
+        registry.add_chunker(name=name, label=label, factory=cls, description=description)
+        return cls
     return decorator
 
 

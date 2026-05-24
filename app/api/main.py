@@ -30,6 +30,9 @@ import app.converters.vlm          # noqa: F401
 import app.converters.docling      # noqa: F401
 import app.converters.marker       # noqa: F401
 
+# Import chunkers so their @register_chunker decorators run
+import app.chunkers                # noqa: F401
+
 # Load settings
 settings = get_settings()
 logger.info(f"Starting in {settings.ENVIRONMENT} mode")
@@ -427,6 +430,97 @@ async def get_capabilities():
         GET http://localhost:8000/capabilities
     """
     return registry.get_capabilities()
+
+
+# ==================== CHUNK ENDPOINTS ====================
+
+
+class ChunkRequest(BaseModel):
+    """Body for POST /chunk.
+
+    Either `markdown` (text) is provided directly, or the caller uploads a file
+    in a future variant. For now JSON-only with `markdown` field is supported.
+    """
+    markdown: str
+    chunker: str = "docling_hybrid"
+    params: Dict = {}
+
+
+class ChunkResponse(BaseModel):
+    chunks: list
+
+
+@app.get("/chunk/capabilities")
+async def chunk_capabilities():
+    """List registered chunkers.
+
+    Response example::
+
+        {
+          "chunkers": [
+            {"name": "docling_hybrid",
+             "label": "Docling HybridChunker",
+             "description": "Context-aware token-aware chunking..."}
+          ]
+        }
+    """
+    return registry.get_chunker_capabilities()
+
+
+@app.post("/chunk", response_model=ChunkResponse)
+async def chunk(request: ChunkRequest):
+    """Run a registered chunker over a markdown string.
+
+    Synchronous (chunking is fast vs PDF conversion; no ZeroMQ worker dispatch
+    needed). For Docling HybridChunker: markdown → DoclingDocument →
+    HybridChunker → list of chunks with heading_path + token_count + page.
+
+    Body::
+
+        {
+          "markdown": "# Title\\n\\nBody text...",
+          "chunker": "docling_hybrid",
+          "params": {"max_tokens": 512, "merge_peers": true}
+        }
+
+    Response::
+
+        {
+          "chunks": [
+            {
+              "text": "...",
+              "heading_path": ["Title", "Subsection"],
+              "token_count": 487,
+              "page": 3,
+              "contextualized_text": "Title > Subsection\\n...",
+            },
+            ...
+          ]
+        }
+    """
+    chunker_impl = registry.get_chunker(request.chunker)
+    if chunker_impl is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown chunker {request.chunker!r}. "
+                f"Available: see GET /chunk/capabilities"
+            ),
+        )
+    if not request.markdown:
+        return {"chunks": []}
+    try:
+        chunks = await asyncio.to_thread(chunker_impl.chunk, request.markdown, request.params)
+    except RuntimeError as exc:
+        # Dependency error (e.g. docling not installed).
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Chunker %s failed", request.chunker)
+        raise HTTPException(status_code=500, detail=f"Chunker failed: {exc}")
+    return {"chunks": chunks}
+
+
+# ==================== END CHUNK ENDPOINTS ====================
 
 
 @app.get("/health")

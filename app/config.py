@@ -72,6 +72,13 @@ class WorkerSettings(BaseSettings):
     
     ZMQ_RESULT_PORT: int = 5556
     """ZeroMQ port for result queue (PUSH/PULL). Configurable via env var."""
+
+    ZMQ_CHUNK_PORT: int = 5557
+    """ZeroMQ port for the chunking ROUTER service (REQ/REP). External
+    clients (e.g. v2's DoclingHybridChunker plugin) open a REQ socket and
+    talk directly to chunk_server. Symmetric topology — no ingress proxy
+    or reply_to hack needed. Conversion still uses 5555/5556 PUSH/PULL.
+    """
     
     # ── Logging ────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
@@ -122,6 +129,11 @@ class WorkerSettings(BaseSettings):
         """Full ZeroMQ URL for task queue."""
         return f"tcp://{self.ZEROMQ_HOST}:{self.ZMQ_TASK_PORT}"
     
+    @property
+    def zeromq_chunk_url(self) -> str:
+        """Full ZeroMQ URL for the chunking ROUTER service."""
+        return f"tcp://{self.ZEROMQ_HOST}:{self.ZMQ_CHUNK_PORT}"
+
     @property
     def zeromq_result_url(self) -> str:
         """Full ZeroMQ URL for result queue."""

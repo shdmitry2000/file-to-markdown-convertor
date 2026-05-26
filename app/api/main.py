@@ -65,6 +65,10 @@ pending_conversions_db: Dict[str, Dict] = {}  # Pending conversions with metadat
 active_conversions_db: Dict[str, Dict] = {}  # Active conversions with metadata
 last_completion_timestamp = time.time()  # Track last successful conversion
 
+# In-memory database for chunking tasks
+chunk_status_db: Dict[str, str] = {}
+chunk_results_db: Dict[str, Dict] = {}  # Stores chunk results
+
 # ZeroMQ setup
 context = zmq.Context()
 
@@ -87,21 +91,36 @@ def result_listener():
         try:
             result = result_socket.recv_json()
             if isinstance(result, dict):
-                conversion_id = result.get("conversion_id")
-                status = result.get("status")
-                if isinstance(conversion_id, str) and isinstance(status, str):
-                    logger.info(f"Received status update for {conversion_id}: {status}")
-                    conversion_status_db[conversion_id] = status
-                    
-                    # Update last completion timestamp if conversion finished
-                    if status in ["completed", "success", "failed", "error"]:
-                        last_completion_timestamp = time.time()
+                result_type = result.get("type")
+                
+                if result_type == "chunk":
+                    # Handle chunking results
+                    chunk_id = result.get("chunk_id")
+                    status = result.get("status")
+                    if isinstance(chunk_id, str) and isinstance(status, str):
+                        logger.info(f"Received chunk status update for {chunk_id}: {status}")
+                        chunk_status_db[chunk_id] = status
+                        chunk_results_db[chunk_id] = result
                         
-                        # Move from active to completed
-                        if conversion_id in active_conversions_db:
-                            del active_conversions_db[conversion_id]
-                        if conversion_id in pending_conversions_db:
-                            del pending_conversions_db[conversion_id]
+                        if status in ["completed", "success", "failed", "error"]:
+                            last_completion_timestamp = time.time()
+                else:
+                    # Handle conversion results (existing logic)
+                    conversion_id = result.get("conversion_id")
+                    status = result.get("status")
+                    if isinstance(conversion_id, str) and isinstance(status, str):
+                        logger.info(f"Received status update for {conversion_id}: {status}")
+                        conversion_status_db[conversion_id] = status
+                        
+                        # Update last completion timestamp if conversion finished
+                        if status in ["completed", "success", "failed", "error"]:
+                            last_completion_timestamp = time.time()
+                            
+                            # Move from active to completed
+                            if conversion_id in active_conversions_db:
+                                del active_conversions_db[conversion_id]
+                            if conversion_id in pending_conversions_db:
+                                del pending_conversions_db[conversion_id]
             else:
                 logger.warning(f"Received non-dict message: {result}")
         except zmq.ZMQError as e:
@@ -450,6 +469,22 @@ class ChunkResponse(BaseModel):
     chunks: list
 
 
+class ChunkAsyncRequest(BaseModel):
+    """Body for POST /chunk-async (async PDF chunking via ZeroMQ)."""
+    chunk_id: str
+    file_path: str
+    chunker: str = "docling_hybrid"
+    params: Dict = {}
+
+
+class ChunkStatusResponse(BaseModel):
+    """Response for GET /chunk-status/{chunk_id}."""
+    chunk_id: str
+    status: str  # pending, processing, completed, failed
+    chunks: list = []
+    error: str = ""
+
+
 @app.get("/chunk/capabilities")
 async def chunk_capabilities():
     """List registered chunkers.
@@ -518,6 +553,92 @@ async def chunk(request: ChunkRequest):
         logger.exception("Chunker %s failed", request.chunker)
         raise HTTPException(status_code=500, detail=f"Chunker failed: {exc}")
     return {"chunks": chunks}
+
+
+@app.post("/chunk-async")
+async def submit_chunk_task(request: ChunkAsyncRequest):
+    """Submit async chunking task to ZeroMQ workers.
+    
+    This endpoint is for PDF → chunks flow (no markdown intermediary).
+    The worker processes PDF directly via Docling HybridChunker.
+    
+    Body::
+    
+        {
+          "chunk_id": "unique-id",
+          "file_path": "/path/to/document.pdf",
+          "chunker": "docling_hybrid",
+          "params": {"max_tokens": 512, "merge_peers": true}
+        }
+    
+    Response::
+    
+        {
+          "chunk_id": "unique-id",
+          "status": "pending"
+        }
+    
+    Poll GET /chunk-status/{chunk_id} for results.
+    """
+    task = {
+        "type": "chunk",
+        "chunk_id": request.chunk_id,
+        "file_path": request.file_path,
+        "chunker": request.chunker,
+        "params": request.params
+    }
+    
+    task_socket.send_string(json.dumps(task))
+    chunk_status_db[request.chunk_id] = "pending"
+    
+    logger.info(f"Submitted chunk task {request.chunk_id} for {request.file_path}")
+    return {"chunk_id": request.chunk_id, "status": "pending"}
+
+
+@app.get("/chunk-status/{chunk_id}", response_model=ChunkStatusResponse)
+async def get_chunk_status(chunk_id: str):
+    """Poll chunking task status.
+    
+    Response statuses:
+    - pending: Task queued
+    - processing: Worker is chunking
+    - completed: Chunks ready (includes chunks array)
+    - failed: Error occurred (includes error message)
+    
+    Response::
+    
+        {
+          "chunk_id": "unique-id",
+          "status": "completed",
+          "chunks": [
+            {
+              "text": "...",
+              "index": 0,
+              "metadata": {
+                "heading_path": ["Title"],
+                "page": 1,
+                "token_count": 487
+              },
+              "contextualized_text": "Title\\n..."
+            },
+            ...
+          ]
+        }
+    """
+    if chunk_id not in chunk_status_db:
+        raise HTTPException(status_code=404, detail="Chunk ID not found")
+    
+    status = chunk_status_db[chunk_id]
+    response = {"chunk_id": chunk_id, "status": status, "chunks": [], "error": ""}
+    
+    if status == "completed":
+        result = chunk_results_db.get(chunk_id, {})
+        response["chunks"] = result.get("chunks", [])
+    elif status == "failed":
+        result = chunk_results_db.get(chunk_id, {})
+        response["error"] = result.get("error", "Unknown error")
+    
+    return response
 
 
 # ==================== END CHUNK ENDPOINTS ====================

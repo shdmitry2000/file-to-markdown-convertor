@@ -14,6 +14,9 @@ import uuid
 # Import configuration
 from app.config import get_settings
 
+# Import chunkers to trigger @register_chunker decorators
+import app.chunkers  # noqa: F401
+
 
 def _read_do_ocr() -> bool:
     """Read DOCLING_DO_OCR env var. Defaults to OFF.
@@ -504,8 +507,90 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
             result_sender_socket.send_json({"conversion_id": conversion_id, "status": "failed", "error": str(e)})
 
 
+def chunk_file(file_path: str, chunk_id: str, result_sender_socket, chunker_type: str = "docling_hybrid", params: dict = None):
+    """Handle a chunking task delivered via the convert worker's PUSH queue.
+
+    Result is sent back on result_sender_socket (5556) with type='chunk',
+    matching the existing HTTP /chunk-async + status-polling flow in
+    app/api/main.py. For synchronous REQ/REP ingest (the v2 indexer path),
+    use chunk_server.py instead — it bypasses the convert queue entirely.
+    """
+    params = params or {}
+    result_socket = result_sender_socket
+
+    with tracer.start_as_current_span("chunk_file") as span:
+        span.set_attribute("chunk.id", chunk_id)
+        span.set_attribute("file.path", file_path)
+        span.set_attribute("file.name", Path(file_path).name)
+        span.set_attribute("chunker_type", chunker_type)
+
+        logger.info(f"[{chunk_id}] Received chunking task for: {file_path} using {chunker_type}")
+
+        result_socket.send_json({
+            "chunk_id": chunk_id,
+            "status": "processing",
+            "type": "chunk"
+        })
+        
+        try:
+            if not os.path.exists(file_path):
+                error_msg = f"File not found: {file_path}"
+                result_socket.send_json({
+                    "chunk_id": chunk_id,
+                    "status": "failed",
+                    "error": error_msg,
+                    "type": "chunk"
+                })
+                return
+            
+            # Get chunker from registry
+            from app.registry import registry
+            chunker = registry.get_chunker(chunker_type)
+            
+            if chunker is None:
+                error_msg = f"Unknown chunker type: {chunker_type}"
+                result_socket.send_json({
+                    "chunk_id": chunk_id,
+                    "status": "failed",
+                    "error": error_msg,
+                    "type": "chunk"
+                })
+                return
+            
+            with tracer.start_as_current_span("chunker.chunk") as chunker_span:
+                chunker_span.set_attribute("chunker_type", chunker_type)
+                chunker_span.set_attribute("params", json.dumps(params))
+                
+                # Chunk the file (PDF → chunks directly)
+                chunks = chunker.chunk(file_path, params)
+                
+                chunker_span.set_attribute("chunks.count", len(chunks))
+            
+            result_socket.send_json({
+                "chunk_id": chunk_id,
+                "status": "completed",
+                "chunks": chunks,
+                "type": "chunk"
+            })
+            logger.info(f"[{chunk_id}] Successfully chunked {file_path} into {len(chunks)} chunks")
+            
+        except Exception as e:
+            logger.error(f"[{chunk_id}] Chunking failed: {e}", exc_info=True)
+            try:
+                span.record_exception(e)
+                span.set_attribute("error", True)
+            except Exception:
+                pass
+            result_socket.send_json({
+                "chunk_id": chunk_id,
+                "status": "failed",
+                "error": str(e),
+                "type": "chunk"
+            })
+
+
 def main():
-    parser = argparse.ArgumentParser(description="ZeroMQ worker for file conversion.")
+    parser = argparse.ArgumentParser(description="ZeroMQ worker for file conversion and chunking.")
     parser.add_argument("--host", type=str, default=None, help="ZeroMQ host (overrides auto-detection)")
     args = parser.parse_args()
     
@@ -524,10 +609,31 @@ def main():
     while True:
         message = task_receiver_socket.recv_string()
         task = json.loads(message)
-        conversion_id = task["conversion_id"]
-        file_path = task["file_path"]
-        converter_type = task.get("converter_type", "docling")
-        convert_file_to_markdown(file_path, conversion_id, result_sender_socket, converter_type)
+        task_type = task.get("type", "convert")  # Default: convert
+        
+        if task_type == "convert":
+            # Existing conversion flow
+            conversion_id = task["conversion_id"]
+            file_path = task["file_path"]
+            converter_type = task.get("converter_type", "docling")
+            convert_file_to_markdown(file_path, conversion_id, result_sender_socket, converter_type)
+        elif task_type == "chunk":
+            # Chunking via HTTP /chunk-async flow. Synchronous REQ/REP ingest
+            # uses chunk_server.py (port 5557) instead.
+            chunk_id = task["chunk_id"]
+            file_path = task["file_path"]
+            chunker_type = task.get("chunker", "docling_hybrid")
+            params = task.get("params", {})
+            chunk_file(file_path, chunk_id, result_sender_socket, chunker_type, params)
+        else:
+            logger.error(f"Unknown task type: {task_type}")
+            # Send error response (need an ID field)
+            task_id = task.get("chunk_id") or task.get("conversion_id") or "unknown"
+            result_sender_socket.send_json({
+                "task_id": task_id,
+                "status": "failed",
+                "error": f"Unknown task type: {task_type}"
+            })
 
 if __name__ == "__main__":
     # Required for multiprocessing on some platforms

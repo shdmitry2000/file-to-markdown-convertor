@@ -1,26 +1,26 @@
-"""Docling HybridChunker — context-aware token-aware chunking of markdown.
+"""Docling HybridChunker — context-aware chunking with Hebrew support.
+
+Processes PDFs directly: PDF → DoclingDocument → Chunks (no markdown intermediary).
+Uses proper docling_core API with Hebrew-compatible tokenizer and markdown table
+serialization for better embedding quality.
 
 Pipeline:
-  1. Write incoming markdown to a temp .md file (Docling needs a path or stream).
-  2. Run DocumentConverter to get a DoclingDocument with structural metadata
-     (headings, paragraphs, tables).
-  3. Run HybridChunker(tokenizer, max_tokens, merge_peers) over the document.
-  4. For each Chonkie/Docling chunk, extract text + heading_path + token_count.
+  1. PDF → DocumentConverter → DoclingDocument (with structure metadata)
+  2. Configure HybridChunker with Hebrew tokenizer + markdown table serializer
+  3. Chunk DoclingDocument → structured chunks with heading_path, page, token_count
 
-Params (POST /chunk body.params):
-  max_tokens: int = 512        — HybridChunker target chunk size in tokens
-  merge_peers: bool = True     — merge small adjacent chunks
-  tokenizer:   str = "sentence-transformers/all-MiniLM-L6-v2" — for token counting
+Params:
+  max_tokens: int = 512        — Target chunk size in tokens (up to 8K supported)
+  merge_peers: bool = True     — Merge small adjacent chunks
+  tokenizer: str               — HuggingFace tokenizer model (default: potion-multilingual-128M)
 
-This chunker runs in the markdown-api process (Docling + HF weights live here,
-pre-downloaded in the Docker image). v2's DoclingHybridChunker plugin is just
-an HTTP client to this endpoint.
+Runs in markdown-api workers via ZeroMQ. v2's DoclingHybridChunker plugin sends
+chunking tasks and polls for results.
 """
 
 from __future__ import annotations
 
 import logging
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -32,96 +32,129 @@ logger = logging.getLogger(__name__)
 
 @register_chunker(
     name="docling_hybrid",
-    label="Docling HybridChunker",
+    label="Docling · HybridChunker (Hebrew-optimized)",
     description=(
-        "Context-aware token-aware chunking. Preserves heading hierarchy, table "
-        "boundaries, and section structure via Docling's DocumentConverter + "
-        "HybridChunker. Token-counted via configurable tokenizer."
+        "Context-aware chunking via Docling's HybridChunker. Processes PDFs directly, "
+        "preserves document structure (heading hierarchy, table boundaries). Uses Hebrew-compatible "
+        "tokenizer (potion-multilingual-128M, 8K tokens) and markdown table serialization. "
+        "Recommended for multilingual documents."
     ),
 )
 class DoclingHybridChunkerImpl(Chunker):
-    def chunk(self, markdown: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-        if not markdown:
-            return []
-
+    def chunk(self, file_path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Chunk PDF directly without markdown conversion.
+        
+        Args:
+            file_path: Path to PDF file
+            params: {
+                "max_tokens": 512,         # Target chunk size (up to 8K)
+                "merge_peers": True,       # Merge small adjacent chunks
+                "tokenizer": "minishlab/potion-multilingual-128M"  # Hebrew-compatible
+            }
+        
+        Returns:
+            List of chunks with text, metadata (heading_path, page, token_count)
+        """
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        # Config
         max_tokens = int(params.get("max_tokens", 512))
         merge_peers = bool(params.get("merge_peers", True))
-        tokenizer_id = params.get("tokenizer", "sentence-transformers/all-MiniLM-L6-v2")
-
-        # Late import: keep the registration decorator cheap on cold start.
+        # Use potion-multilingual: proven Hebrew support, 8K tokens
+        tokenizer_id = params.get("tokenizer", "minishlab/potion-multilingual-128M")
+        
+        # Late import: keep registration decorator cheap on cold start
         try:
-            from docling.chunking import HybridChunker
             from docling.document_converter import DocumentConverter
+            from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+            from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+            from docling_core.transforms.chunker.hierarchical_chunker import (
+                ChunkingDocSerializer,
+                ChunkingSerializerProvider,
+            )
+            from docling_core.transforms.serializer.markdown import MarkdownTableSerializer
             from transformers import AutoTokenizer
         except ImportError as exc:
             raise RuntimeError(
                 f"DoclingHybridChunker dependencies not installed: {exc}. "
-                "Need docling + transformers."
+                "Need docling, docling-core, transformers."
             )
-
-        # Step 1+2: markdown → DoclingDocument (write to temp file so Docling can ingest).
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", suffix=".md", delete=False,
-        ) as tmp:
-            tmp.write(markdown)
-            tmp_path = Path(tmp.name)
-        try:
-            converter = DocumentConverter()
-            result = converter.convert(str(tmp_path))
-            dl_doc = result.document
-        finally:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-
-        # Step 3: tokenizer + chunker.
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        
+        # Step 1: PDF → DoclingDocument
+        logger.info(f"Converting PDF to DoclingDocument: {file_path}")
+        converter = DocumentConverter()
+        result = converter.convert(str(path))
+        dl_doc = result.document
+        logger.info(f"Converted PDF: {dl_doc.num_pages()} pages")
+        
+        # Step 2: Tokenizer setup (8K token support for up to 4K chunks)
+        logger.info(f"Loading tokenizer: {tokenizer_id}")
+        hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        tokenizer = HuggingFaceTokenizer(tokenizer=hf_tokenizer, max_tokens=max_tokens)
+        
+        # Step 3: Hebrew-optimized serializer (markdown tables for better embeddings)
+        class HebrewOptimizedSerializerProvider(ChunkingSerializerProvider):
+            """Markdown table serialization for better Hebrew embedding quality."""
+            def get_serializer(self, doc):
+                return ChunkingDocSerializer(
+                    doc=doc,
+                    table_serializer=MarkdownTableSerializer(),
+                )
+        
+        # Step 4: HybridChunker with Hebrew-optimized serialization
+        logger.info(f"Chunking with max_tokens={max_tokens}, merge_peers={merge_peers}")
         chunker = HybridChunker(
             tokenizer=tokenizer,
             max_tokens=max_tokens,
             merge_peers=merge_peers,
+            serializer_provider=HebrewOptimizedSerializerProvider(),
         )
-
-        # Step 4: produce chunks with metadata.
+        
+        # Step 5: Chunk and extract metadata
         out: list[dict[str, Any]] = []
-        for raw in chunker.chunk(dl_doc=dl_doc):
-            entry: dict[str, Any] = {"text": getattr(raw, "text", "") or ""}
-            # Docling HybridChunker chunks expose `.meta` (ChunkMeta) with headings.
-            meta = getattr(raw, "meta", None)
-            if meta is not None:
-                headings = getattr(meta, "headings", None)
-                if headings:
-                    entry["heading_path"] = list(headings)
-                page_no = _first_page(meta)
-                if page_no is not None:
-                    entry["page"] = page_no
-            # contextualize() prepends heading context — useful for embedding;
-            # we surface it as a sibling field so callers can choose.
+        for i, chunk in enumerate(chunker.chunk(dl_doc=dl_doc)):
+            entry = {
+                "text": chunk.text,
+                "index": i,
+                "metadata": {}
+            }
+            
+            # Extract metadata
+            if chunk.meta:
+                # Heading path
+                if chunk.meta.headings:
+                    entry["metadata"]["heading_path"] = list(chunk.meta.headings)
+                
+                # Page number
+                if hasattr(chunk.meta, "doc_items") and chunk.meta.doc_items:
+                    for item in chunk.meta.doc_items:
+                        if hasattr(item, "prov") and item.prov:
+                            for prov in item.prov:
+                                if hasattr(prov, "page_no") and prov.page_no is not None:
+                                    entry["metadata"]["page"] = int(prov.page_no)
+                                    break
+                            if "page" in entry["metadata"]:
+                                break
+            
+            # Token count
             try:
-                ctxd = chunker.contextualize(chunk=raw)
-                if ctxd and ctxd != entry["text"]:
-                    entry["contextualized_text"] = ctxd
+                entry["metadata"]["token_count"] = len(
+                    hf_tokenizer.encode(chunk.text, add_special_tokens=False)
+                )
             except Exception:
                 pass
-            # Token count (best-effort using same tokenizer).
+            
+            # Contextualized text (for embeddings with heading context)
             try:
-                entry["token_count"] = len(tokenizer.encode(entry["text"], add_special_tokens=False))
+                ctx_text = chunker.contextualize(chunk=chunk)
+                if ctx_text and ctx_text != chunk.text:
+                    entry["contextualized_text"] = ctx_text
             except Exception:
                 pass
+            
             out.append(entry)
+        
+        logger.info(f"Successfully chunked {file_path} into {len(out)} chunks")
         return out
-
-
-def _first_page(meta: Any) -> int | None:
-    """Best-effort page-number extraction from Docling chunk meta."""
-    try:
-        items = getattr(meta, "doc_items", None) or []
-        for item in items:
-            for prov in getattr(item, "prov", []) or []:
-                page_no = getattr(prov, "page_no", None)
-                if page_no is not None:
-                    return int(page_no)
-    except Exception:
-        pass
-    return None

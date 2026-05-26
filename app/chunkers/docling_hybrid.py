@@ -9,13 +9,16 @@ Pipeline:
   2. Configure HybridChunker with Hebrew tokenizer + markdown table serializer
   3. Chunk DoclingDocument → structured chunks with heading_path, page, token_count
 
-Params:
-  max_tokens: int = 512        — Target chunk size in tokens (up to 8K supported)
-  merge_peers: bool = True     — Merge small adjacent chunks
-  tokenizer: str               — HuggingFace tokenizer model (default: potion-multilingual-128M)
+Params (all read from the caller's per-space settings — no server-side
+defaults so the configured value can't silently drift):
+  max_tokens: int (REQUIRED)   — Target chunk size in tokens
+  tokenizer:  str (REQUIRED)   — HuggingFace tokenizer model id
+  merge_peers: bool = True     — Merge small adjacent chunks (the only knob
+                                  with a server-side default)
 
-Runs in markdown-api workers via ZeroMQ. v2's DoclingHybridChunker plugin sends
-chunking tasks and polls for results.
+Runs in the markdown-api `chunk_server` over ZeroMQ REQ/ROUTER (port 5557).
+v2's DoclingHybridChunker plugin sends `max_tokens` from chunker.chunk_size
+and `tokenizer` from chunker.params.tokenizer.
 """
 
 from __future__ import annotations
@@ -47,9 +50,9 @@ class DoclingHybridChunkerImpl(Chunker):
         Args:
             file_path: Path to PDF file
             params: {
-                "max_tokens": 512,         # Target chunk size (up to 8K)
-                "merge_peers": True,       # Merge small adjacent chunks
-                "tokenizer": "minishlab/potion-multilingual-128M"  # Hebrew-compatible
+                "max_tokens": <int>,       # REQUIRED — caller sets from settings
+                "tokenizer":  <str>,       # REQUIRED — HuggingFace tokenizer id
+                "merge_peers": True,       # optional, default True
             }
         
         Returns:
@@ -58,12 +61,27 @@ class DoclingHybridChunkerImpl(Chunker):
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
-        
-        # Config
-        max_tokens = int(params.get("max_tokens", 512))
+
+        # All params must come from the caller (which reads them from per-
+        # space settings). No silent fallbacks — a missing knob is a bug we
+        # want to surface loudly, not paper over with a hardcoded default
+        # that drifts from the user's configuration.
+        try:
+            max_tokens = int(params["max_tokens"])
+        except KeyError as exc:
+            raise ValueError(
+                "docling_hybrid: 'max_tokens' is required in params (set "
+                "chunker.chunk_size in the per-space settings)"
+            ) from exc
+        try:
+            tokenizer_id = params["tokenizer"]
+        except KeyError as exc:
+            raise ValueError(
+                "docling_hybrid: 'tokenizer' is required in params (set "
+                "chunker.params.tokenizer in the per-space settings, "
+                "e.g. 'minishlab/potion-multilingual-128M' for Hebrew)"
+            ) from exc
         merge_peers = bool(params.get("merge_peers", True))
-        # Use potion-multilingual: proven Hebrew support, 8K tokens
-        tokenizer_id = params.get("tokenizer", "minishlab/potion-multilingual-128M")
         
         # Late import: keep registration decorator cheap on cold start
         try:

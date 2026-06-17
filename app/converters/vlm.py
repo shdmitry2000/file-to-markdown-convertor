@@ -88,14 +88,38 @@ class VLMConverter(PDFConverter):
         user_prompt: Optional[str] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
         http_client: Optional[httpx.Client] = None,
+        backend: Optional[str] = None,
     ) -> None:
-        from openai import OpenAI
-
-        self._model = model
         self._temperature = temperature
         self._user_prompt = user_prompt
         self._on_progress = on_progress
+        # backend: "openai" (default, OpenAI-compatible/Ollama) or "factory"
+        # (route vision through the shared LLMFactory -> litellm -> Gemini/Vertex,
+        # using the same provider + credentials the rest of the platform uses).
+        self._backend = (backend or os.getenv("VLM_BACKEND", "openai")).lower()
 
+        if self._backend == "factory":
+            from shared.llm_factory import LLMFactory
+
+            fc = LLMFactory.from_env()
+            self._model = getattr(fc, "_model", None) or model
+            # Carry the factory client's provider config (proxy base/key/headers)
+            # straight onto each litellm.acompletion call.
+            self._factory_kwargs: dict = {}
+            for attr, key in (("_api_base", "api_base"), ("_api_key", "api_key"),
+                              ("_extra_headers", "extra_headers")):
+                val = getattr(fc, attr, None)
+                if val:
+                    self._factory_kwargs[key] = val
+            self._client = None
+            self._retry_exc: tuple = (Exception,)
+            logger.info("VLMConverter backend=factory model=%s", self._model)
+            return
+
+        from openai import OpenAI, APITimeoutError
+
+        self._model = model
+        self._retry_exc = (APITimeoutError,)
         # If a shared client is supplied its timeout settings apply.
         # Otherwise use a conservative per-request timeout.
         client_kwargs: dict = dict(base_url=base_url, api_key=api_key)
@@ -155,9 +179,39 @@ class VLMConverter(PDFConverter):
         pix = page.get_pixmap(matrix=matrix)
         return base64.b64encode(pix.tobytes("png")).decode("utf-8")
 
+    def _transcribe_page_factory(self, img_b64: str, prompt_text: str) -> str:
+        """Transcribe one page via the shared LLMFactory provider (sync litellm
+        vision call — the converter runs in a sync subprocess, so use the
+        blocking API and avoid per-page event-loop churn)."""
+        import litellm
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                ],
+            }
+        ]
+
+        resp = litellm.completion(
+            model=self._model,
+            temperature=self._temperature,
+            messages=messages,
+            **self._factory_kwargs,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        content = re.sub(r"^```(?:markdown)?\n?", "", content)
+        content = re.sub(r"\n?```$", "", content)
+        return content.strip()
+
     def _transcribe_page(self, img_b64: str) -> str:
         """Send a base64 page image to the VLM and return the Markdown text."""
         prompt_text = self._user_prompt if self._user_prompt else _PROMPT
+        if self._backend == "factory":
+            return self._transcribe_page_factory(img_b64, prompt_text)
         response = self._client.chat.completions.create(
             model=self._model,
             temperature=self._temperature,
@@ -185,13 +239,11 @@ class VLMConverter(PDFConverter):
         On final timeout the exception is re-raised so the caller can decide
         whether to mark the page as failed or abort the entire conversion.
         """
-        from openai import APITimeoutError
-
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRY_ATTEMPTS):
             try:
                 return self._transcribe_page(img_b64)
-            except APITimeoutError as exc:
+            except self._retry_exc as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRY_ATTEMPTS - 1:
                     delay = _RETRY_BASE_DELAY_S * (2 ** attempt)

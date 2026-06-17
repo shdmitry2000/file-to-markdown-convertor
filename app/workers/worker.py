@@ -114,6 +114,28 @@ def _clean_markdown_content(content: str) -> str:
     return content
 
 
+def _letter_count(text: str) -> int:
+    import unicodedata
+    return sum(1 for c in text if unicodedata.category(c).startswith("L"))
+
+
+def _docling_output_unusable(markdown: str) -> bool:
+    """Detect text-layer garbage — e.g. an embedded font with no ToUnicode CMap,
+    where extractors emit glyph/symbol codes with almost no real letters. Such
+    documents are only recoverable via the VLM (vision) path."""
+    if not markdown or not markdown.strip():
+        return True
+    letters = _letter_count(markdown)
+    if letters == 0:
+        return True
+    min_ratio = float(os.getenv("VLM_FALLBACK_MIN_LETTER_RATIO", "0.10"))
+    return len(markdown) >= 200 and (letters / len(markdown)) < min_ratio
+
+
+def _vlm_fallback_enabled() -> bool:
+    return os.getenv("VLM_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
 def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, result_queue, do_table_structure: bool = True) -> None:
     """Subprocess target: run a single conversion and put the result on `result_queue`.
 
@@ -121,6 +143,7 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
     and so tests can swap in their own callable without monkeypatching.
     """
     try:
+        converter_used = converter_type or "docling"
         if converter_type == "docling" or not converter_type:
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -139,6 +162,28 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
             num_pages = result.document.num_pages()
             doc_name = repr(result.document.name)
             doc_origin = repr(result.document.origin)
+
+            # Auto-fallback: a broken text layer (e.g. embedded font with no
+            # ToUnicode CMap -> glyph garbage) yields markdown with almost no real
+            # letters. Retry such docs with the VLM (vision) converter, which reads
+            # the rendered page instead of the text layer. Fail loudly if even VLM
+            # produces nothing, so the doc is flagged rather than silently indexed.
+            if _vlm_fallback_enabled() and _docling_output_unusable(markdown):
+                logger.warning(
+                    "docling output unusable for %s (letters=%d, len=%d) — falling back to VLM",
+                    file_path, _letter_count(markdown), len(markdown),
+                )
+                from app.converters.vlm import VLMConverter
+
+                vlm_markdown = VLMConverter(backend="factory").convert(Path(file_path))
+                if _docling_output_unusable(vlm_markdown):
+                    raise Exception(
+                        "Unreadable document: both docling and VLM produced no usable "
+                        "text (likely scanned/encrypted/empty) — needs review."
+                    )
+                markdown = vlm_markdown
+                converter_used = "docling+vlm"
+                logger.info("VLM fallback recovered %s (letters=%d)", file_path, _letter_count(markdown))
         else:
             from app.converters.pymupdf import PyMuPDFConverter
             from app.converters.markitdown import MarkItDownConverter
@@ -166,7 +211,7 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
             "num_pages": num_pages,
             "doc_name": doc_name,
             "doc_origin": doc_origin,
-            "converter_used": converter_type,
+            "converter_used": converter_used,
         }))
     except Exception as e:
         import traceback

@@ -190,12 +190,14 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
             from app.converters.markitdown import MarkItDownConverter
             from app.converters.vlm import VLMConverter
             from app.converters.marker import MarkerConverter
+            from app.converters.dbank import DbankConverter
 
             converters_map = {
                 "pymupdf": PyMuPDFConverter,
                 "markitdown": MarkItDownConverter,
                 "vlm": VLMConverter,
                 "marker": MarkerConverter,
+                "dbank": DbankConverter,
             }
             cls = converters_map.get(converter_type)
             if not cls:

@@ -42,6 +42,11 @@ _DPI_SCALE = _RENDER_DPI / 72  # fitz uses 72 DPI as its baseline
 
 _DEFAULT_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
+# Hard cap on tokens generated per page. A single page of markdown is well under
+# this; the cap exists to stop the degenerate repetition loops some VLMs fall
+# into on dense tables (observed: 1M+ chars of garbage on a Hebrew/English table).
+_DEFAULT_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "32000"))
+
 # Retry settings for timed-out VLM calls.
 _MAX_RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY_S = 1.0  # seconds; doubles each attempt (1 s, 2 s, 4 s)
@@ -89,8 +94,10 @@ class VLMConverter(PDFConverter):
         on_progress: Optional[Callable[[int, int], None]] = None,
         http_client: Optional[httpx.Client] = None,
         backend: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> None:
         self._temperature = temperature
+        self._max_tokens = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
         self._user_prompt = user_prompt
         self._on_progress = on_progress
         # backend: "openai" (default, OpenAI-compatible/Ollama) or "factory"
@@ -102,7 +109,11 @@ class VLMConverter(PDFConverter):
             from shared.llm_factory import LLMFactory
 
             fc = LLMFactory.from_env()
-            self._model = getattr(fc, "_model", None) or model
+            # The VLM lane needs a vision-capable, table-reliable model that is
+            # independent of the general LLM lane: gemini-2.5-flash-lite falls into
+            # repetition loops on dense tables and flash returns near-empty, while
+            # gemini-2.5-pro produces clean tables. Default to pro; override via VLM_MODEL.
+            self._model = os.getenv("VLM_MODEL", "vertex_ai/gemini-2.5-pro")
             # Carry the factory client's provider config (proxy base/key/headers)
             # straight onto each litellm.acompletion call.
             self._factory_kwargs: dict = {}
@@ -199,6 +210,7 @@ class VLMConverter(PDFConverter):
         resp = litellm.completion(
             model=self._model,
             temperature=self._temperature,
+            max_tokens=self._max_tokens,
             messages=messages,
             **self._factory_kwargs,
         )
@@ -215,6 +227,7 @@ class VLMConverter(PDFConverter):
         response = self._client.chat.completions.create(
             model=self._model,
             temperature=self._temperature,
+            max_tokens=self._max_tokens,
             messages=[
                 {
                     "role": "user",

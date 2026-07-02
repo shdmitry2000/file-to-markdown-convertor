@@ -8,15 +8,13 @@ HEB = "בנקאות פתוחה בישראל מאפשרת ללקוחות גישה
 ENG = "Open banking in Israel grants third parties access to financial data"
 
 
-def _page(text, table=False):
+def _page(text, image=False):
     pg = MagicMock()
     pg.get_text.return_value = text
-    tables = pg.find_tables.return_value
-    if table:
-        t = MagicMock(); t.row_count = 3; t.col_count = 4  # 12 cells -> routes to VLM
-        tables.tables = [t]
-    else:
-        tables.tables = []
+    pg.rect.width = 595.0
+    pg.rect.height = 842.0
+    # big image (>10% of page) routes to VLM; empty list otherwise
+    pg.get_image_info.return_value = [{"bbox": (0, 0, 500, 700)}] if image else []
     return pg
 
 
@@ -29,15 +27,19 @@ def _fake_doc(pages):
     return doc
 
 
-def _run(pages, docling_out):
+def _run(pages, docling_ret):
+    """docling_ret is the (markdown, n_tables) tuple _docling_convert returns."""
     conv = DbankConverter()
+    vlm = MagicMock()
+    vlm.transcribe_page.return_value = HEB
     with patch("app.converters.dbank.fitz.open", return_value=_fake_doc(pages)), \
          patch.object(DbankConverter, "validate_path", return_value=None), \
          patch.object(DbankConverter, "_write_page", return_value=Path("/tmp/_x.pdf")), \
-         patch.object(conv, "_docling_convert", return_value=docling_out) as dmock, \
-         patch.object(conv, "_vlm_convert", return_value=HEB) as vmock:
+         patch.object(DbankConverter, "_render", return_value="IMG_B64"), \
+         patch.object(conv, "_docling_convert", return_value=docling_ret) as dmock, \
+         patch.object(conv, "_ensure_vlm", side_effect=lambda: setattr(conv, "_vlm", vlm)):
         out = conv.convert(Path("/tmp/whatever.pdf"))
-    return out, dmock, vmock
+    return out, dmock, vlm
 
 
 def test_pure_helpers():
@@ -47,21 +49,36 @@ def test_pure_helpers():
 
 
 def test_prose_page_uses_docling():
-    _, d, v = _run([_page(HEB)], docling_out=HEB)
-    assert d.called and not v.called
+    # docling detects no table + captures the text -> docling output kept
+    _, d, vlm = _run([_page(HEB)], (HEB, 0))
+    assert d.called and not vlm.transcribe_page.called
 
 
 def test_english_page_dropped_by_prefilter():
-    out, d, v = _run([_page(ENG)], docling_out=HEB)
-    assert out == "" and not d.called and not v.called
+    out, d, vlm = _run([_page(ENG)], (HEB, 0))
+    assert out == "" and not d.called and not vlm.transcribe_page.called
 
 
 def test_table_page_routes_to_vlm():
-    _, d, v = _run([_page(HEB, table=True)], docling_out=HEB)
-    assert v.called and not d.called
+    # docling's layout model reports a table region -> page goes to the VLM
+    _, d, vlm = _run([_page(HEB)], (HEB, 1))
+    assert d.called and vlm.transcribe_page.called
 
 
 def test_completeness_guard_falls_back_to_vlm():
     # docling returns almost no Hebrew -> below 85% of the page's text-layer words
-    _, d, v = _run([_page(HEB)], docling_out="x")
-    assert d.called and v.called
+    _, d, vlm = _run([_page(HEB)], ("x", 0))
+    assert d.called and vlm.transcribe_page.called
+
+
+def test_image_page_routes_to_vlm():
+    # Hebrew prose page carrying a large figure -> VLM before docling is even run
+    _, d, vlm = _run([_page(HEB, image=True)], (HEB, 0))
+    assert vlm.transcribe_page.called and not d.called
+
+
+def test_scanned_doc_routes_all_pages_to_vlm():
+    # near-empty text layer on every page -> scanned -> all VLM, no docling, no drops
+    out, d, vlm = _run([_page(""), _page("   ")], (HEB, 0))
+    assert vlm.transcribe_page.call_count == 2 and not d.called
+    assert out != ""  # nothing dropped

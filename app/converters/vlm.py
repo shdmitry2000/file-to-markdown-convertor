@@ -47,6 +47,13 @@ _DEFAULT_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 # into on dense tables (observed: 1M+ chars of garbage on a Hebrew/English table).
 _DEFAULT_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "32000"))
 
+# Page transcription is a mechanical OCR-style task, not a reasoning task, so
+# thinking is disabled by default — it only adds latency (dense financial tables
+# were ~55s/page with thinking on). Empty string = leave the model default.
+# On gemini-3.x "disable" maps to the lowest thinking level (thinkingLevel=low,
+# no thought output); on 2.5-class models it drops the thinking budget to 0.
+_DEFAULT_REASONING_EFFORT = os.getenv("VLM_REASONING_EFFORT", "disable")
+
 # Retry settings for timed-out VLM calls.
 _MAX_RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY_S = 1.0  # seconds; doubles each attempt (1 s, 2 s, 4 s)
@@ -89,15 +96,20 @@ class VLMConverter(PDFConverter):
         model: str = "qwen3-vl:4b-instruct-q4_K_M",
         base_url: str = _DEFAULT_BASE_URL,
         api_key: str = "ollama",
-        temperature: float = 0.1,
+        temperature: float = 0.0,
         user_prompt: Optional[str] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
         http_client: Optional[httpx.Client] = None,
         backend: Optional[str] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         self._temperature = temperature
         self._max_tokens = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
+        # None => use the env-derived default ("disable"); "" => leave model default.
+        self._reasoning_effort = (
+            reasoning_effort if reasoning_effort is not None else _DEFAULT_REASONING_EFFORT
+        )
         self._user_prompt = user_prompt
         self._on_progress = on_progress
         # backend: "openai" (default, OpenAI-compatible/Ollama) or "factory"
@@ -108,21 +120,22 @@ class VLMConverter(PDFConverter):
         if self._backend == "factory":
             from shared.llm_factory import LLMFactory
 
-            fc = LLMFactory.from_env()
-            # The VLM lane needs a vision-capable, table-reliable model that is
-            # independent of the general LLM lane: gemini-2.5-flash-lite falls into
-            # repetition loops on dense tables and flash returns near-empty, while
-            # gemini-2.5-pro produces clean tables. Default to pro; override via VLM_MODEL.
-            self._model = os.getenv("VLM_MODEL", "vertex_ai/gemini-2.5-pro")
-            # Carry the factory client's provider config (proxy base/key/headers)
-            # straight onto each litellm.acompletion call.
-            self._factory_kwargs: dict = {}
-            for attr, key in (("_api_base", "api_base"), ("_api_key", "api_key"),
-                              ("_extra_headers", "extra_headers")):
-                val = getattr(fc, attr, None)
-                if val:
-                    self._factory_kwargs[key] = val
-            self._client = None
+            # Use the factory as the single source of truth for model + region +
+            # provider auth. Model comes from LLM_FACTORY_PROVIDER (e.g.
+            # vertex_ai/gemini-3.5-flash); set VLM_MODEL only to give the vision
+            # lane a *different* model than the general LLM lane. The factory
+            # client owns vertex_location (gemini-3.x is global-only) and does the
+            # vision call via vision_sync — no model/region config duplicated here.
+            model_override = os.getenv("VLM_MODEL")
+            self._client = (LLMFactory.build(model_override) if model_override
+                            else LLMFactory.from_env())
+            if not hasattr(self._client, "vision_sync"):
+                raise RuntimeError(
+                    "VLM factory backend needs a litellm/vertex provider with vision "
+                    f"(got {type(self._client).__name__}); set LLM_FACTORY_PROVIDER / "
+                    "VLM_MODEL to a vertex_ai or gemini model."
+                )
+            self._model = getattr(self._client, "_model", "factory")
             self._retry_exc: tuple = (Exception,)
             logger.info("VLMConverter backend=factory model=%s", self._model)
             return
@@ -191,30 +204,15 @@ class VLMConverter(PDFConverter):
         return base64.b64encode(pix.tobytes("png")).decode("utf-8")
 
     def _transcribe_page_factory(self, img_b64: str, prompt_text: str) -> str:
-        """Transcribe one page via the shared LLMFactory provider (sync litellm
-        vision call — the converter runs in a sync subprocess, so use the
-        blocking API and avoid per-page event-loop churn)."""
-        import litellm
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_text},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-                ],
-            }
-        ]
-
-        resp = litellm.completion(
-            model=self._model,
-            temperature=self._temperature,
+        """Transcribe one page through the shared LLMFactory client's vision_sync
+        (the factory owns model + region + provider auth; the thinking-disable
+        fallback for models that reject it lives there too)."""
+        content = self._client.vision_sync(
+            prompt_text, [img_b64],
             max_tokens=self._max_tokens,
-            messages=messages,
-            **self._factory_kwargs,
-        )
-        content = (resp.choices[0].message.content or "").strip()
+            temperature=self._temperature,
+            reasoning_effort=self._reasoning_effort or None,
+        ).strip()
         content = re.sub(r"^```(?:markdown)?\n?", "", content)
         content = re.sub(r"\n?```$", "", content)
         return content.strip()
@@ -245,6 +243,16 @@ class VLMConverter(PDFConverter):
         content = re.sub(r"^```(?:markdown)?\n?", "", content)
         content = re.sub(r"\n?```$", "", content)
         return content.strip()
+
+    def transcribe_page(self, img_b64: str) -> str:
+        """Public entry for a single pre-rendered page image (base64 PNG).
+
+        Lets callers (e.g. the dbank pipeline) render pages themselves and fan
+        transcription out across threads — VLM calls are network-bound, so a
+        thread pool over this method parallelises cleanly while one converter
+        instance (and its factory/client config) is shared read-only.
+        """
+        return self._transcribe_page_with_retry(img_b64)
 
     def _transcribe_page_with_retry(self, img_b64: str) -> str:
         """Call ``_transcribe_page`` with exponential back-off on timeout.

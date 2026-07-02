@@ -228,7 +228,7 @@ class TestRoutingIntegration:
                 str(sample_pdf_path),
                 "t-fail-status",
                 mock_socket,
-                converter_type="marker",
+                converter_type="pymupdf",
             )
 
         sent = [c.args[0] for c in mock_socket.send_json.call_args_list]

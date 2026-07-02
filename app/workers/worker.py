@@ -3,6 +3,7 @@ import json
 import os
 import time
 import multiprocessing
+import threading
 import queue as queue_module
 from pathlib import Path
 import frontmatter
@@ -188,13 +189,13 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
             from app.converters.pymupdf import PyMuPDFConverter
             from app.converters.markitdown import MarkItDownConverter
             from app.converters.vlm import VLMConverter
-            from app.converters.marker import MarkerConverter
+            from app.converters.dbank import DbankConverter
 
             converters_map = {
                 "pymupdf": PyMuPDFConverter,
                 "markitdown": MarkItDownConverter,
                 "vlm": VLMConverter,
-                "marker": MarkerConverter,
+                "dbank": DbankConverter,
             }
             cls = converters_map.get(converter_type)
             if not cls:
@@ -218,6 +219,267 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
         result_queue.put(("error", str(e), traceback.format_exc()))
 
 
+# ---------------------------------------------------------------------------
+# Warm Docling worker
+# ---------------------------------------------------------------------------
+# Building a Docling DocumentConverter loads the layout + table-structure models
+# into memory (~10-12s on CPU). The original design spawned a fresh process per
+# conversion, so EVERY job re-paid that cost — a 1-page PDF took ~14s of which
+# <1s was real work. This keeps ONE warm subprocess with the converter built
+# once; jobs stream to it and return in ~1s. Process isolation (and the hard
+# timeout) is preserved: on timeout the worker is killed and the next job
+# transparently respawns it. Table-structure extraction stays enabled.
+
+def _warm_enabled() -> bool:
+    return os.getenv("DOCLING_WARM_WORKER", "true").lower() in ("true", "1", "yes")
+
+
+def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool) -> None:
+    """Persistent docling worker target: build the converter ONCE, then serve
+    file paths from `in_q`, putting result tuples on `out_q`. `None` = shutdown."""
+    import traceback
+    try:
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.datamodel.base_models import InputFormat
+
+        pdf_options = PdfPipelineOptions()
+        pdf_options.do_ocr = do_ocr
+        pdf_options.do_table_structure = do_table_structure
+        converter = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)}
+        )
+        out_q.put(("ready", None))
+    except Exception as e:  # model/import failure → report and exit
+        out_q.put(("init_error", str(e), traceback.format_exc()))
+        return
+
+    while True:
+        job = in_q.get()
+        if job is None:
+            return
+        file_path = job
+        try:
+            result = converter.convert(file_path)
+            markdown = result.document.export_to_markdown()
+            num_pages = result.document.num_pages()
+            doc_name = repr(result.document.name)
+            doc_origin = repr(result.document.origin)
+            converter_used = "docling"
+            # Same broken-text-layer → VLM fallback as the cold path.
+            if _vlm_fallback_enabled() and _docling_output_unusable(markdown):
+                from app.converters.vlm import VLMConverter
+                vlm_markdown = VLMConverter(backend="factory").convert(Path(file_path))
+                if _docling_output_unusable(vlm_markdown):
+                    raise Exception(
+                        "Unreadable document: both docling and VLM produced no usable "
+                        "text (likely scanned/encrypted/empty) — needs review."
+                    )
+                markdown = vlm_markdown
+                converter_used = "docling+vlm"
+            out_q.put(("success", {
+                "markdown": markdown, "num_pages": num_pages,
+                "doc_name": doc_name, "doc_origin": doc_origin,
+                "converter_used": converter_used,
+            }))
+        except Exception as e:
+            out_q.put(("error", str(e), traceback.format_exc()))
+
+
+class _WarmDoclingWorker:
+    """Manages one long-lived warm docling subprocess (lazy start; restart on
+    timeout, crash, or changed options). Calls are serialized — the daemon
+    processes conversions one at a time."""
+
+    def __init__(self) -> None:
+        self._ctx = multiprocessing.get_context("spawn")
+        self._proc = None
+        self._in = None
+        self._out = None
+        self._opts = None  # (do_ocr, do_table_structure) the worker was built with
+        self._lock = threading.Lock()
+
+    def _kill(self) -> None:
+        proc = self._proc
+        self._proc = self._in = self._out = self._opts = None
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+
+    def _start(self, do_ocr: bool, do_table_structure: bool) -> None:
+        self._in = self._ctx.Queue()
+        self._out = self._ctx.Queue()
+        self._proc = self._ctx.Process(
+            target=_warm_docling_loop,
+            args=(self._in, self._out, do_ocr, do_table_structure),
+            daemon=True,
+        )
+        self._proc.start()
+        self._opts = (do_ocr, do_table_structure)
+        # Wait for the converter to finish loading models. Bounded generously —
+        # this cold start is paid ONCE (or once per restart), never per job.
+        warm_timeout = int(os.getenv("DOCLING_WARM_START_TIMEOUT", "300"))
+        try:
+            status = self._out.get(timeout=warm_timeout)
+        except queue_module.Empty:
+            self._kill()
+            raise Exception(f"Warm docling worker did not become ready in {warm_timeout}s")
+        if status[0] != "ready":
+            detail = status[1] if len(status) > 1 else status
+            self._kill()
+            raise Exception(f"Warm docling worker init failed: {detail}")
+        logger.info("Warm docling worker ready (ocr=%s, tables=%s)", do_ocr, do_table_structure)
+
+    def _ensure(self, do_ocr: bool, do_table_structure: bool) -> None:
+        if (self._proc is None or not self._proc.is_alive()
+                or self._opts != (do_ocr, do_table_structure)):
+            self._kill()
+            self._start(do_ocr, do_table_structure)
+
+    def ensure_started(self, do_ocr: bool, do_table_structure: bool) -> None:
+        """Pre-warm at daemon startup so the first real conversion is already fast."""
+        with self._lock:
+            self._ensure(do_ocr, do_table_structure)
+
+    def convert(self, file_path: str, conversion_id: str, do_ocr: bool,
+                do_table_structure: bool, timeout_seconds: int) -> dict:
+        with self._lock:
+            self._ensure(do_ocr, do_table_structure)
+            self._in.put(file_path)
+            try:
+                item = self._out.get(timeout=timeout_seconds)
+            except queue_module.Empty:
+                # Hung conversion: kill the warm worker so it can't wedge the
+                # daemon; the next job respawns it.
+                logger.warning(
+                    "[%s] Warm docling conversion timeout (%ss); restarting worker",
+                    conversion_id, timeout_seconds,
+                )
+                self._kill()
+                raise TimeoutError(
+                    f"Conversion exceeded {timeout_seconds}s timeout and was terminated"
+                )
+            if self._proc is None or not self._proc.is_alive():
+                self._kill()  # worker died producing this result → clean respawn next time
+            if item[0] == "error":
+                raise Exception(item[1])
+            return item[1]
+
+
+_WARM_DOCLING = _WarmDoclingWorker()
+
+
+# ---------------------------------------------------------------------------
+# Warm dbank worker
+# ---------------------------------------------------------------------------
+# The dbank pipeline builds its own docling (table_structure OFF) + VLM client.
+# Building docling costs ~8s. A fresh subprocess per job would re-pay that every
+# document, so — like docling — keep ONE long-lived subprocess holding a single
+# DbankConverter instance; its docling + VLM clients build once and stay warm
+# across jobs. Process isolation and the hard timeout are preserved (kill +
+# respawn on timeout), unlike running dbank inline in the daemon.
+
+def _warm_dbank_loop(in_q, out_q) -> None:
+    """Persistent dbank worker target: build ONE DbankConverter, then serve file
+    paths from `in_q`, putting result tuples on `out_q`. `None` = shutdown."""
+    import traceback
+    try:
+        from app.converters.dbank import DbankConverter
+        converter = DbankConverter()  # docling + VLM built lazily on first job, then reused
+        out_q.put(("ready", None))
+    except Exception as e:  # import/init failure → report and exit
+        out_q.put(("init_error", str(e), traceback.format_exc()))
+        return
+
+    while True:
+        job = in_q.get()
+        if job is None:
+            return
+        file_path = job
+        try:
+            markdown = converter.convert(Path(file_path))
+            out_q.put(("success", {
+                "markdown": markdown,
+                "num_pages": max(1, len(markdown) // 2000),
+                "doc_name": str(Path(file_path).name),
+                "doc_origin": "converter:dbank",
+                "converter_used": "dbank",
+            }))
+        except Exception as e:
+            out_q.put(("error", str(e), traceback.format_exc()))
+
+
+class _WarmDbankWorker:
+    """Manages one long-lived warm dbank subprocess (lazy start; restart on
+    timeout or crash). Calls are serialized — one conversion at a time."""
+
+    def __init__(self) -> None:
+        self._ctx = multiprocessing.get_context("spawn")
+        self._proc = None
+        self._in = None
+        self._out = None
+        self._lock = threading.Lock()
+
+    def _kill(self) -> None:
+        proc = self._proc
+        self._proc = self._in = self._out = None
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+
+    def _start(self) -> None:
+        self._in = self._ctx.Queue()
+        self._out = self._ctx.Queue()
+        self._proc = self._ctx.Process(target=_warm_dbank_loop, args=(self._in, self._out), daemon=True)
+        self._proc.start()
+        warm_timeout = int(os.getenv("DOCLING_WARM_START_TIMEOUT", "300"))
+        try:
+            status = self._out.get(timeout=warm_timeout)
+        except queue_module.Empty:
+            self._kill()
+            raise Exception(f"Warm dbank worker did not become ready in {warm_timeout}s")
+        if status[0] != "ready":
+            detail = status[1] if len(status) > 1 else status
+            self._kill()
+            raise Exception(f"Warm dbank worker init failed: {detail}")
+        logger.info("Warm dbank worker ready")
+
+    def _ensure(self) -> None:
+        if self._proc is None or not self._proc.is_alive():
+            self._kill()
+            self._start()
+
+    def convert(self, file_path: str, conversion_id: str, timeout_seconds: int) -> dict:
+        with self._lock:
+            self._ensure()
+            self._in.put(file_path)
+            try:
+                item = self._out.get(timeout=timeout_seconds)
+            except queue_module.Empty:
+                logger.warning(
+                    "[%s] Warm dbank conversion timeout (%ss); restarting worker",
+                    conversion_id, timeout_seconds,
+                )
+                self._kill()
+                raise TimeoutError(
+                    f"Conversion exceeded {timeout_seconds}s timeout and was terminated"
+                )
+            if self._proc is None or not self._proc.is_alive():
+                self._kill()
+            if item[0] == "error":
+                raise Exception(item[1])
+            return item[1]
+
+
+_WARM_DBANK = _WarmDbankWorker()
+
+
 def _run_converter_with_timeout(
     file_path: str,
     conversion_id: str,
@@ -233,7 +495,7 @@ def _run_converter_with_timeout(
     Args:
         file_path: Path to file to convert.
         conversion_id: Used for log correlation.
-        converter_type: docling | pymupdf | markitdown | marker | vlm.
+        converter_type: docling | pymupdf | markitdown | vlm.
         timeout_seconds: Hard wall-clock limit; process is killed if exceeded.
         do_ocr: Forwarded to the docling pipeline. Caller decides — there is no
             implicit env lookup here, so the parent's OTel attributes and the
@@ -246,6 +508,18 @@ def _run_converter_with_timeout(
     we deadlock until the timeout, then kill a process that actually succeeded.
     Reading from the queue first unblocks the put and lets the child exit.
     """
+    # Warm path for docling: reuse one long-lived converter instead of reloading
+    # the models per job (turns a ~14s/job cold start into ~1s). Skipped when a
+    # test injects `_target`, or when explicitly disabled via DOCLING_WARM_WORKER.
+    if _target is None and _warm_enabled() and (converter_type == "docling" or not converter_type):
+        return _WARM_DOCLING.convert(
+            file_path, conversion_id, do_ocr, do_table_structure, timeout_seconds)
+
+    # dbank keeps its own long-lived worker so its docling (~8s) + VLM client are
+    # built once and reused across documents, not per job.
+    if _target is None and _warm_enabled() and converter_type == "dbank":
+        return _WARM_DBANK.convert(file_path, conversion_id, timeout_seconds)
+
     target = _target or _convert_in_subprocess
     result_queue = multiprocessing.Queue()
 
@@ -459,7 +733,7 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
     if converter_type == "docling" or not converter_type:
         return _convert_with_docling(file_path, conversion_id, result_sender_socket)
         
-    # Use PyMuPDF, MarkItDown, Marker, VLM, etc plugin with timeout protection
+    # Use PyMuPDF, MarkItDown, VLM, etc plugin with timeout protection
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
     with tracer.start_as_current_span("convert_file") as span:
@@ -650,6 +924,14 @@ def main():
     task_receiver_socket.connect(f"tcp://{host}:{settings.ZMQ_TASK_PORT}")
     result_sender_socket = context.socket(zmq.PUSH)
     result_sender_socket.connect(f"tcp://{host}:{settings.ZMQ_RESULT_PORT}")
+
+    # Pre-warm the docling models at startup so the FIRST real conversion is
+    # already fast (otherwise the first request pays the one-time ~12s load).
+    if _warm_enabled():
+        try:
+            _WARM_DOCLING.ensure_started(_read_do_ocr(), _read_do_table_structure())
+        except Exception as e:
+            logger.warning("Docling pre-warm failed (will warm lazily on first job): %s", e)
 
     while True:
         message = task_receiver_socket.recv_string()

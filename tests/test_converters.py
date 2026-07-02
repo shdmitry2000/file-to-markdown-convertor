@@ -51,7 +51,9 @@ def test_vlm_converter_success(sample_pdf):
             mock_response.choices[0].message.content = "```markdown\n# Test Document\n\nConverted using VLM\n```"
             mock_client.chat.completions.create.return_value = mock_response
             
-            converter = VLMConverter()
+            # Pin the OpenAI backend: the default is env-driven (VLM_BACKEND),
+            # and this test exercises the OpenAI-compatible path specifically.
+            converter = VLMConverter(backend="openai")
             result = converter.convert(sample_pdf)
-            
+
             assert "Converted using VLM" in result

@@ -27,8 +27,8 @@ from app.registry import registry
 import app.converters.pymupdf      # noqa: F401
 import app.converters.markitdown   # noqa: F401
 import app.converters.vlm          # noqa: F401
+import app.converters.dbank        # noqa: F401
 import app.converters.docling      # noqa: F401
-import app.converters.marker       # noqa: F401
 
 # Import chunkers so their @register_chunker decorators run
 import app.chunkers                # noqa: F401

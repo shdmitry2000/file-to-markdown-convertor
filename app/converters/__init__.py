@@ -7,6 +7,7 @@ from .pymupdf import PyMuPDFConverter
 from .markitdown import MarkItDownConverter
 from .vlm import VLMConverter
 from .docling import DoclingConverter
+from .dbank import DbankConverter
 
 __all__ = [
     "PDFConverter",
@@ -14,4 +15,5 @@ __all__ = [
     "MarkItDownConverter",
     "VLMConverter",
     "DoclingConverter",
+    "DbankConverter",
 ]

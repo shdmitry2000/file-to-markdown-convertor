@@ -234,6 +234,73 @@ def _warm_enabled() -> bool:
     return os.getenv("DOCLING_WARM_WORKER", "true").lower() in ("true", "1", "yes")
 
 
+def _write_warmup_pdf() -> str:
+    """Write a tiny 1-page PDF to a temp file and return its path.
+
+    Docling loads its layout/table models lazily on the FIRST .convert(), NOT in
+    the DocumentConverter constructor. So a pre-warm that only builds the
+    converter signals "ready" with no models resident, and the first real job on
+    each worker still pays the full cold model load. Running one throwaway
+    conversion of this PDF during pre-warm forces the load up front."""
+    import tempfile
+
+    import fitz  # PyMuPDF — already a dependency of the dbank pipeline.
+
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "warmup")
+    fd, path = tempfile.mkstemp(suffix="_docling_warmup.pdf")
+    os.close(fd)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+# Skip eager pre-warm when free memory is below this (GB). Each docling model set
+# is ~0.9GB resident; on a memory-tight host, eagerly loading one per worker at
+# startup can exhaust RAM and trigger an OOM/jetsam kill. When we skip, models
+# still load lazily on the first real job — slower first conversion, but no crash.
+_PREWARM_MIN_FREE_GB = float(os.getenv("DOCLING_PREWARM_MIN_FREE_GB", "2.5"))
+
+
+def _available_memory_gb():
+    """Available (reclaimable) RAM in GB, or None if it can't be determined."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1073741824
+    except Exception:
+        return None
+
+
+def _prewarm_convert(convert_fn, label: str) -> None:
+    """Force docling's lazy model load by converting a throwaway PDF, so the first
+    real job is already warm.
+
+    Memory-guarded: if available RAM is below ``_PREWARM_MIN_FREE_GB`` we SKIP the
+    eager load and fall back to lazy loading on the first job — this prevents the
+    startup OOM/jetsam kill that eager-loading a ~0.9GB model set per worker would
+    otherwise cause on a memory-tight host. Never raises."""
+    avail = _available_memory_gb()
+    if avail is not None and avail < _PREWARM_MIN_FREE_GB:
+        logger.warning(
+            "%s pre-warm skipped: %.1fGB available < %.1fGB required "
+            "(DOCLING_PREWARM_MIN_FREE_GB); models load lazily on first job",
+            label, avail, _PREWARM_MIN_FREE_GB,
+        )
+        return
+    try:
+        warmup = _write_warmup_pdf()
+        try:
+            convert_fn(warmup)
+        finally:
+            try:
+                os.unlink(warmup)
+            except OSError:
+                pass
+    except Exception as e:
+        logger.warning("%s pre-warm convert failed; models load on first job: %s", label, e)
+
+
 def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool) -> None:
     """Persistent docling worker target: build the converter ONCE, then serve
     file paths from `in_q`, putting result tuples on `out_q`. `None` = shutdown."""
@@ -249,6 +316,8 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool) -> N
         converter = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)}
         )
+        # Load the models now, before signalling ready (see _write_warmup_pdf).
+        _prewarm_convert(converter.convert, "docling")
         out_q.put(("ready", None))
     except Exception as e:  # model/import failure → report and exit
         out_q.put(("init_error", str(e), traceback.format_exc()))
@@ -389,6 +458,9 @@ def _warm_dbank_loop(in_q, out_q) -> None:
     try:
         from app.converters.dbank import DbankConverter
         converter = DbankConverter()  # docling + VLM built lazily on first job, then reused
+        # Warm dbank's docling engine directly: the normal routing would drop a
+        # non-Hebrew warmup page before docling runs, so call _docling_convert.
+        _prewarm_convert(converter._docling_convert, "dbank")
         out_q.put(("ready", None))
     except Exception as e:  # import/init failure → report and exit
         out_q.put(("init_error", str(e), traceback.format_exc()))

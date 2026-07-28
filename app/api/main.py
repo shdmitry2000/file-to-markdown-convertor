@@ -111,6 +111,7 @@ def result_listener():
                     if isinstance(conversion_id, str) and isinstance(status, str):
                         logger.info(f"Received status update for {conversion_id}: {status}")
                         conversion_status_db[conversion_id] = status
+                        conversion_details_db[conversion_id] = result
                         
                         # Update last completion timestamp if conversion finished
                         if status in ["completed", "success", "failed", "error"]:
@@ -172,7 +173,11 @@ async def get_status(conversion_id: str):
     if status is None:
         logger.warning(f"Conversion ID not found: {conversion_id}")
         raise HTTPException(status_code=404, detail="Conversion ID not found")
-    return {"status": status}
+    response: Dict[str, str] = {"status": status}
+    details = conversion_details_db.get(conversion_id)
+    if isinstance(details, dict) and details.get("error"):
+        response["error"] = details["error"]
+    return response
 
 
 @app.delete("/convert/{conversion_id}")

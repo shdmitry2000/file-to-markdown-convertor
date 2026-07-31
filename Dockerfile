@@ -97,7 +97,25 @@ WORKDIR /home/appuser/app
 # Copy the application code into the container
 COPY --chown=appuser:appuser ./app /home/appuser/app
 
-# Set PYTHONPATH so 'app' module can be found
+# Platform shared libs — only shared.llm_factory + shared.utils and their import-time
+# dependencies (async_utils, connector_credentials, request_context, secret_box).
+# Needed by app/converters/vlm.py (VLM_BACKEND=factory) and app/workers/worker.py.
+# shared/db is deliberately not vendored: connector_credentials reaches it through a
+# guarded lazy import that falls back to the global connector credentials.
+#
+# `share[d]` is an optional glob — present when built from the enterprise repo (the sync
+# vendors it), absent in a standalone submodule build, where those two code paths remain
+# unavailable exactly as they are today. pyproject.toml always matches, which is what lets
+# a COPY containing a non-matching glob succeed; it is removed again below.
+COPY --chown=appuser:appuser ./pyproject.toml ./share[d]/ /home/appuser/shared/
+RUN if [ -d /home/appuser/shared/llm_factory ]; then \
+      echo "shared libs: vendored"; \
+    else \
+      echo "shared libs: absent (standalone build — VLM_BACKEND=factory unavailable)"; \
+    fi; \
+    rm -f /home/appuser/shared/pyproject.toml
+
+# Set PYTHONPATH so 'app' and 'shared' modules can be found
 ENV PYTHONPATH=/home/appuser
 
 # Expose the port the app runs on

@@ -355,6 +355,29 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool) -> N
             out_q.put(("error", str(e), traceback.format_exc()))
 
 
+def _await_warm_result(out_q, proc, timeout_seconds: int):
+    """Wait for a warm worker's result, polling liveness like the cold path does.
+
+    A bare ``out_q.get(timeout=...)`` cannot tell "still working" from "child is
+    gone": when a warm child is OOM-killed it never puts anything, so the caller
+    blocks for the FULL timeout while holding the worker lock — which wedges the
+    whole daemon, since every conversion in the service funnels through it.
+    Observed in the wild as a 163-page PDF stalling all conversions for hours.
+
+    Returns ``(item, reason)`` where reason is None (got a result), 'timeout',
+    or 'died'."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, "timeout"
+        try:
+            return out_q.get(timeout=min(2.0, remaining)), None
+        except queue_module.Empty:
+            if proc is None or not proc.is_alive():
+                return None, "died"
+
+
 class _WarmDoclingWorker:
     """Manages one long-lived warm docling subprocess (lazy start; restart on
     timeout, crash, or changed options). Calls are serialized — the daemon
@@ -418,9 +441,8 @@ class _WarmDoclingWorker:
         with self._lock:
             self._ensure(do_ocr, do_table_structure)
             self._in.put(file_path)
-            try:
-                item = self._out.get(timeout=timeout_seconds)
-            except queue_module.Empty:
+            item, reason = _await_warm_result(self._out, self._proc, timeout_seconds)
+            if reason == "timeout":
                 # Hung conversion: kill the warm worker so it can't wedge the
                 # daemon; the next job respawns it.
                 logger.warning(
@@ -430,6 +452,18 @@ class _WarmDoclingWorker:
                 self._kill()
                 raise TimeoutError(
                     f"Conversion exceeded {timeout_seconds}s timeout and was terminated"
+                )
+            if reason == "died":
+                exitcode = self._proc.exitcode if self._proc is not None else None
+                logger.error(
+                    "[%s] Warm docling worker died (exit=%s); restarting worker",
+                    conversion_id, exitcode,
+                )
+                self._kill()
+                raise Exception(
+                    f"Warm docling worker died (exit={exitcode}) without producing a "
+                    "result — exit=-9 means it was OOM-killed; raise the container "
+                    "memory limit or use a lighter converter for this document"
                 )
             if self._proc is None or not self._proc.is_alive():
                 self._kill()  # worker died producing this result → clean respawn next time
@@ -531,9 +565,8 @@ class _WarmDbankWorker:
         with self._lock:
             self._ensure()
             self._in.put(file_path)
-            try:
-                item = self._out.get(timeout=timeout_seconds)
-            except queue_module.Empty:
+            item, reason = _await_warm_result(self._out, self._proc, timeout_seconds)
+            if reason == "timeout":
                 logger.warning(
                     "[%s] Warm dbank conversion timeout (%ss); restarting worker",
                     conversion_id, timeout_seconds,
@@ -541,6 +574,18 @@ class _WarmDbankWorker:
                 self._kill()
                 raise TimeoutError(
                     f"Conversion exceeded {timeout_seconds}s timeout and was terminated"
+                )
+            if reason == "died":
+                exitcode = self._proc.exitcode if self._proc is not None else None
+                logger.error(
+                    "[%s] Warm dbank worker died (exit=%s); restarting worker",
+                    conversion_id, exitcode,
+                )
+                self._kill()
+                raise Exception(
+                    f"Warm dbank worker died (exit={exitcode}) without producing a "
+                    "result — exit=-9 means it was OOM-killed; raise the container "
+                    "memory limit or use a lighter converter for this document"
                 )
             if self._proc is None or not self._proc.is_alive():
                 self._kill()

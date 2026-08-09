@@ -63,6 +63,11 @@ conversion_status_db: Dict[str, str] = {}
 conversion_details_db: Dict[str, Dict] = {}  # Stores detailed info about conversions
 pending_conversions_db: Dict[str, Dict] = {}  # Pending conversions with metadata
 active_conversions_db: Dict[str, Dict] = {}  # Active conversions with metadata
+# (file_path, converter_type) -> conversion_id, for conversions not yet finished.
+# Ingesting one file to N RAG systems fans out N concurrent /convert calls for the
+# SAME file; without this every one of them queues its own full conversion behind
+# the others. Callers share a conversion_id instead and all poll the same job.
+inflight_conversions: Dict[tuple, str] = {}
 last_completion_timestamp = time.time()  # Track last successful conversion
 
 # In-memory database for chunking tasks
@@ -112,16 +117,29 @@ def result_listener():
                         logger.info(f"Received status update for {conversion_id}: {status}")
                         conversion_status_db[conversion_id] = status
                         conversion_details_db[conversion_id] = result
-                        
+
+                        # Promote pending -> active so /health reflects real work.
+                        # Without this the counters only ever moved for /debug/convert,
+                        # which is why /health reported active:0 while a job was wedged.
+                        if status == "processing":
+                            meta = pending_conversions_db.pop(conversion_id, {})
+                            active_conversions_db[conversion_id] = {
+                                **meta, "started_at": time.time(),
+                            }
+
                         # Update last completion timestamp if conversion finished
                         if status in ["completed", "success", "failed", "error"]:
                             last_completion_timestamp = time.time()
-                            
+
                             # Move from active to completed
                             if conversion_id in active_conversions_db:
                                 del active_conversions_db[conversion_id]
                             if conversion_id in pending_conversions_db:
                                 del pending_conversions_db[conversion_id]
+                            # Finished, so it can no longer be shared by a new caller.
+                            for key, cid in list(inflight_conversions.items()):
+                                if cid == conversion_id:
+                                    del inflight_conversions[key]
             else:
                 logger.warning(f"Received non-dict message: {result}")
         except zmq.ZMQError as e:
@@ -150,9 +168,23 @@ async def convert_file(request: ConversionRequest):
         logger.warning(f"File not found at path: {file_path}")
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Share an already-queued conversion of the same file rather than duplicating
+    # it — see inflight_conversions. Both callers poll the same id and get the
+    # same result, which the polling client already handles unchanged.
+    inflight_key = (file_path, request.converter_type)
+    existing_id = inflight_conversions.get(inflight_key)
+    if existing_id and conversion_status_db.get(existing_id) in ("pending", "processing"):
+        logger.info(f"Reusing in-flight conversion {existing_id} for {file_path}")
+        return {"conversion_id": existing_id}
+
     conversion_id = str(uuid.uuid4())
     logger.info(f"Generated conversion ID {conversion_id} for file {file_path}")
     conversion_status_db[conversion_id] = "pending"
+    inflight_conversions[inflight_key] = conversion_id
+    pending_conversions_db[conversion_id] = {
+        "filename": os.path.basename(file_path),
+        "queued_at": time.time(),
+    }
 
     task = {
         "conversion_id": conversion_id,

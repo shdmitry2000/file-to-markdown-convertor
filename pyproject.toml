@@ -20,6 +20,14 @@ dependencies = [
     "pillow>=10.0.0",
     "python-frontmatter>=1.0.0",
     "python-multipart>=0.0.22",
+    # VLM_BACKEND=factory routes vision through shared.llm_factory -> litellm ->
+    # Vertex. Needed by the dbank Hebrew pipeline and docling's VLM fallback;
+    # without them `import shared.llm_factory` fails and both converters are
+    # unavailable. Pin matches evaluator/requirements.txt so the platform runs
+    # one litellm across services.
+    "litellm>=1.84.0,<2.0.0",
+    "google-auth>=2.56.0",
+    "google-cloud-aiplatform>=1.163.0",
 ]
 
 [tool.uv]

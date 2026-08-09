@@ -6,3 +6,6 @@ htmlcov/
 .coverage
 .pytest_cache/
 bench_out/
+# Vendored from the platform repo by `make vendor-markdown-shared` so the
+# Dockerfile's optional share[d]/ glob can pick it up. Build output, not source.
+shared/

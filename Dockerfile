@@ -79,17 +79,27 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 # Copy the executables (like uvicorn) from the builder stage.
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy pre-downloaded caches (HF / docling artifacts from builder)
-RUN mkdir -p /home/appuser/.cache
-COPY --from=builder /export/root-cache/ /home/appuser/.cache/
-
-# Match builder: docling uses Hugging Face hub for weights
-ENV HF_HOME=/home/appuser/.cache/huggingface
-
-# Create a non-root user for better security
+# Create a non-root user for better security.
+# MUST come before the cache COPY: `useradd --create-home` does not chown a home
+# directory that already exists, so copying into /home/appuser first left the
+# whole cache root-owned and docling's HF download died with EACCES on hub/.
 RUN useradd --create-home appuser && \
     mkdir -p /usr/local/lib/python3.12/site-packages/rapidocr/models && \
     chmod -R 777 /usr/local/lib/python3.12/site-packages/rapidocr/models
+
+# Copy pre-downloaded caches (HF / docling artifacts from builder)
+COPY --from=builder --chown=appuser:appuser /export/root-cache/ /home/appuser/.cache/
+
+# Match builder: docling uses Hugging Face hub for weights. The directory has to
+# be writable by appuser — docling resolves weights lazily on first convert and
+# writes them here, so a read-only cache fails every conversion, not just a cold one.
+ENV HF_HOME=/home/appuser/.cache/huggingface
+RUN mkdir -p "${HF_HOME}" && chown -R appuser:appuser /home/appuser/.cache
+
+# This image has no C++ toolchain (slim base, no build-essential), and torch's
+# inductor backend shells out to g++. Leaving dynamo on makes docling's layout
+# model fail with InvalidCxxCompiler instead of falling back to eager.
+ENV TORCHDYNAMO_DISABLE=1
 
 USER appuser
 WORKDIR /home/appuser/app

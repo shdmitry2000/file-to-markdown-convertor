@@ -51,6 +51,45 @@ Environment notes:
 - ✅ Frontmatter metadata in converted files
 - ✅ Health check endpoint
 - ✅ Preserves directory structure
+- ✅ Formula-aware Excel conversion (see below)
+
+## Excel: formulas, not just numbers
+
+`.xlsx` / `.xlsm` route to the `excel` converter (`app/converters/excel/`), which
+keeps what a spreadsheet means rather than only what it shows. markitdown and
+docling both read Excel values-only, so a totals cell arrives as a bare number
+with nothing tying it to the rows behind it.
+
+Each sheet renders as one markdown table **per region** (several blocks on one
+sheet stay separate), followed by:
+
+```markdown
+### Formulas / נוסחאות — הלוואות
+- **C8** · סך יתרות ההלוואות בכל הבנקים (₪) = 2,736,000
+  - `=SUM(C3:C7)` = הפועלים · משכנתא · יתרה (₪)=850,000 + הפועלים · צרכנית · יתרה (₪)=120,000 + …
+
+### Dependencies / תלויות — הלוואות
+- הפועלים · משכנתא · יתרה (₪) (C3) → feeds ... (הלוואות!C8)
+```
+
+Cell names come from metadata the workbook already carries — comments, defined
+names, Table headers, freeze panes, then header/label inference — so **no LLM is
+called**. Nothing is recalculated either: a formula whose result Excel never
+saved is reported as `(no cached result)`, never computed and never guessed.
+
+Legacy `.xls` stays on markitdown (openpyxl cannot read it; xlrd exposes no
+formulas).
+
+Tuning — all optional:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `EXCEL_MAX_CELLS` | 200000 | Whole-workbook read budget; sheets that hit it are marked truncated |
+| `EXCEL_MAX_REFS_PER_FORMULA` | 20 | Terms expanded per formula before `+ …` |
+| `EXCEL_EXPAND_DEPTH` | 1 | Levels of formula-into-formula expansion |
+| `EXCEL_EMIT_DEPENDENCIES` | true | Set `false` to drop the dependency section |
+
+Fixtures live in `tests/fixtures/excel/` — see the README there to rebuild them.
 
 ## Quick Start
 

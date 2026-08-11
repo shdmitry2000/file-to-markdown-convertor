@@ -8,6 +8,7 @@ from .markitdown import MarkItDownConverter
 from .vlm import VLMConverter
 from .docling import DoclingConverter
 from .dbank import DbankConverter
+from .excel import ExcelConverter
 
 __all__ = [
     "PDFConverter",
@@ -16,4 +17,5 @@ __all__ = [
     "VLMConverter",
     "DoclingConverter",
     "DbankConverter",
+    "ExcelConverter",
 ]

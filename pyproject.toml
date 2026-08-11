@@ -1,6 +1,6 @@
 [project]
 name = "file-to-markdown-convertor"
-version = "0.1.0"
+version = "1.2.5"
 description = "Centralized PDF to Markdown conversion service"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,6 +16,9 @@ dependencies = [
     "huggingface-hub>=1.3.0",
     "pymupdf4llm>=0.0.0",
     "markitdown[all]>=0.0.0",
+    # Direct dependency of the formula-aware excel converter. It also arrives
+    # transitively via markitdown[all], but that is not a contract we control.
+    "openpyxl>=3.1",
     "httpx>=0.27.0",
     "pillow>=12.3.0",
     "python-frontmatter>=1.0.0",

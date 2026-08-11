@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel
 import zmq
@@ -7,7 +7,7 @@ import os
 import json
 import time
 import asyncio
-from typing import Dict
+from typing import Dict, Optional
 import threading
 import logging
 from pathlib import Path
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Import configuration and registry
 from app.config import get_settings
+from app.format_routes import converter_for
 from app.registry import registry
 
 # Import all converters so their @register_converter decorators run
@@ -237,7 +238,7 @@ async def get_converted_file(file_path: str):
     converted_dir = settings.CONVERTED_FILES_DIR
     # Rag-template requests by original name (e.g. 439.pdf); worker writes <stem>.md
     base, ext = os.path.splitext(file_path)
-    if ext.lower() in (".pdf", ".docx", ".doc") and not file_path.lower().endswith(".md"):
+    if ext.lower() in (".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".xls") and not file_path.lower().endswith(".md"):
         lookup_path = os.path.join(converted_dir, os.path.basename(base) + ".md")
     else:
         lookup_path = os.path.join(converted_dir, file_path)
@@ -255,10 +256,19 @@ async def get_converted_file(file_path: str):
 # ==================== DEBUG ENDPOINTS ====================
 
 @app.post("/debug/convert")
-async def debug_convert_file(file: UploadFile = File(...)):
-    """Upload a PDF and test conversion with timing."""
+async def debug_convert_file(
+    file: UploadFile = File(...),
+    converter_type: Optional[str] = Form(None),
+):
+    """Upload a document and test conversion with timing.
+
+    Routes by format so the check exercises the same converter the ingest path
+    would pick (PDF → docling, .xlsx/.xlsm → excel, .xls → markitdown). Pass
+    `converter_type` to force a specific one.
+    """
     logger.info(f"Debug conversion request for file: {file.filename}")
     start_time = time.time()
+    selected_converter = (converter_type or "").strip() or converter_for(file.filename)
     
     # Save uploaded file temporarily
     temp_path = Path(settings.CONVERTED_FILES_DIR) / f"debug_{file.filename}"
@@ -274,9 +284,10 @@ async def debug_convert_file(file: UploadFile = File(...)):
     task = {
         "conversion_id": conversion_id,
         "file_path": str(temp_path),
-        "converter_type": "docling"
+        "converter_type": selected_converter
     }
-    
+    logger.info(f"Debug conversion {conversion_id} routed to converter {selected_converter}")
+
     task_socket.send_string(json.dumps(task))
     conversion_status_db[conversion_id] = "pending"
     conversion_details_db[conversion_id] = {
@@ -300,14 +311,19 @@ async def debug_convert_file(file: UploadFile = File(...)):
         if status in ["completed", "success", "failed", "error"]:
             elapsed = time.time() - start_time
             
-            # Try to find output path
+            # Try to find output path. The worker names the output after the
+            # file it was given — which here is the debug_-prefixed temp copy —
+            # so check that first; the unprefixed name is kept for callers that
+            # dropped the file in themselves. Checking only the stripped name is
+            # why output_available used to report false on every success.
             output_path = None
             converted_dir = Path(settings.CONVERTED_FILES_DIR)
             stem = temp_path.stem.replace("debug_", "")
-            potential_output = converted_dir / f"{stem}.md"
-            if potential_output.exists():
-                output_path = str(potential_output)
-                conversion_details_db[conversion_id]["output_path"] = output_path
+            for candidate in (converted_dir / f"debug_{stem}.md", converted_dir / f"{stem}.md"):
+                if candidate.exists():
+                    output_path = str(candidate)
+                    conversion_details_db[conversion_id]["output_path"] = output_path
+                    break
             
             return {
                 "conversion_id": conversion_id,
@@ -315,7 +331,7 @@ async def debug_convert_file(file: UploadFile = File(...)):
                 "file_size": file_size,
                 "status": status,
                 "conversion_time_seconds": round(elapsed, 2),
-                "converter_type": "docling",
+                "converter_type": selected_converter,
                 "output_available": output_path is not None
             }
         

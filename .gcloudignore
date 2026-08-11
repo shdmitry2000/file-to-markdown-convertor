@@ -1,0 +1,14 @@
+# The markdown-api image builds with this directory as its context (its
+# Dockerfile does `COPY ./app ./app`), so `gcloud builds submit` is run from
+# here and reads this file rather than the repo-root one.
+.git
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/*.egg-info/
+bench_out/
+data/
+files_to_convert/
+converted_files/
+**/*.log

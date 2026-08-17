@@ -13,6 +13,7 @@ import argparse
 import uuid
 
 # Import configuration
+from app.cancellation import is_cancelled
 from app.config import get_settings
 
 # Import chunkers to trigger @register_chunker decorators
@@ -1062,6 +1063,17 @@ def main():
             conversion_id = task["conversion_id"]
             file_path = task["file_path"]
             converter_type = task.get("converter_type", "docling")
+            # Skip work nobody is waiting for. A cancelled batch of 300 files has
+            # almost all of them still queued, and converting them costs the same
+            # as converting wanted ones — this is where the reclaimed compute is.
+            # Checked HERE, before the converter is touched, so it costs one stat.
+            if is_cancelled(conversion_id):
+                logger.info("[%s] Cancelled before it started; skipping %s",
+                            conversion_id, file_path)
+                result_sender_socket.send_json(
+                    {"conversion_id": conversion_id, "status": "cancelled"}
+                )
+                continue
             convert_file_to_markdown(file_path, conversion_id, result_sender_socket, converter_type)
         elif task_type == "chunk":
             # Chunking via HTTP /chunk-async flow. Synchronous REQ/REP ingest

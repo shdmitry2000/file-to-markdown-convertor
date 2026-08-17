@@ -20,6 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Import configuration and registry
+from app.cancellation import clear_cancel, request_cancel
 from app.config import get_settings
 from app.format_routes import converter_for
 from app.registry import registry
@@ -128,9 +129,19 @@ def result_listener():
                                 **meta, "started_at": time.time(),
                             }
 
-                        # Update last completion timestamp if conversion finished
-                        if status in ["completed", "success", "failed", "error"]:
+                        # Update last completion timestamp if conversion finished.
+                        # `cancelled` belongs here: a worker that declines a job it
+                        # was told to skip is DONE with it. Without this the entry
+                        # stayed in active_conversions_db forever, so /debug/queue
+                        # reported a conversion nobody was running — and an empty
+                        # queue after a cancel could not be told from a busy one.
+                        if status in ["completed", "success", "failed", "error", "cancelled"]:
                             last_completion_timestamp = time.time()
+
+                            # The job is over, so the marker has nothing left to
+                            # stop; leaving it behind would accumulate on a shared
+                            # volume with no one to clean it up.
+                            clear_cancel(conversion_id)
 
                             # Move from active to completed
                             if conversion_id in active_conversions_db:
@@ -215,19 +226,30 @@ async def get_status(conversion_id: str):
 
 @app.delete("/convert/{conversion_id}")
 async def cancel_conversion(conversion_id: str):
-    """Cancel a conversion (mark as cancelled; worker will ignore result)."""
+    """Cancel a conversion.
+
+    Writes a marker the workers read, so a job that has not started never starts.
+    This used to set a status and nothing more: the caller stopped waiting while
+    the worker converted the document to completion anyway, so a cancelled batch
+    still occupied the whole pool for its full duration.
+
+    A conversion already RUNNING is not interrupted by this — see the worker's
+    poll loop for that half. Cancelling a queued job is where the compute is: a
+    cancelled 300-file batch has almost all of it still in the queue.
+    """
     logger.info(f"Request to cancel conversion ID: {conversion_id}")
     if conversion_id not in conversion_status_db:
         logger.warning(f"Conversion ID not found for cancellation: {conversion_id}")
         raise HTTPException(status_code=404, detail="Conversion ID not found")
-    
+
     current_status = conversion_status_db[conversion_id]
     if current_status in ["completed", "success", "failed"]:
         logger.info(f"Conversion {conversion_id} already finished with status: {current_status}")
         return {"conversion_id": conversion_id, "status": current_status, "message": "Already finished"}
-    
+
+    marked = request_cancel(conversion_id)
     conversion_status_db[conversion_id] = "cancelled"
-    logger.info(f"Conversion {conversion_id} marked as cancelled")
+    logger.info(f"Conversion {conversion_id} marked as cancelled (marker={marked})")
     return {"conversion_id": conversion_id, "status": "cancelled"}
 
 

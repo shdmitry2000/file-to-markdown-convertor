@@ -250,3 +250,138 @@ async def test_cancelling_an_unknown_conversion_is_a_404():
     with pytest.raises(HTTPException) as exc:
         await main.cancel_conversion("never-existed")
     assert exc.value.status_code == 404
+
+
+# ------------------------------------------------ a conversion already running
+
+def test_the_poll_loop_notices_a_cancel_and_says_so(monkeypatch):
+    """`_await_warm_result` is the only point in the service awake while a
+    conversion runs, so it is the only place a cancel can be noticed. docling
+    offers no hook of its own — convert() takes no cancellation token, and its
+    internal stage stop() documents that a blocked stage is simply abandoned."""
+    import queue as queue_module
+
+    from app.workers import worker
+
+    cancellation.request_cancel("running-1")
+
+    class _NeverAnswers:
+        def get(self, timeout=None): raise queue_module.Empty()
+
+    class _StillAlive:
+        def is_alive(self): return True
+
+    item, reason = worker._await_warm_result(
+        _NeverAnswers(), _StillAlive(), timeout_seconds=60,
+        conversion_id="running-1")
+
+    assert reason == "cancelled" and item is None
+
+
+def test_the_poll_loop_leaves_an_uncancelled_conversion_alone():
+    """It must keep waiting — a conversion legitimately runs for half an hour."""
+    import queue as queue_module
+
+    from app.workers import worker
+
+    class _AnswersOnce:
+        def __init__(self): self.calls = 0
+        def get(self, timeout=None):
+            self.calls += 1
+            if self.calls < 3:
+                raise queue_module.Empty()
+            return ("success", {"markdown": "# ok"})
+
+    class _StillAlive:
+        def is_alive(self): return True
+
+    item, reason = worker._await_warm_result(
+        _AnswersOnce(), _StillAlive(), timeout_seconds=60,
+        conversion_id="not-cancelled")
+
+    assert reason is None and item[0] == "success"
+
+
+def test_cancelling_mid_conversion_kills_the_worker_holding_it(monkeypatch):
+    """Killing the child is the only way to stop docling, and freeing the slot is
+    the whole point. The loaded models die with it, so the next job pays a cold
+    start — cheap against the minutes of conversion reclaimed."""
+    from app.cancellation import ConversionCancelled
+    from app.workers import worker
+
+    cancellation.request_cancel("running-2")
+    warm = worker._WarmDoclingWorker()
+    killed = []
+
+    monkeypatch.setattr(warm, "_ensure", lambda *a, **k: None)
+    monkeypatch.setattr(warm, "_kill", lambda: killed.append(True))
+    warm._in = type("Q", (), {"put": lambda self, v: None})()
+    monkeypatch.setattr(
+        worker, "_await_warm_result", lambda *a, **k: (None, "cancelled"))
+
+    with pytest.raises(ConversionCancelled):
+        warm.convert("/tmp/a.pdf", "running-2", False, True, 60)
+
+    assert killed == [True], "the slot stays busy until the child is killed"
+
+
+# --------------------------------------------------- one conversion, N callers
+
+async def test_one_caller_leaving_does_not_cancel_anothers_work():
+    """markdown-api deliberately shares ONE conversion between callers of the same
+    file. Cancelling used to stop the work outright, so one space cancelling its
+    ingest killed the conversion another space was still waiting for — and that
+    space saw the file fail for no reason it could observe."""
+    from app.api import main
+
+    main.conversion_status_db["shared-1"] = "processing"
+    main.conversion_waiters["shared-1"] = 2
+
+    first = await main.cancel_conversion("shared-1")
+
+    assert first["status"] == "processing", "the work must continue"
+    assert cancellation.is_cancelled("shared-1") is False
+    assert main.conversion_status_db["shared-1"] == "processing"
+
+    second = await main.cancel_conversion("shared-1")
+
+    assert second["status"] == "cancelled", "the last caller left, so stop the work"
+    assert cancellation.is_cancelled("shared-1") is True
+
+
+async def test_a_sole_caller_cancels_immediately():
+    from app.api import main
+
+    main.conversion_status_db["sole-1"] = "processing"
+    main.conversion_waiters["sole-1"] = 1
+
+    assert (await main.cancel_conversion("sole-1"))["status"] == "cancelled"
+    assert cancellation.is_cancelled("sole-1") is True
+
+
+# --------------------------------------------------------------- the sweeper
+
+def test_a_marker_whose_job_never_reported_back_is_swept(tmp_path):
+    """Terminal statuses clear their own marker, so this is for the ones that
+    never get one — a cancel for a job never dispatched, or a restart landing
+    between the cancel and the worker reporting back. Observed within minutes of
+    the queued-cancel change shipping."""
+    import os
+    import time as _time
+
+    cancellation.request_cancel("ancient")
+    cancellation.request_cancel("recent")
+
+    old = cancellation.cancel_dir() / "ancient"
+    stale = _time.time() - (cancellation.marker_ttl_seconds() + 60)
+    os.utime(old, (stale, stale))
+
+    assert cancellation.sweep() == 1
+    assert cancellation.is_cancelled("ancient") is False
+    assert cancellation.is_cancelled("recent") is True, "a live cancel was swept"
+
+
+def test_sweeping_an_absent_directory_is_not_an_error(monkeypatch, tmp_path):
+    """It runs on startup, before anything has ever been cancelled."""
+    monkeypatch.setenv("CANCEL_MARKER_DIR", str(tmp_path / "never-created"))
+    assert cancellation.sweep() == 0

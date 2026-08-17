@@ -27,7 +27,7 @@ def test_docling_hybrid_chunker_registered(registry_after_import):
     names = {c["name"] for c in caps["chunkers"]}
     assert "docling_hybrid" in names
     entry = next(c for c in caps["chunkers"] if c["name"] == "docling_hybrid")
-    assert entry["label"] == "Docling HybridChunker"
+    assert entry["label"] == "Docling · HybridChunker (Hebrew-optimized)"
     assert "Context-aware" in entry["description"]
 
 
@@ -43,11 +43,32 @@ def test_chunker_factory_produces_instance_with_chunk_method(registry_after_impo
     assert hasattr(impl, "chunk") and callable(impl.chunk)
 
 
-def test_chunker_empty_markdown_short_circuits():
-    """Empty input → empty list, without importing Docling."""
+def test_chunker_rejects_a_path_that_is_not_there():
+    """This chunker takes a PDF PATH, not markdown — it converts the document
+    itself rather than chunking text somebody else converted. The old contract
+    ("empty markdown → empty list") no longer exists, and asserting it here meant
+    the suite was describing an interface the code had stopped having."""
     from app.chunkers.docling_hybrid import DoclingHybridChunkerImpl
+
     impl = DoclingHybridChunkerImpl()
-    assert impl.chunk("", {}) == []
+    with pytest.raises(FileNotFoundError):
+        impl.chunk("/nonexistent/document.pdf", {"max_tokens": 128, "tokenizer": "x"})
+
+
+def test_chunker_requires_the_settings_it_will_not_guess(tmp_path):
+    """A missing knob is surfaced, never defaulted. A server-side default would
+    silently diverge from the per-space setting it is supposed to honour, and the
+    resulting chunk sizes would be wrong in a way nothing reports."""
+    from app.chunkers.docling_hybrid import DoclingHybridChunkerImpl
+
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    impl = DoclingHybridChunkerImpl()
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        impl.chunk(str(pdf), {"tokenizer": "x"})
+    with pytest.raises(ValueError, match="tokenizer"):
+        impl.chunk(str(pdf), {"max_tokens": 128})
 
 
 def test_chunker_capabilities_endpoint_shape(registry_after_import):
@@ -60,20 +81,23 @@ def test_chunker_capabilities_endpoint_shape(registry_after_import):
 
 
 @pytest.mark.integration
-def test_chunker_real_invocation_returns_chunks():
-    """Real Docling HybridChunker run. Requires docling + transformers installed."""
+def test_chunker_real_invocation_returns_chunks(sample_pdf):
+    """Real Docling HybridChunker run over a real PDF.
+
+    Deselected by default (see the `integration` marker in pyproject): it runs the
+    docling pipeline and downloads a HuggingFace tokenizer, so it needs models and
+    a network. The marker was never registered, so this ran in every suite — and
+    it fed MARKDOWN to a chunker that takes a PDF path, meaning it could only ever
+    fail. Run it deliberately with `pytest -m integration`.
+    """
     from app.chunkers.docling_hybrid import DoclingHybridChunkerImpl
+
     impl = DoclingHybridChunkerImpl()
-    markdown = (
-        "# Sample Document\n\n"
-        "## Introduction\n\n"
-        "RAG combines retrieval with generation. The retrieval step pulls "
-        "context from a knowledge base.\n\n"
-        "## Methods\n\n"
-        "Common patterns include reranking, query expansion, and hybrid search.\n"
-    )
     try:
-        chunks = impl.chunk(markdown, {"max_tokens": 128})
+        chunks = impl.chunk(
+            str(sample_pdf),
+            {"max_tokens": 128, "tokenizer": "minishlab/potion-multilingual-128M"},
+        )
     except RuntimeError as exc:
         pytest.skip(f"Docling dependencies missing: {exc}")
     assert len(chunks) > 0

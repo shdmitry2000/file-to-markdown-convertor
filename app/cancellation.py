@@ -22,10 +22,21 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+class ConversionCancelled(Exception):
+    """Raised inside a worker when the job it is running has been cancelled.
+
+    Distinct from a conversion FAILING: nothing is wrong with the document, so it
+    is reported as `cancelled` rather than `failed` and never counted against the
+    document's retry budget.
+    """
 
 
 def cancel_dir() -> Path:
@@ -87,3 +98,43 @@ def clear_cancel(conversion_id: str) -> None:
         pass
     except OSError as exc:
         logger.debug("could not clear cancel marker for %s: %s", conversion_id, exc)
+
+
+def marker_ttl_seconds() -> int:
+    """How long a marker can possibly still be needed.
+
+    A conversion cannot outlive the worker's own hard timeout, so a marker older
+    than that plus a margin has no job left to stop.
+    """
+    configured = os.getenv("CANCEL_MARKER_TTL_SECONDS")
+    if configured:
+        return int(configured)
+    return int(os.getenv("DOCLING_TIMEOUT_SECONDS", "7200")) + 3600
+
+
+def sweep(max_age_seconds: Optional[int] = None) -> int:
+    """Delete markers too old to matter. Returns how many were removed.
+
+    Terminal statuses clear their own marker, so this is for the ones that never
+    get a terminal status: a cancel for a job that was never dispatched, or whose
+    worker died, or — observed within minutes of this shipping — a service
+    restarted between the cancel and the worker reporting back. Nothing else
+    collects those, and they accumulate on a shared volume forever.
+    """
+    ttl = marker_ttl_seconds() if max_age_seconds is None else max_age_seconds
+    cutoff = time.time() - ttl
+    removed = 0
+    try:
+        entries = list(cancel_dir().iterdir())
+    except (OSError, FileNotFoundError):
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("swept %d stale cancel marker(s) older than %ds", removed, ttl)
+    return removed

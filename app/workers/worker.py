@@ -13,7 +13,7 @@ import argparse
 import uuid
 
 # Import configuration
-from app.cancellation import is_cancelled
+from app.cancellation import ConversionCancelled, is_cancelled
 from app.config import get_settings
 
 # Import chunkers to trigger @register_chunker decorators
@@ -358,7 +358,7 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool) -> N
             out_q.put(("error", str(e), traceback.format_exc()))
 
 
-def _await_warm_result(out_q, proc, timeout_seconds: int):
+def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = None):
     """Wait for a warm worker's result, polling liveness like the cold path does.
 
     A bare ``out_q.get(timeout=...)`` cannot tell "still working" from "child is
@@ -367,8 +367,14 @@ def _await_warm_result(out_q, proc, timeout_seconds: int):
     whole daemon, since every conversion in the service funnels through it.
     Observed in the wild as a 163-page PDF stalling all conversions for hours.
 
+    This 2-second slice is also the ONLY point in the service that is awake while
+    a conversion runs, which makes it the only place a cancellation can be
+    noticed. docling offers no hook of its own: `convert()` takes no cancellation
+    token and no progress callback, and its internal stage `stop()` documents that
+    a stage stuck in a blocking call is simply abandoned.
+
     Returns ``(item, reason)`` where reason is None (got a result), 'timeout',
-    or 'died'."""
+    'died', or 'cancelled'."""
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -379,6 +385,8 @@ def _await_warm_result(out_q, proc, timeout_seconds: int):
         except queue_module.Empty:
             if proc is None or not proc.is_alive():
                 return None, "died"
+            if conversion_id and is_cancelled(conversion_id):
+                return None, "cancelled"
 
 
 class _WarmDoclingWorker:
@@ -444,7 +452,18 @@ class _WarmDoclingWorker:
         with self._lock:
             self._ensure(do_ocr, do_table_structure)
             self._in.put(file_path)
-            item, reason = _await_warm_result(self._out, self._proc, timeout_seconds)
+            item, reason = _await_warm_result(
+                self._out, self._proc, timeout_seconds, conversion_id)
+            if reason == "cancelled":
+                # Killing the child is the only way to stop docling, and it is the
+                # whole point: the slot goes back to the pool now instead of at the
+                # end of a conversion nobody is waiting for. The cost is the loaded
+                # models dying with it, so the next job on this worker pays a cold
+                # start — cheap against the minutes of conversion reclaimed.
+                logger.info("[%s] Cancelled mid-conversion; killing warm worker",
+                            conversion_id)
+                self._kill()
+                raise ConversionCancelled(f"conversion {conversion_id} was cancelled")
             if reason == "timeout":
                 # Hung conversion: kill the warm worker so it can't wedge the
                 # daemon; the next job respawns it.
@@ -568,7 +587,13 @@ class _WarmDbankWorker:
         with self._lock:
             self._ensure()
             self._in.put(file_path)
-            item, reason = _await_warm_result(self._out, self._proc, timeout_seconds)
+            item, reason = _await_warm_result(
+                self._out, self._proc, timeout_seconds, conversion_id)
+            if reason == "cancelled":
+                logger.info("[%s] Cancelled mid-conversion; killing warm dbank worker",
+                            conversion_id)
+                self._kill()
+                raise ConversionCancelled(f"conversion {conversion_id} was cancelled")
             if reason == "timeout":
                 logger.warning(
                     "[%s] Warm dbank conversion timeout (%ss); restarting worker",
@@ -663,6 +688,19 @@ def _run_converter_with_timeout(
             if not process.is_alive():
                 # Crashed / killed without producing a result.
                 break
+            # The non-docling converters (vlm, markitdown, excel, pymupdf) run
+            # here. Easy to overlook, and overlooking it would mean cancel
+            # silently doing nothing for every converter except docling.
+            if is_cancelled(conversion_id):
+                logger.info("[%s] Cancelled mid-conversion; terminating subprocess",
+                            conversion_id)
+                process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+                raise ConversionCancelled(
+                    f"conversion {conversion_id} was cancelled")
 
     if item is None:
         if process.is_alive():
@@ -777,6 +815,17 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                     span.set_attribute("document.num_pages", num_pages)
                     logger.info(f"[{conversion_id}] Docling converted {num_pages} pages")
                     
+                except ConversionCancelled:
+                    # Not a failure of the document — reporting it as one would
+                    # spend a retry attempt and show an error for something the
+                    # operator asked for.
+                    logger.info(f"[{conversion_id}] Conversion cancelled")
+                    span.set_attribute("cancelled", True)
+                    result_sender_socket.send_json({
+                        "conversion_id": conversion_id,
+                        "status": "cancelled",
+                    })
+                    return
                 except TimeoutError as e:
                     error_msg = str(e)
                     logger.error(f"[{conversion_id}] {error_msg}")
@@ -899,6 +948,14 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                     num_pages = result_data.get("num_pages", 0)
                     converter_span.set_attribute("document.num_pages", num_pages)
                     
+                except ConversionCancelled:
+                    logger.info(f"[{conversion_id}] Conversion cancelled")
+                    span.set_attribute("cancelled", True)
+                    result_sender_socket.send_json({
+                        "conversion_id": conversion_id,
+                        "status": "cancelled",
+                    })
+                    return
                 except TimeoutError as e:
                     error_msg = f"{converter_type} conversion: {str(e)}"
                     logger.error(f"[{conversion_id}] {error_msg}")

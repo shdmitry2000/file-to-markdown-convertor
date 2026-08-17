@@ -1,6 +1,6 @@
 [project]
 name = "file-to-markdown-convertor"
-version = "1.2.5"
+version = "1.2.6"
 description = "Centralized PDF to Markdown conversion service"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -80,3 +80,9 @@ asyncio_mode = "auto"
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+# Tests that run the real docling pipeline and download models. Deselected by
+# default so the suite stays offline and fast; run them with `pytest -m integration`.
+markers = [
+    "integration: real converter/model run; needs models and a network",
+]
+addopts = "-m 'not integration'"

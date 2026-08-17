@@ -151,17 +151,44 @@ curl http://localhost:8000/convert/550e8400-e29b-41d4-a716-446655440000
 Response:
 ```json
 {
-  "status": "completed"  // or "pending", "processing", "failed"
+  "status": "completed"  // or "pending", "processing", "failed", "cancelled"
 }
 ```
 
-### 3. Retrieve Converted File
+### 3. Cancel a Conversion
+
+```bash
+curl -X DELETE http://localhost:8000/convert/550e8400-e29b-41d4-a716-446655440000
+```
+
+Stops the work, not just the waiting. A job that has **not started** is dropped
+before it reaches the converter; a job already **converting** has its converter
+subprocess killed so the slot returns to the pool. Either way the conversion ends
+as `cancelled` — which is not `failed`, because nothing is wrong with the
+document.
+
+Two behaviours worth knowing before relying on it:
+
+- **Conversions are shared between callers.** Two callers converting the same file
+  get the same `conversion_id`, so a cancel means "I have stopped waiting"; the
+  work only stops when the *last* caller has cancelled. Until then the response
+  reports the conversion's real status rather than `cancelled`.
+- **Killing an active conversion discards the warm model.** The next job on that
+  worker pays a cold start (~10-12s). Worth it for a long conversion, a loss for a
+  short one.
+
+Cancellation reaches the workers through a marker file in `CANCEL_MARKER_DIR`
+(default: alongside the converted files). **The API and the workers must share
+that directory** — they already must, to exchange documents at all, but a
+deployment that separates them breaks cancellation silently.
+
+### 4. Retrieve Converted File
 
 ```bash
 curl http://localhost:8000/converted/document.md
 ```
 
-### 4. Health Check
+### 5. Health Check
 
 ```bash
 curl http://localhost:8000/health
@@ -277,6 +304,23 @@ Default ports (in `app/api/main.py`):
 - Tasks: `5555` (PUSH from API, PULL by workers)
 - Results: `5556` (PUSH from workers, PULL by API)
 
+### Cancellation
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CANCEL_MARKER_DIR` | `{CONVERTED_FILES_DIR}/.cancelled` | Where cancel markers are written and read. **Must be visible to both the API and the workers.** |
+| `CANCEL_MARKER_TTL_SECONDS` | `DOCLING_TIMEOUT_SECONDS` + 1h | Age past which a marker has no job left to stop and is swept |
+| `CANCEL_MARKER_SWEEP_INTERVAL_SECONDS` | `3600` | How often the API sweeps stale markers |
+
+Why a file rather than a message: a worker mid-conversion is blocked inside its
+job and is **not reading its ZeroMQ socket**, so a cancel sent on the task queue
+would be delivered to an idle worker or wait behind the busy one until it
+finished — exactly when it is worthless.
+
+Terminal statuses clear their own marker. The sweeper exists for the ones that
+never reach a terminal status: a cancel for a job that was never dispatched, or a
+restart landing between the cancel and the worker reporting back.
+
 ### Output Structure
 
 Converted files maintain directory structure:
@@ -315,7 +359,9 @@ Converted markdown here...
 |----------|--------|-------------|
 | `/convert` | POST | Submit file for conversion |
 | `/convert/{id}` | GET | Check conversion status |
+| `/convert/{id}` | DELETE | Cancel a conversion — drops it if queued, kills its converter if running |
 | `/converted/{path}` | GET | Retrieve converted file |
+| `/debug/queue` | GET | Pending and active conversions |
 | `/health` | GET | Service health check |
 
 ## Dependencies

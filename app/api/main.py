@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Import configuration and registry
 from app.cancellation import clear_cancel, request_cancel
+from app.cancellation import sweep as sweep_cancel_markers
 from app.config import get_settings
 from app.format_routes import converter_for
 from app.registry import registry
@@ -41,6 +42,18 @@ logger.info(f"Starting in {settings.ENVIRONMENT} mode")
 logger.info(f"Converted files directory: {settings.CONVERTED_FILES_DIR}")
 
 
+def _cancel_marker_sweeper():
+    """Sweep stale cancel markers at startup and then hourly. Never raises: a
+    housekeeping thread that dies must not take conversions with it."""
+    interval = int(os.getenv("CANCEL_MARKER_SWEEP_INTERVAL_SECONDS", "3600"))
+    while True:
+        try:
+            sweep_cancel_markers()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cancel-marker sweep failed: %s", exc)
+        time.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages application lifespan events for startup and shutdown."""
@@ -48,6 +61,13 @@ async def lifespan(app: FastAPI):
     logger.info("Starting result listener background thread.")
     thread = threading.Thread(target=result_listener, daemon=True)
     thread.start()
+
+    # Markers are cleared when a conversion reaches a terminal status, so this is
+    # only for the ones that never do — a cancel whose job was never dispatched,
+    # or a restart landing between the cancel and the worker reporting back.
+    # Nothing else collects those, and they live on a shared volume.
+    logger.info("Starting cancel-marker sweeper background thread.")
+    threading.Thread(target=_cancel_marker_sweeper, daemon=True).start()
 
     yield
 
@@ -70,6 +90,11 @@ active_conversions_db: Dict[str, Dict] = {}  # Active conversions with metadata
 # SAME file; without this every one of them queues its own full conversion behind
 # the others. Callers share a conversion_id instead and all poll the same job.
 inflight_conversions: Dict[tuple, str] = {}
+# conversion_id -> how many callers are waiting on it. The sharing above means a
+# cancel is not necessarily "nobody wants this any more": one space cancelling its
+# ingest must not stop the conversion another space is still waiting for. Only the
+# LAST waiter to leave cancels the work.
+conversion_waiters: Dict[str, int] = {}
 last_completion_timestamp = time.time()  # Track last successful conversion
 
 # In-memory database for chunking tasks
@@ -148,6 +173,7 @@ def result_listener():
                                 del active_conversions_db[conversion_id]
                             if conversion_id in pending_conversions_db:
                                 del pending_conversions_db[conversion_id]
+                            conversion_waiters.pop(conversion_id, None)
                             # Finished, so it can no longer be shared by a new caller.
                             for key, cid in list(inflight_conversions.items()):
                                 if cid == conversion_id:
@@ -187,12 +213,14 @@ async def convert_file(request: ConversionRequest):
     existing_id = inflight_conversions.get(inflight_key)
     if existing_id and conversion_status_db.get(existing_id) in ("pending", "processing"):
         logger.info(f"Reusing in-flight conversion {existing_id} for {file_path}")
+        conversion_waiters[existing_id] = conversion_waiters.get(existing_id, 1) + 1
         return {"conversion_id": existing_id}
 
     conversion_id = str(uuid.uuid4())
     logger.info(f"Generated conversion ID {conversion_id} for file {file_path}")
     conversion_status_db[conversion_id] = "pending"
     inflight_conversions[inflight_key] = conversion_id
+    conversion_waiters[conversion_id] = 1
     pending_conversions_db[conversion_id] = {
         "filename": os.path.basename(file_path),
         "queued_at": time.time(),
@@ -246,6 +274,24 @@ async def cancel_conversion(conversion_id: str):
     if current_status in ["completed", "success", "failed"]:
         logger.info(f"Conversion {conversion_id} already finished with status: {current_status}")
         return {"conversion_id": conversion_id, "status": current_status, "message": "Already finished"}
+
+    # One conversion can be shared by several callers (see inflight_conversions).
+    # The caller leaves either way — that is their business — but the WORK only
+    # stops when the last one has gone. Without this, one space cancelling its
+    # ingest silently killed the conversion another space was still waiting for,
+    # and that space would see the file fail for no reason it could observe.
+    remaining = max(0, conversion_waiters.get(conversion_id, 1) - 1)
+    conversion_waiters[conversion_id] = remaining
+    if remaining:
+        logger.info(
+            f"Conversion {conversion_id} still wanted by {remaining} other caller(s); "
+            "not cancelling the work"
+        )
+        return {
+            "conversion_id": conversion_id,
+            "status": current_status,
+            "message": f"Stopped waiting; {remaining} other caller(s) still want this conversion",
+        }
 
     marked = request_cancel(conversion_id)
     conversion_status_db[conversion_id] = "cancelled"

@@ -80,6 +80,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Guarded like every other shared/ import in this service (see vlm.py,
+# worker.py): the platform libs are vendored only when the image is built from
+# the enterprise repo, and are absent in a standalone submodule build. An
+# unconditional import here made the container exit at startup with
+# ModuleNotFoundError instead of simply running without the config report.
+try:
+    from shared.config_report_api import register_config_report
+except ImportError:
+    pass
+else:
+    register_config_report(app, "markdown-api")
+
 # In-memory database to store conversion status
 conversion_status_db: Dict[str, str] = {}
 conversion_details_db: Dict[str, Dict] = {}  # Stores detailed info about conversions

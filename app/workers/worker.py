@@ -58,6 +58,14 @@ logger.info(f"ZeroMQ result URL: {settings.zeromq_result_url}")
 # OpenTelemetry setup — initialized once at worker startup
 # ---------------------------------------------------------------------------
 
+def _noop_tracer():
+    from unittest.mock import MagicMock
+    t = MagicMock()
+    t.start_as_current_span.return_value.__enter__ = lambda s, *a: MagicMock()
+    t.start_as_current_span.return_value.__exit__ = lambda s, *a: None
+    return t
+
+
 def _setup_telemetry():
     """Initialize OTel tracer for this worker process."""
     try:
@@ -66,15 +74,21 @@ def _setup_telemetry():
         for p in ["/app", str(Path(__file__).parent.parent.parent.parent)]:
             if p not in sys.path:
                 sys.path.insert(0, p)
-        from shared.utils.telemetry import init_telemetry
-        return init_telemetry("markdown-worker")
+        from shared.utils.telemetry import TelemetryConfigError, init_telemetry
     except Exception as e:
         logger.warning(f"[telemetry] Could not load shared telemetry: {e}. Tracing disabled.")
-        from unittest.mock import MagicMock
-        t = MagicMock()
-        t.start_as_current_span.return_value.__enter__ = lambda s, *a: MagicMock()
-        t.start_as_current_span.return_value.__exit__ = lambda s, *a: None
-        return t
+        return _noop_tracer()
+
+    # The import failing is degradable (no shared module on the path); an OTLP
+    # endpoint that is configured but unexportable is not — same policy as the
+    # services, so a worker cannot silently be the one pod dropping every span.
+    try:
+        return init_telemetry("markdown-worker")
+    except TelemetryConfigError:
+        raise
+    except Exception as e:
+        logger.warning(f"[telemetry] init failed: {e}. Tracing disabled.")
+        return _noop_tracer()
 
 tracer = _setup_telemetry()
 

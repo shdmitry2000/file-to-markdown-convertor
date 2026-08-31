@@ -31,7 +31,7 @@
 # Hat's patch cadence. UBI is still glibc, so torch's manylinux_2_28 wheels
 # (which have no musl build and no sdist) resolve exactly as before — that is
 # why an Alpine base was never an option for this image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:0682a7aa239c28eaad5187914699612daaa3b1fa63abddaee7ba46f5b76c3361 AS builder
+FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:ddf83888de3388bce2fc9c3d66f917bf683790d4db9f956644a3e1b9b6fd15e7 AS builder
 
 USER 0
 WORKDIR /app
@@ -105,7 +105,7 @@ RUN mkdir -p /export/root-cache && \
 
 # ---- Final Stage ----
 # This stage creates the final, small, production-ready image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:0682a7aa239c28eaad5187914699612daaa3b1fa63abddaee7ba46f5b76c3361
+FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:ddf83888de3388bce2fc9c3d66f917bf683790d4db9f956644a3e1b9b6fd15e7
 
 USER 0
 
@@ -123,6 +123,13 @@ RUN microdnf install -y \
     libXext \
     libSM \
     libICE \
+ && microdnf clean all
+
+# Security errata published AFTER this base image was built, so pinning the digest
+# alone does not pick them up: libxml2 (RHSA-2026:61247) and libattr
+# (RHSA-2026:60226). Named explicitly rather than a blanket `microdnf update` so the
+# image keeps a reviewable package set — revisit when the base digest catches up.
+RUN microdnf update -y libxml2 libattr \
  && microdnf clean all
 
 # Copy the installed packages from the builder stage. This is the key to a small image.

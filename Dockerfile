@@ -85,6 +85,26 @@ RUN uv pip uninstall --python $VENV rapidocr rapidocr-onnxruntime 2>/dev/null; \
       import cv2; \
       print('rapidocr removed; docling + onnxruntime + cv2 intact')"
 
+# Drop accelerate. CVE-2026-69112 (High) is a path traversal in its checkpoint
+# loaders, and 1.14.0 is the newest release — the advisory names no fixed
+# version, so removal is the only remediation available.
+#
+# Nothing here needs it: no module imports it, and every requirement on it is
+# guarded by an extra (transformers' torch/serving/dev, docling's all/
+# models-local/models-vlm-inline), none of which this image installs. It is for
+# multi-device dispatch of locally-loaded weights; VLM_BACKEND=factory sends
+# that work to the LLM factory instead, and docling's layout/table models run
+# through onnxruntime.
+#
+# Verified before removal: docling's DocumentConverter builds, and app.api.main,
+# app.converters.vlm and app.workers.worker all import, with it absent.
+#
+# To restore local-weight dispatch, delete this block.
+RUN uv pip uninstall --python $VENV accelerate 2>/dev/null; \
+    $VENV -c "import importlib.util as u, docling, transformers, onnxruntime; \
+      assert u.find_spec('accelerate') is None, 'accelerate still present'; \
+      print('accelerate removed; docling + transformers + onnxruntime intact')"
+
 # Pre-download docling models (layout + table extraction, WITHOUT OCR)
 # Match runtime API (DocumentConverter + PdfFormatOption + InputFormat).
 RUN $VENV -c "\

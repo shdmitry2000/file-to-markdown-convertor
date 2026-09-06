@@ -33,7 +33,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz  # `fitz` is the deprecated alias for the same module
 
 from app.registry import register_converter
 from .base import PDFConverter

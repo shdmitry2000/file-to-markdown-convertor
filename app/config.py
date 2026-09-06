@@ -19,6 +19,11 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class ConfigError(RuntimeError):
+    """The service cannot determine where to write. Raised at construction, because a
+    converter that does not know its output directory has nothing useful to do."""
+
+
 def detect_environment() -> str:
     """
     Detect the runtime environment.
@@ -90,21 +95,35 @@ class WorkerSettings(BaseSettings):
         self._configure_zeromq()
     
     def _configure_paths(self):
-        """Auto-configure file paths based on environment if not explicitly set."""
-        if self.CONVERTED_FILES_DIR is None:
-            if self.ENVIRONMENT == 'kubernetes':
-                # K8s: Use shared persistent volume
-                self.CONVERTED_FILES_DIR = "/app/converted_files"
-            elif self.ENVIRONMENT == 'docker':
-                # Docker: Use volume mount or default container path
-                self.CONVERTED_FILES_DIR = "/app/converted_files"
-            else:
-                # Standalone: Use local data directory relative to project root
+        """Resolve CONVERTED_FILES_DIR. Does NOT create it — see get_converted_files_dir().
+
+        The default used to be a bare "/app/converted_files" under both docker and
+        kubernetes. That path is outside every volume we mount: the shared claim is
+        mounted at PROJECTS_BASE_PATH ("/app/projects" in every lane), so "/app" is
+        the image's own root filesystem and no lane runs this as root. Creating it
+        raised EACCES — and because the mkdir sat in ``__init__``, that happened at
+        import, killing the process before anything could report which path failed.
+
+        So: derive from the volume we actually have, and when there is no volume to
+        derive from, say which variables are missing instead of guessing a path that
+        cannot work.
+        """
+        if not self.CONVERTED_FILES_DIR:
+            if self.PROJECTS_BASE_PATH:
+                self.CONVERTED_FILES_DIR = str(
+                    Path(self.PROJECTS_BASE_PATH) / ".cache" / "converted_files"
+                )
+            elif self.ENVIRONMENT == 'standalone':
+                # Local development: a directory inside the checkout, always writable.
                 project_root = Path(__file__).parent.parent
                 self.CONVERTED_FILES_DIR = str(project_root / "data" / "converted_files")
-        
-        # Ensure directory exists
-        Path(self.CONVERTED_FILES_DIR).mkdir(parents=True, exist_ok=True)
+            else:
+                raise ConfigError(
+                    f"Cannot place converted files in the {self.ENVIRONMENT} environment: "
+                    "set CONVERTED_FILES_DIR, or set PROJECTS_BASE_PATH and it is derived "
+                    "as <PROJECTS_BASE_PATH>/.cache/converted_files. Refusing to fall back "
+                    "to /app/converted_files, which is outside every mounted volume."
+                )
     
     def _configure_zeromq(self):
         """Auto-configure ZeroMQ host based on environment if not explicitly set."""
@@ -153,10 +172,13 @@ def get_settings() -> WorkerSettings:
 
 # Convenience function for getting converted files directory
 def get_converted_files_dir() -> Path:
+    """The converted files directory, created if absent.
+
+    Creation happens here rather than in ``WorkerSettings.__init__`` so an
+    unwritable directory is a request-time failure naming the path, not an import-time
+    crash. Callers that already mkdir before writing (the worker, the cancel markers)
+    are unaffected.
     """
-    Get the converted files directory as a Path object.
-    
-    Returns:
-        Path: Directory where converted files are stored
-    """
-    return Path(get_settings().CONVERTED_FILES_DIR)
+    path = Path(get_settings().CONVERTED_FILES_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    return path

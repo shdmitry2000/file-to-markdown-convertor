@@ -94,6 +94,30 @@ class WorkerSettings(BaseSettings):
         self._configure_paths()
         self._configure_zeromq()
     
+    def _resolve_projects_base(self):
+        """Make PROJECTS_BASE_PATH absolute before anything derives from it.
+
+        Every deployed lane sets it absolutely (/app/projects), so this is a no-op
+        there. A RELATIVE value resolves against each process's working directory,
+        and this service is started from its own submodule directory while the
+        gateway and templates run from the repo root — so the same configured value
+        pointed at two different trees. markdown-api then read a store containing no
+        spaces at all: every key 404'd, and the converted-file cache was written and
+        looked for under a path nothing else could see.
+
+        Delegated to shared.file_storage so the store and this settings object
+        cannot disagree about where the root is. Guarded like every other shared
+        import here: a standalone build has no shared/ and keeps the raw value.
+        """
+        base = self.PROJECTS_BASE_PATH
+        if not base:
+            return
+        try:
+            from shared.file_storage import _local_root
+        except ImportError:
+            return
+        self.PROJECTS_BASE_PATH = str(_local_root(base))
+
     def _configure_paths(self):
         """Resolve CONVERTED_FILES_DIR. Does NOT create it — see get_converted_files_dir().
 
@@ -108,6 +132,7 @@ class WorkerSettings(BaseSettings):
         derive from, say which variables are missing instead of guessing a path that
         cannot work.
         """
+        self._resolve_projects_base()
         if not self.CONVERTED_FILES_DIR:
             if self.PROJECTS_BASE_PATH:
                 self.CONVERTED_FILES_DIR = str(

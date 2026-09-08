@@ -123,6 +123,10 @@ def test_convert_file_creates_output_directory(sample_pdf, monkeypatch, tmp_path
 
     converted_dir = test_dir / "converted_files"
     monkeypatch.setenv("CONVERTED_FILES_DIR", str(converted_dir))
+    # get_settings() is lru_cached, so a value set after import is only picked up
+    # once the cache is dropped. Production sets this before the process starts.
+    from app.config import get_settings
+    get_settings.cache_clear()
 
     (test_dir / "files_to_convert" / "subdir").mkdir(parents=True)
     nested_file = test_dir / "files_to_convert" / "subdir" / "nested.pdf"
@@ -147,6 +151,10 @@ def test_worker_metadata_in_output(sample_pdf, monkeypatch, tmp_path):
 
     converted_dir = test_dir / "converted_files"
     monkeypatch.setenv("CONVERTED_FILES_DIR", str(converted_dir))
+    # get_settings() is lru_cached, so a value set after import is only picked up
+    # once the cache is dropped. Production sets this before the process starts.
+    from app.config import get_settings
+    get_settings.cache_clear()
 
     (test_dir / "files_to_convert").mkdir()
     test_file = test_dir / "files_to_convert" / "test_document.pdf"

@@ -13,6 +13,8 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+from app import storage
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -206,41 +208,83 @@ def result_listener():
 
 
 class ConversionRequest(BaseModel):
-    file_path: str
+    # Exactly one of these. `file_key` addresses the platform's FileStore, so the
+    # document can live on the shared claim or in an object store and this service
+    # does not need to know which. `file_path` is the original contract: a host path
+    # both this pod and the worker pods must be able to see, which is only true when
+    # they share a filesystem.
+    file_path: Optional[str] = None
+    file_key: Optional[str] = None
     converter_type: str = "docling"  # Default to docling for backward compatibility
 
 
 @app.post("/convert")
 async def convert_file(request: ConversionRequest):
-    logger.info(f"Received conversion request for file: {request.file_path} with converter: {request.converter_type}")
-    file_path = request.file_path
-    if not os.path.exists(file_path):
-        logger.warning(f"File not found at path: {file_path}")
-        raise HTTPException(status_code=404, detail="File not found")
+    logger.info(
+        "Received conversion request for %s with converter: %s",
+        request.file_key or request.file_path, request.converter_type,
+    )
+    if bool(request.file_path) == bool(request.file_key):
+        raise HTTPException(
+            status_code=400,
+            detail="send exactly one of file_key (preferred) or file_path",
+        )
+
+    if request.file_key:
+        try:
+            file_key = storage.normalize_key(request.file_key)
+        except storage.StorageUnavailable as exc:
+            # 503, not 400: the request is well-formed, this build cannot serve it.
+            raise HTTPException(status_code=503, detail=str(exc))
+        except ValueError as exc:
+            # Absolute or upward-traversing. Refusing here is the point of keys —
+            # the file_path branch below opens whatever it is handed.
+            raise HTTPException(status_code=400, detail=str(exc))
+        store = storage.file_store()
+        if store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="storage keys unavailable in this build; send file_path",
+            )
+        if not store.exists(file_key):
+            logger.warning("No object at key: %s", file_key)
+            raise HTTPException(status_code=404, detail="File not found")
+        file_path = None
+        identity = file_key
+        display_name = os.path.basename(file_key)
+    else:
+        file_path = request.file_path
+        if not os.path.exists(file_path):
+            logger.warning(f"File not found at path: {file_path}")
+            raise HTTPException(status_code=404, detail="File not found")
+        file_key = None
+        identity = file_path
+        display_name = os.path.basename(file_path)
 
     # Share an already-queued conversion of the same file rather than duplicating
     # it — see inflight_conversions. Both callers poll the same id and get the
     # same result, which the polling client already handles unchanged.
-    inflight_key = (file_path, request.converter_type)
+    inflight_key = (identity, request.converter_type)
     existing_id = inflight_conversions.get(inflight_key)
     if existing_id and conversion_status_db.get(existing_id) in ("pending", "processing"):
-        logger.info(f"Reusing in-flight conversion {existing_id} for {file_path}")
+        logger.info(f"Reusing in-flight conversion {existing_id} for {identity}")
         conversion_waiters[existing_id] = conversion_waiters.get(existing_id, 1) + 1
         return {"conversion_id": existing_id}
 
     conversion_id = str(uuid.uuid4())
-    logger.info(f"Generated conversion ID {conversion_id} for file {file_path}")
+    logger.info(f"Generated conversion ID {conversion_id} for file {identity}")
     conversion_status_db[conversion_id] = "pending"
     inflight_conversions[inflight_key] = conversion_id
     conversion_waiters[conversion_id] = 1
     pending_conversions_db[conversion_id] = {
-        "filename": os.path.basename(file_path),
+        "filename": display_name,
         "queued_at": time.time(),
     }
 
     task = {
         "conversion_id": conversion_id,
         "file_path": file_path,
+        "file_key": file_key,
         "converter_type": request.converter_type
     }
 

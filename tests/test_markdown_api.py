@@ -139,9 +139,18 @@ def test_get_converted_file_not_found(client):
 
 def test_conversion_request_validation(client):
     """Test request validation for /convert endpoint."""
-    # Missing file_path
+    # Neither file_key nor file_path. Both are Optional in the model because the
+    # request must carry exactly one, which pydantic cannot express — so this is a
+    # 400 from the explicit check rather than a 422 from field validation.
     response = client.post("/convert", json={})
-    assert response.status_code == 422  # Validation error
+    assert response.status_code == 400
+    assert "exactly one" in response.json()["detail"]
+
+    # Both is equally wrong, and for the same reason.
+    response = client.post(
+        "/convert", json={"file_path": "/tmp/a.pdf", "file_key": "s/raw/a.pdf"}
+    )
+    assert response.status_code == 400
     
     # Invalid JSON
     response = client.post(

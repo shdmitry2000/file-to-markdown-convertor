@@ -62,3 +62,17 @@ def test_accessor_creates_on_demand(tmp_path, monkeypatch):
         assert created.is_dir()
     finally:
         get_settings.cache_clear()
+
+
+def test_worker_docling_path_uses_mounted_volume(tmp_path, monkeypatch):
+    """Docling conversion must not fall back to ./data/converted_files on the image fs."""
+    base = tmp_path / "projects"
+    monkeypatch.setenv("PROJECTS_BASE_PATH", str(base))
+    monkeypatch.delenv("CONVERTED_FILES_DIR", raising=False)
+    get_settings.cache_clear()
+    try:
+        created = get_converted_files_dir()
+        assert created == base / ".cache" / "converted_files"
+        assert created.is_dir()
+    finally:
+        get_settings.cache_clear()

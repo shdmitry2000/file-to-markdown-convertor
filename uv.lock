@@ -844,7 +844,7 @@ wheels = [
 
 [[package]]
 name = "file-to-markdown-convertor"
-version = "1.2.5"
+version = "1.2.8"
 source = { virtual = "." }
 dependencies = [
     { name = "docling" },

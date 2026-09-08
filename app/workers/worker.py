@@ -14,7 +14,7 @@ import uuid
 
 # Import configuration
 from app.cancellation import ConversionCancelled, is_cancelled
-from app.config import get_settings
+from app.config import get_converted_files_dir, get_settings
 
 # Import chunkers to trigger @register_chunker decorators
 import app.chunkers  # noqa: F401
@@ -782,14 +782,13 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                 )
                 return
             
-            # Write converted files to shared cache directory
-            converted_dir = os.getenv("CONVERTED_FILES_DIR", "./data/converted_files")
-            os.makedirs(converted_dir, exist_ok=True)
-            
+            # Write converted files to shared cache directory on the mounted volume.
+            converted_dir = get_converted_files_dir()
+
             # Use file stem for flat structure (e.g., 439.pdf -> 439.md)
             stem = Path(file_path).stem
-            converted_file_path = os.path.join(converted_dir, f"{stem}.md")
-            span.set_attribute("output.path", converted_file_path)
+            converted_file_path = converted_dir / f"{stem}.md"
+            span.set_attribute("output.path", str(converted_file_path))
             
             logger.info(f"[{conversion_id}] Converting: {file_path} -> {converted_file_path}")
 
@@ -870,7 +869,7 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
 
             # ── File write span ──────────────────────────────────────────
             with tracer.start_as_current_span("write_output") as write_span:
-                write_span.set_attribute("output.path", converted_file_path)
+                write_span.set_attribute("output.path", str(converted_file_path))
 
                 # Create metadata
                 metadata = {
@@ -887,7 +886,9 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                 post.metadata = metadata
 
                 # Save the converted file atomically
-                tmp_file_path = f"{converted_file_path}.tmp_{uuid.uuid4().hex}"
+                tmp_file_path = converted_file_path.with_name(
+                    f"{converted_file_path.name}.tmp_{uuid.uuid4().hex}"
+                )
                 with open(tmp_file_path, "w", encoding='utf-8', errors='replace') as f:
                     f.write(frontmatter.dumps(post))
                 os.replace(tmp_file_path, converted_file_path)
@@ -907,6 +908,15 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
             result_sender_socket.send_json(
                 {"conversion_id": conversion_id, "status": "failed", "error": str(e)}
             )
+
+
+def _fail_conversion(conversion_id: str, result_sender_socket, error: str) -> None:
+    """Report a conversion that could not start. Same shape the converters emit, so
+    the polling client's existing failure path handles it unchanged."""
+    logger.error("[%s] %s", conversion_id, error)
+    result_sender_socket.send_json(
+        {"conversion_id": conversion_id, "status": "failed", "error": error}
+    )
 
 
 def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_socket, converter_type: str = "docling"):
@@ -937,12 +947,10 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                 result_sender_socket.send_json({"conversion_id": conversion_id, "status": "failed", "error": error_msg})
                 return
             
-            # Use configured converted files directory
-            converted_dir = settings.CONVERTED_FILES_DIR
-            os.makedirs(converted_dir, exist_ok=True)
+            converted_dir = get_converted_files_dir()
             stem = Path(file_path).stem
-            converted_file_path = os.path.join(converted_dir, f"{stem}.md")
-            span.set_attribute("output.path", converted_file_path)
+            converted_file_path = converted_dir / f"{stem}.md"
+            span.set_attribute("output.path", str(converted_file_path))
             
             CONVERSION_TIMEOUT_SECONDS = _read_timeout_seconds()
             span.set_attribute("converter.timeout_seconds", CONVERSION_TIMEOUT_SECONDS)
@@ -986,7 +994,7 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
             span.set_attribute("output.markdown_length", len(markdown_content))
 
             with tracer.start_as_current_span("write_output") as write_span:
-                write_span.set_attribute("output.path", converted_file_path)
+                write_span.set_attribute("output.path", str(converted_file_path))
                 
                 metadata = {
                     "source_file": file_path,
@@ -999,7 +1007,9 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                 post.metadata = metadata
 
                 # Save the converted file atomically
-                tmp_file_path = f"{converted_file_path}.tmp_{uuid.uuid4().hex}"
+                tmp_file_path = converted_file_path.with_name(
+                    f"{converted_file_path.name}.tmp_{uuid.uuid4().hex}"
+                )
                 with open(tmp_file_path, "w", encoding='utf-8', errors='replace') as f:
                     f.write(frontmatter.dumps(post))
                 os.replace(tmp_file_path, converted_file_path)
@@ -1132,7 +1142,8 @@ def main():
         if task_type == "convert":
             # Existing conversion flow
             conversion_id = task["conversion_id"]
-            file_path = task["file_path"]
+            file_path = task.get("file_path")
+            file_key = task.get("file_key")
             converter_type = task.get("converter_type", "docling")
             # Skip work nobody is waiting for. A cancelled batch of 300 files has
             # almost all of them still queued, and converting them costs the same
@@ -1140,12 +1151,40 @@ def main():
             # Checked HERE, before the converter is touched, so it costs one stat.
             if is_cancelled(conversion_id):
                 logger.info("[%s] Cancelled before it started; skipping %s",
-                            conversion_id, file_path)
+                            conversion_id, file_key or file_path)
                 result_sender_socket.send_json(
                     {"conversion_id": conversion_id, "status": "cancelled"}
                 )
                 continue
-            convert_file_to_markdown(file_path, conversion_id, result_sender_socket, converter_type)
+            if file_key:
+                # The converters need a real file on disk — docling and PyMuPDF both
+                # take a path — so an object is staged locally for the duration of
+                # the conversion and removed after. On the pvc backend materialize
+                # yields the mounted file itself, so this costs nothing there.
+                from app import storage
+
+                store = storage.file_store()
+                if store is None:
+                    _fail_conversion(
+                        conversion_id, result_sender_socket,
+                        "storage keys unavailable in this build",
+                    )
+                    continue
+                try:
+                    with store.materialize(file_key) as local:
+                        convert_file_to_markdown(
+                            str(local), conversion_id, result_sender_socket,
+                            converter_type,
+                        )
+                except FileNotFoundError:
+                    _fail_conversion(
+                        conversion_id, result_sender_socket,
+                        f"no object at key {file_key}",
+                    )
+            else:
+                convert_file_to_markdown(
+                    file_path, conversion_id, result_sender_socket, converter_type
+                )
         elif task_type == "chunk":
             # Chunking via HTTP /chunk-async flow. Synchronous REQ/REP ingest
             # uses chunk_server.py (port 5557) instead.

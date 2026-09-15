@@ -1,6 +1,6 @@
 [project]
 name = "file-to-markdown-convertor"
-version = "1.2.9"
+version = "1.2.10"
 description = "Centralized PDF to Markdown conversion service"
 readme = "README.md"
 requires-python = ">=3.12"

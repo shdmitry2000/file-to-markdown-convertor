@@ -1,8 +1,11 @@
 # Base pinned by digest, not :latest. These images go through a scan gate, so a
 # rebuild of the same commit must produce the same CVE profile; with a floating
-# tag it silently would not. Bump this digest deliberately to pick up Red Hat
-# errata — notably the sqlite-libs fix for CVE-2026-51302, unreleased as of
-# 2026-08-19, which is the one critical these images still carry.
+# tag it silently would not. Bumped 2026-09-16 in answer to the Xray export of
+# that day: the new digest ships openssl-libs 3.5.8-1.el9_8 (RHSA-2026:67165),
+# expat 2.5.0-6.el9_8.3, coreutils-single 8.32-41.el9_8.1 and glib2
+# 2.68.4-19.el9_8.10, which between them close thirteen of the findings. What is
+# left on the RHEL side — libxml2, pcre2, curl-minimal, util-linux, libsolv —
+# Red Hat has published no fix for at any version, so no digest reaches them.
 #-*--*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*#
 #
 #                                 |
@@ -31,7 +34,7 @@
 # Hat's patch cadence. UBI is still glibc, so torch's manylinux_2_28 wheels
 # (which have no musl build and no sdist) resolve exactly as before — that is
 # why an Alpine base was never an option for this image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:ddf83888de3388bce2fc9c3d66f917bf683790d4db9f956644a3e1b9b6fd15e7 AS builder
+FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:3ad9a8b075fe314f59db0737aa6d14528aa0beecc0bd121c7dd5a798c070a91d AS builder
 
 USER 0
 WORKDIR /app
@@ -105,6 +108,26 @@ RUN uv pip uninstall --python $VENV accelerate 2>/dev/null; \
       assert u.find_spec('accelerate') is None, 'accelerate still present'; \
       print('accelerate removed; docling + transformers + onnxruntime intact')"
 
+# Drop pymupdf's command-line entry point. CVE-2026-82035 (High) is a path
+# traversal in extract_objects() in src/__main__.py: the output filename is built
+# by joining a document-controlled BaseFont name onto the output directory with
+# no stripping of separators or dot-dot, so a crafted PDF makes `pymupdf extract`
+# write anywhere the process can reach. 1.28.2 is the newest release and carries
+# it; the fix exists only as an unreleased upstream commit (b2c8f3a).
+#
+# The library itself stays — three call sites need it (converters/dbank.py,
+# converters/vlm.py, workers/worker.py) and pymupdf4llm sits on top of it. All of
+# them go through Document()/to_markdown(); none runs `python -m pymupdf`, which
+# is the only way into __main__. Removing that one file removes the vulnerable
+# code and leaves every path this service uses untouched.
+#
+# Drop this block once a pymupdf release carries b2c8f3a.
+RUN $VENV -c "import pathlib, pymupdf; \
+      pathlib.Path(pymupdf.__file__).parent.joinpath('__main__.py').unlink(missing_ok=True)" \
+ && $VENV -c "import importlib.util as u, pymupdf, pymupdf4llm; \
+      assert u.find_spec('pymupdf.__main__') is None, 'pymupdf CLI still present'; \
+      print('pymupdf CLI entry point removed; pymupdf + pymupdf4llm intact')"
+
 # Pre-download docling models (layout + table extraction, WITHOUT OCR)
 # Match runtime API (DocumentConverter + PdfFormatOption + InputFormat).
 RUN $VENV -c "\
@@ -125,7 +148,7 @@ RUN mkdir -p /export/root-cache && \
 
 # ---- Final Stage ----
 # This stage creates the final, small, production-ready image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:ddf83888de3388bce2fc9c3d66f917bf683790d4db9f956644a3e1b9b6fd15e7
+FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:3ad9a8b075fe314f59db0737aa6d14528aa0beecc0bd121c7dd5a798c070a91d
 
 USER 0
 
@@ -145,11 +168,14 @@ RUN microdnf install -y \
     libICE \
  && microdnf clean all
 
-# Security errata published AFTER this base image was built, so pinning the digest
-# alone does not pick them up: libxml2 (RHSA-2026:61247) and libattr
-# (RHSA-2026:60226). Named explicitly rather than a blanket `microdnf update` so the
-# image keeps a reviewable package set — revisit when the base digest catches up.
-RUN microdnf update -y libxml2 libattr \
+# Red Hat errata published after this base image was built. The digest pin does
+# not pick those up on its own, and that is exactly how the September Xray export
+# came to carry openssl CVE-2026-14456 (High) along with the expat, coreutils and
+# glib2 advisories — every one of them fixed by Red Hat weeks earlier, none of
+# them in the pinned layer. So this is a blanket update now, not a named list: a
+# named list only ever covers the errata somebody remembered to add to it, which
+# is a gate that fails quietly. The digest still pins what the build starts from.
+RUN microdnf update -y \
  && microdnf clean all
 
 # Copy the installed packages from the builder stage. This is the key to a small image.

@@ -39,17 +39,12 @@ FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:3ad9a8b075fe314f5
 USER 0
 WORKDIR /app
 
-# opencv's shared libraries, needed here and not only in the final stage: the
-# post-install guard below imports cv2 to prove the rapidocr removal did not
-# take it with it, and that import loads libxcb at build time.
+# Runtime libraries the post-install guards below need at build time. opencv is
+# swapped for its headless build further down, so the GL/X11 stack it used to
+# link against (mesa-libGL, libxcb, libXext, libSM, libICE) is not installed.
 RUN microdnf install -y \
     libgomp \
-    mesa-libGL \
     glib2 \
-    libxcb \
-    libXext \
-    libSM \
-    libICE \
  && microdnf clean all
 
 # Install uv, our build tool
@@ -71,15 +66,35 @@ ENV HF_HOME=/root/.cache/huggingface
 RUN mkdir -p "${HF_HOME}"
 RUN uv pip install --python $VENV --no-cache-dir .
 
+# Swap opencv-python for opencv-python-headless at the same version. The GUI
+# build links against mesa-libGL, and mesa drags libX11, llvm-libs and the
+# rust/node crates bundled in mesa-dri-drivers into the image — the 2026-09-24
+# Xray export flagged libX11 CVE-2026-88806 (High) and rustls-webpki
+# CVE-2026-93599 (High) there, with no Red Hat fix at any version. Nothing here
+# opens a window: cv2 is imported by docling-ibm-models (layout, tableformer),
+# transformers and pymupdf for array/image work only, which headless provides
+# under the same `cv2` module name.
+#
+# To restore the GUI build, delete this block and put mesa-libGL, libxcb,
+# libXext, libSM and libICE back in both microdnf installs.
+RUN CV=$($VENV -c "import importlib.metadata as m; print(m.version('opencv-python'))") \
+ && uv pip uninstall --python $VENV opencv-python \
+ && uv pip install --python $VENV --no-cache-dir "opencv-python-headless==$CV" \
+ && $VENV -c "import importlib.util as u, cv2, docling_ibm_models; \
+      assert u.find_spec('cv2') is not None; \
+      import importlib.metadata as m; \
+      names = {d.metadata['Name'].lower() for d in m.distributions()}; \
+      assert 'opencv-python' not in names, 'GUI opencv still present'; \
+      print('opencv headless', cv2.__version__)"
+
 # Drop rapidocr, the OCR engine. Nothing here calls it: no module imports it,
 # every pipeline sets do_ocr=False, and the one way in was DOCLING_DO_OCR=true,
 # which is off by default and was never viable for this corpus anyway since
 # rapidocr ships no Hebrew model. Setting it true now raises at convert time
 # rather than silently mis-reading Hebrew.
 #
-# Scope is rapidocr only. opencv-python and onnxruntime stay — onnxruntime is
-# used by the Excel path, and opencv is left alone by request even though
-# rapidocr was its main consumer here.
+# Scope is rapidocr only. opencv (now headless, see above) and onnxruntime
+# stay — onnxruntime is used by the Excel path, and docling-ibm-models imports cv2.
 #
 # To restore OCR, delete this block.
 RUN uv pip uninstall --python $VENV rapidocr rapidocr-onnxruntime 2>/dev/null; \
@@ -152,20 +167,13 @@ FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:3ad9a8b075fe314f5
 
 USER 0
 
-# Same runtime libraries as the Debian build, under their RHEL9 names: libgomp
-# is torch's OpenMP runtime, the rest are what opencv links against. RHEL9's
-# single libxcb carries the render/shape/xfixes extensions that Debian splits
-# into libxcb-render0/-shape0/-xfixes0.
+# libgomp is torch's OpenMP runtime. The GL/X11 libraries opencv used to link
+# against are gone with the switch to opencv-python-headless (see the builder).
 #
-# curl is the one thing not carried over — nothing in the image shells out to it.
+# curl is not carried over either — nothing in the image shells out to it.
 RUN microdnf install -y \
     libgomp \
-    mesa-libGL \
     glib2 \
-    libxcb \
-    libXext \
-    libSM \
-    libICE \
  && microdnf clean all
 
 # Red Hat errata published after this base image was built. The digest pin does

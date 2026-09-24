@@ -78,6 +78,18 @@ class WorkerSettings(BaseSettings):
     ZMQ_RESULT_PORT: int = 5556
     """ZeroMQ port for result queue (PUSH/PULL). Configurable via env var."""
 
+    WORKER_READY_INTERVAL_SECONDS: float = 10.0
+    """Worker side: how often an idle worker says "ready", and how often a busy
+    one sends a heartbeat for its task. The API's timeouts below are multiples."""
+
+    JOB_SILENCE_SECONDS: float = 120.0
+    """API side: an assigned task with no heartbeat or status for this long is
+    requeued once, then failed. Generous because chunking runs in-process."""
+
+    NO_WORKER_SECONDS: float = 120.0
+    """API side: with no worker seen for this long, new tasks are refused (503)
+    and queued ones fail, instead of waiting for a worker that is not coming."""
+
     ZMQ_CHUNK_PORT: int = 5557
     """ZeroMQ port for the chunking ROUTER service (REQ/REP). External
     clients (e.g. v2's DoclingHybridChunker plugin) open a REQ socket and

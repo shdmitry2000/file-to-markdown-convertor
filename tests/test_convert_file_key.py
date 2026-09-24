@@ -18,17 +18,9 @@ from fastapi.testclient import TestClient
 @pytest.fixture(autouse=True)
 def mock_zmq(monkeypatch):
     """The queue is not what these tests are about; /convert only has to reach it."""
-    class MockSocket:
-        def bind(self, address): pass
-        def send_string(self, data): self.sent = data
-        def recv_json(self): return {"conversion_id": "test-id", "status": "completed"}
-        def close(self): pass
+    from tests.zmq_fakes import FakeContext
 
-    class MockContext:
-        def socket(self, socket_type): return MockSocket()
-        def term(self): pass
-
-    monkeypatch.setattr("zmq.Context", lambda: MockContext())
+    monkeypatch.setattr("zmq.Context", FakeContext)
 
 
 @pytest.fixture

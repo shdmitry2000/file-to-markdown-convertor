@@ -11,6 +11,7 @@ cancelled batch of 300 files has almost all of them still in the queue.
 """
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -30,17 +31,9 @@ def _mock_zmq(monkeypatch):
     """`app.api.main` binds its ZeroMQ sockets at IMPORT time, so importing it here
     would bind the ports a running service already holds — and hang. Same approach
     as tests/test_markdown_api.py."""
-    class MockSocket:
-        def bind(self, address): pass
-        def send_string(self, data): pass
-        def recv_json(self): return {}
-        def close(self): pass
+    from tests.zmq_fakes import FakeContext
 
-    class MockContext:
-        def socket(self, socket_type): return MockSocket()
-        def term(self): pass
-
-    monkeypatch.setattr("zmq.Context", lambda: MockContext())
+    monkeypatch.setattr("zmq.Context", FakeContext)
 
 
 # ------------------------------------------------------------------ the marker
@@ -116,19 +109,27 @@ def _run_worker_on(tasks: list[dict], monkeypatch) -> tuple[list[str], list[dict
     reported: list[dict] = []
 
     class _TaskSocket:
+        def setsockopt(self, option, value): pass
         def connect(self, addr): pass
+        def send_string(self, data): pass  # "ready"
+        def poll(self, timeout=None):
+            if not remaining:
+                raise _StopTheLoop()
+            return 1
         def recv_string(self):
             if not remaining:
                 raise _StopTheLoop()
             return json.dumps(remaining.pop(0))
 
     class _ResultSocket:
+        def setsockopt(self, option, value): pass
         def connect(self, addr): pass
-        def send_json(self, payload): reported.append(payload)
+        def send_json(self, payload, flags=0): reported.append(payload)
+        def close(self, linger=None): pass
 
     class _Context:
         def socket(self, socket_type):
-            return _TaskSocket() if socket_type == zmq.PULL else _ResultSocket()
+            return _TaskSocket() if socket_type == zmq.DEALER else _ResultSocket()
 
     monkeypatch.setattr(worker.zmq, "Context", lambda: _Context())
 
@@ -200,6 +201,9 @@ def test_the_result_listener_treats_cancelled_as_terminal(monkeypatch):
         def __init__(self):
             self.sent = False
 
+        def poll(self, timeout=None):
+            return 1
+
         def recv_json(self):
             if self.sent:
                 raise zmq.ZMQError(zmq.ETERM)
@@ -207,7 +211,7 @@ def test_the_result_listener_treats_cancelled_as_terminal(monkeypatch):
             return {"conversion_id": "job-3", "status": "cancelled"}
 
     monkeypatch.setattr(main, "result_socket", _OneResultThenShutdown())
-    main.result_listener()
+    main.result_listener(threading.Event())
 
     assert "job-3" not in main.active_conversions_db, "still shown as running"
     assert ("/tmp/a.pdf", "docling") not in main.inflight_conversions, (

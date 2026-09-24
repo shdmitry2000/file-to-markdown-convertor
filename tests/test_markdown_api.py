@@ -12,27 +12,9 @@ import shutil
 @pytest.fixture(autouse=True)
 def mock_zmq(monkeypatch):
     """Mock ZMQ context and sockets for testing."""
-    class MockSocket:
-        def bind(self, address):
-            pass
-        
-        def send_string(self, data):
-            pass
-        
-        def recv_json(self):
-            return {"conversion_id": "test-id", "status": "completed"}
-        
-        def close(self):
-            pass
-    
-    class MockContext:
-        def socket(self, socket_type):
-            return MockSocket()
-        
-        def term(self):
-            pass
-    
-    monkeypatch.setattr("zmq.Context", lambda: MockContext())
+    from tests.zmq_fakes import FakeContext
+
+    monkeypatch.setattr("zmq.Context", FakeContext)
 
 
 @pytest.fixture
@@ -48,7 +30,10 @@ def client():
     """Create test client."""
     # Import here to avoid ZMQ binding on module load
     from app.api.main import app
-    return TestClient(app)
+    # Entered, so the lifespan starts the listener and dispatcher threads — /health
+    # reports 503 without them, as it should for a real pod.
+    with TestClient(app) as c:
+        yield c
 
 
 def test_health_endpoint(client):

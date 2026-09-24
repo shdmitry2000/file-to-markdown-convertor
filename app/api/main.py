@@ -7,7 +7,7 @@ import os
 import json
 import time
 import asyncio
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 import threading
 import logging
 from pathlib import Path
@@ -27,6 +27,8 @@ from app.cancellation import sweep as sweep_cancel_markers
 from app.config import get_settings
 from app.format_routes import converter_for
 from app.registry import registry
+from app.dispatch import Dispatcher, task_id
+from app.zmq_keepalive import apply_keepalive
 
 # Import all converters so their @register_converter decorators run
 import app.converters.pymupdf      # noqa: F401
@@ -59,10 +61,16 @@ def _cancel_marker_sweeper():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages application lifespan events for startup and shutdown."""
-    # Startup logic
+    # Startup logic. /health reports these threads, so one that dies is a pod
+    # restart instead of a service that accepts work and never finishes it.
+    global _listener_thread, _dispatcher_thread
+    stop = threading.Event()
     logger.info("Starting result listener background thread.")
-    thread = threading.Thread(target=result_listener, daemon=True)
-    thread.start()
+    _listener_thread = threading.Thread(target=result_listener, args=(stop,), daemon=True)
+    _listener_thread.start()
+    logger.info("Starting dispatcher background thread.")
+    _dispatcher_thread = threading.Thread(target=dispatcher.run, args=(stop,), daemon=True)
+    _dispatcher_thread.start()
 
     # Markers are cleared when a conversion reaches a terminal status, so this is
     # only for the ones that never do — a cancel whose job was never dispatched,
@@ -75,9 +83,16 @@ async def lifespan(app: FastAPI):
 
     # Shutdown logic
     logger.info("Shutting down: closing ZeroMQ sockets and context.")
+    stop.set()
+    _listener_thread.join(timeout=2)
+    _dispatcher_thread.join(timeout=2)
     task_socket.close()
     result_socket.close()
     context.term()
+
+
+_listener_thread: Optional[threading.Thread] = None
+_dispatcher_thread: Optional[threading.Thread] = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -118,89 +133,164 @@ chunk_results_db: Dict[str, Dict] = {}  # Stores chunk results
 # ZeroMQ setup
 context = zmq.Context()
 
-# Socket to send tasks to workers (load ports from settings)
-task_socket = context.socket(zmq.PUSH)
+# Tasks go to workers that ask for them: each worker's DEALER says "ready" and the
+# dispatcher's ROUTER hands it exactly one task — see app/dispatch.py for why a
+# blind PUSH could leave an ingest "pending" for an hour. LINGER 0: on shutdown,
+# undelivered tasks are dropped rather than holding the pod open until SIGKILL.
+task_socket = apply_keepalive(context.socket(zmq.ROUTER))
+task_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+task_socket.setsockopt(zmq.LINGER, 0)
 task_socket.bind(f"tcp://*:{settings.ZMQ_TASK_PORT}")
 logger.info(f"Task socket bound to port {settings.ZMQ_TASK_PORT}")
 
+
+def _fail_task(task: dict, error: str) -> None:
+    """The dispatcher gave up on *task*: report it exactly as a worker failure."""
+    # retryable: the service lost the task, the document did nothing wrong. The
+    # caller must not dead-letter the file for it.
+    if task.get("type") == "chunk":
+        _apply_result({"type": "chunk", "chunk_id": task.get("chunk_id"),
+                       "status": "failed", "error": error, "retryable": True})
+    else:
+        _apply_result({"conversion_id": task.get("conversion_id"),
+                       "status": "failed", "error": error, "retryable": True})
+
+
+dispatcher = Dispatcher(
+    task_socket,
+    on_fail=_fail_task,
+    job_silence_s=settings.JOB_SILENCE_SECONDS,
+    no_worker_s=settings.NO_WORKER_SECONDS,
+)
+
+
+class WorkerUnavailable(Exception):
+    """No worker has been seen for NO_WORKER_SECONDS."""
+
+
+def enqueue_task(task: dict) -> None:
+    """Queue *task* for the next free worker. Never blocks.
+
+    Refused up front when no worker has asked for work in NO_WORKER_SECONDS: the
+    caller gets a 503 it can retry now, rather than a task that would only be
+    failed by the watchdog later.
+    """
+    if not dispatcher.has_live_worker():
+        raise WorkerUnavailable()
+    dispatcher.submit(task)
+
+
+def _no_worker_error() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail=(
+            "no conversion worker connected for "
+            f"{settings.NO_WORKER_SECONDS:g}s; retry later"
+        ),
+    )
+
 # Socket to receive results from workers
-result_socket = context.socket(zmq.PULL)
+result_socket = apply_keepalive(context.socket(zmq.PULL))
+result_socket.setsockopt(zmq.LINGER, 0)
 result_socket.bind(f"tcp://*:{settings.ZMQ_RESULT_PORT}")
 logger.info(f"Result socket bound to port {settings.ZMQ_RESULT_PORT}")
 
 
-def result_listener():
-    """Listens for results from workers and updates the status database."""
+def _apply_result(result: dict) -> None:
+    """Record one message from a worker — or a failure the dispatcher decided on —
+    in the job tables."""
     global last_completion_timestamp
+    result_type = result.get("type")
+
+    if result_type == "heartbeat":
+        job_id = result.get("job_id")
+        if isinstance(job_id, str):
+            dispatcher.note_progress(job_id)
+        return
+
+    if result_type == "chunk":
+        # Handle chunking results
+        chunk_id = result.get("chunk_id")
+        status = result.get("status")
+        if isinstance(chunk_id, str) and isinstance(status, str):
+            logger.info(f"Received chunk status update for {chunk_id}: {status}")
+            chunk_status_db[chunk_id] = status
+            chunk_results_db[chunk_id] = result
+            dispatcher.note_progress(chunk_id)
+
+            if status in ["completed", "success", "failed", "error"]:
+                last_completion_timestamp = time.time()
+                dispatcher.note_done(chunk_id)
+        return
+
+    # Handle conversion results (existing logic)
+    conversion_id = result.get("conversion_id")
+    status = result.get("status")
+    if isinstance(conversion_id, str) and isinstance(status, str):
+        logger.info(f"Received status update for {conversion_id}: {status}")
+        conversion_status_db[conversion_id] = status
+        conversion_details_db[conversion_id] = result
+        dispatcher.note_progress(conversion_id)
+
+        # Promote pending -> active so /health reflects real work.
+        # Without this the counters only ever moved for /debug/convert,
+        # which is why /health reported active:0 while a job was wedged.
+        if status == "processing":
+            meta = pending_conversions_db.pop(conversion_id, {})
+            active_conversions_db[conversion_id] = {
+                **meta, "started_at": time.time(),
+            }
+
+        # Update last completion timestamp if conversion finished.
+        # `cancelled` belongs here: a worker that declines a job it
+        # was told to skip is DONE with it. Without this the entry
+        # stayed in active_conversions_db forever, so /debug/queue
+        # reported a conversion nobody was running — and an empty
+        # queue after a cancel could not be told from a busy one.
+        if status in ["completed", "success", "failed", "error", "cancelled"]:
+            last_completion_timestamp = time.time()
+            dispatcher.note_done(conversion_id)
+
+            # The job is over, so the marker has nothing left to
+            # stop; leaving it behind would accumulate on a shared
+            # volume with no one to clean it up.
+            clear_cancel(conversion_id)
+
+            # Move from active to completed
+            if conversion_id in active_conversions_db:
+                del active_conversions_db[conversion_id]
+            if conversion_id in pending_conversions_db:
+                del pending_conversions_db[conversion_id]
+            conversion_waiters.pop(conversion_id, None)
+            # Finished, so it can no longer be shared by a new caller.
+            for key, cid in list(inflight_conversions.items()):
+                if cid == conversion_id:
+                    del inflight_conversions[key]
+
+
+def result_listener(stop: threading.Event):
+    """Listens for results from workers and updates the status database.
+
+    Only shutdown ends this loop. It used to `break` on any other ZeroMQ error,
+    and the API went on accepting conversions whose results nobody would ever
+    read — each one "pending" until the caller's hour-long timeout.
+    """
     logger.info("Result listener thread started")
-    while True:
+    while not stop.is_set():
         try:
+            if not result_socket.poll(500):
+                continue
             result = result_socket.recv_json()
             if isinstance(result, dict):
-                result_type = result.get("type")
-                
-                if result_type == "chunk":
-                    # Handle chunking results
-                    chunk_id = result.get("chunk_id")
-                    status = result.get("status")
-                    if isinstance(chunk_id, str) and isinstance(status, str):
-                        logger.info(f"Received chunk status update for {chunk_id}: {status}")
-                        chunk_status_db[chunk_id] = status
-                        chunk_results_db[chunk_id] = result
-                        
-                        if status in ["completed", "success", "failed", "error"]:
-                            last_completion_timestamp = time.time()
-                else:
-                    # Handle conversion results (existing logic)
-                    conversion_id = result.get("conversion_id")
-                    status = result.get("status")
-                    if isinstance(conversion_id, str) and isinstance(status, str):
-                        logger.info(f"Received status update for {conversion_id}: {status}")
-                        conversion_status_db[conversion_id] = status
-                        conversion_details_db[conversion_id] = result
-
-                        # Promote pending -> active so /health reflects real work.
-                        # Without this the counters only ever moved for /debug/convert,
-                        # which is why /health reported active:0 while a job was wedged.
-                        if status == "processing":
-                            meta = pending_conversions_db.pop(conversion_id, {})
-                            active_conversions_db[conversion_id] = {
-                                **meta, "started_at": time.time(),
-                            }
-
-                        # Update last completion timestamp if conversion finished.
-                        # `cancelled` belongs here: a worker that declines a job it
-                        # was told to skip is DONE with it. Without this the entry
-                        # stayed in active_conversions_db forever, so /debug/queue
-                        # reported a conversion nobody was running — and an empty
-                        # queue after a cancel could not be told from a busy one.
-                        if status in ["completed", "success", "failed", "error", "cancelled"]:
-                            last_completion_timestamp = time.time()
-
-                            # The job is over, so the marker has nothing left to
-                            # stop; leaving it behind would accumulate on a shared
-                            # volume with no one to clean it up.
-                            clear_cancel(conversion_id)
-
-                            # Move from active to completed
-                            if conversion_id in active_conversions_db:
-                                del active_conversions_db[conversion_id]
-                            if conversion_id in pending_conversions_db:
-                                del pending_conversions_db[conversion_id]
-                            conversion_waiters.pop(conversion_id, None)
-                            # Finished, so it can no longer be shared by a new caller.
-                            for key, cid in list(inflight_conversions.items()):
-                                if cid == conversion_id:
-                                    del inflight_conversions[key]
+                _apply_result(result)
             else:
                 logger.warning(f"Received non-dict message: {result}")
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
                 logger.info("Context terminated, result listener shutting down.")
-                break  # Exit loop if context is terminated
-            else:
-                logger.error(f"ZeroMQ error in result listener: {e}", exc_info=True)
                 break
+            logger.error(f"ZeroMQ error in result listener: {e}", exc_info=True)
+            stop.wait(1.0)
         except Exception as e:
             logger.error(
                 f"An unexpected error occurred in result listener: {e}", exc_info=True
@@ -289,7 +379,18 @@ async def convert_file(request: ConversionRequest):
     }
 
     logger.info(f"Sending task {conversion_id} to the ZeroMQ queue with converter {request.converter_type}.")
-    task_socket.send_string(json.dumps(task))
+    try:
+        enqueue_task(task)
+    except WorkerUnavailable:
+        # Undo the bookkeeping, or the next request for this file would
+        # "reuse" a conversion that was never queued and poll it forever.
+        conversion_status_db.pop(conversion_id, None)
+        if inflight_conversions.get(inflight_key) == conversion_id:
+            del inflight_conversions[inflight_key]
+        conversion_waiters.pop(conversion_id, None)
+        pending_conversions_db.pop(conversion_id, None)
+        logger.error(f"No worker took conversion {conversion_id}; refusing with 503")
+        raise _no_worker_error()
 
     return {"conversion_id": conversion_id}
 
@@ -301,10 +402,17 @@ async def get_status(conversion_id: str):
     if status is None:
         logger.warning(f"Conversion ID not found: {conversion_id}")
         raise HTTPException(status_code=404, detail="Conversion ID not found")
-    response: Dict[str, str] = {"status": status}
+    response: Dict[str, Any] = {"status": status}
     details = conversion_details_db.get(conversion_id)
     if isinstance(details, dict) and details.get("error"):
         response["error"] = details["error"]
+    if isinstance(details, dict) and details.get("retryable"):
+        response["retryable"] = True
+    # Where it is while unfinished: queued (and at what position) or assigned
+    # (to whom, and how long since it last showed progress).
+    where = dispatcher.state(conversion_id)
+    if where:
+        response.update(where)
     return response
 
 
@@ -412,7 +520,10 @@ async def debug_convert_file(
     }
     logger.info(f"Debug conversion {conversion_id} routed to converter {selected_converter}")
 
-    task_socket.send_string(json.dumps(task))
+    try:
+        enqueue_task(task)
+    except WorkerUnavailable:
+        raise _no_worker_error()
     conversion_status_db[conversion_id] = "pending"
     conversion_details_db[conversion_id] = {
         "filename": file.filename,
@@ -765,7 +876,10 @@ async def submit_chunk_task(request: ChunkAsyncRequest):
         "params": request.params
     }
     
-    task_socket.send_string(json.dumps(task))
+    try:
+        enqueue_task(task)
+    except WorkerUnavailable:
+        raise _no_worker_error()
     chunk_status_db[request.chunk_id] = "pending"
     
     logger.info(f"Submitted chunk task {request.chunk_id} for {request.file_path}")
@@ -822,7 +936,7 @@ async def get_chunk_status(chunk_id: str):
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(response: Response):
     """Health check endpoint for monitoring with diagnostic information."""
     # Check if paths are accessible
     projects_base = settings.PROJECTS_BASE_PATH or "not set"
@@ -831,9 +945,18 @@ async def health_check():
     
     # Calculate last activity
     seconds_since_last = int(time.time() - last_completion_timestamp)
-    
+
+    # A dead listener or dispatcher means work is accepted and never finished;
+    # 503 makes the liveness probe restart the pod instead of leaving it so.
+    threads_alive = all(t is not None and t.is_alive()
+                        for t in (_listener_thread, _dispatcher_thread))
+    if not threads_alive:
+        response.status_code = 503
+
     return {
-        "status": "healthy",
+        "status": "healthy" if threads_alive else "unhealthy",
+        "threads_alive": threads_alive,
+        "dispatch": dispatcher.snapshot(),
         "service": "markdown-api",
         "environment": settings.ENVIRONMENT,
         "configuration": {

@@ -1,4 +1,5 @@
 import zmq
+import socket
 import json
 import os
 import time
@@ -15,6 +16,7 @@ import uuid
 # Import configuration
 from app.cancellation import ConversionCancelled, is_cancelled
 from app.config import get_converted_files_dir, get_settings
+from app.zmq_keepalive import apply_keepalive
 
 # Import chunkers to trigger @register_chunker decorators
 import app.chunkers  # noqa: F401
@@ -1121,10 +1123,14 @@ def main():
     logger.info(f"Task port: {settings.ZMQ_TASK_PORT}, Result port: {settings.ZMQ_RESULT_PORT}")
 
     context = zmq.Context()
-    task_receiver_socket = context.socket(zmq.PULL)
+    # DEALER: this worker asks for tasks one at a time (see app/dispatch.py).
+    task_receiver_socket = apply_keepalive(context.socket(zmq.DEALER))
+    task_receiver_socket.setsockopt(zmq.LINGER, 0)
     task_receiver_socket.connect(f"tcp://{host}:{settings.ZMQ_TASK_PORT}")
-    result_sender_socket = context.socket(zmq.PUSH)
-    result_sender_socket.connect(f"tcp://{host}:{settings.ZMQ_RESULT_PORT}")
+    result_address = f"tcp://{host}:{settings.ZMQ_RESULT_PORT}"
+    result_sender_socket = apply_keepalive(context.socket(zmq.PUSH))
+    result_sender_socket.connect(result_address)
+    worker_id = f"{socket.gethostname()}-{os.getpid()}"
 
     # Pre-warm the docling models at startup so the FIRST real conversion is
     # already fast (otherwise the first request pays the one-time ~12s load).
@@ -1134,9 +1140,68 @@ def main():
         except Exception as e:
             logger.warning("Docling pre-warm failed (will warm lazily on first job): %s", e)
 
+    heartbeat: list = [None]
+    try:
+        _serve(context, task_receiver_socket, result_sender_socket,
+               result_address, worker_id, heartbeat)
+    finally:
+        if heartbeat[0] is not None:
+            heartbeat[0].stop()
+
+
+def _next_task(task_receiver_socket, worker_id: str, finished):
+    """Say "ready" and wait for one task.
+
+    Repeated every WORKER_READY_INTERVAL_SECONDS while idle, so the API knows an
+    idle worker is alive — and learns about it again after either side restarts.
+    ``finished`` names the task just completed, which is what frees this worker
+    in the dispatcher.
+    """
+    ready = json.dumps({"type": "ready", "worker_id": worker_id, "finished": finished})
     while True:
-        message = task_receiver_socket.recv_string()
-        task = json.loads(message)
+        task_receiver_socket.send_string(ready)
+        if task_receiver_socket.poll(int(settings.WORKER_READY_INTERVAL_SECONDS * 1000)):
+            return json.loads(task_receiver_socket.recv_string())
+
+
+class _Heartbeat(threading.Thread):
+    """Tells the API every WORKER_READY_INTERVAL_SECONDS that *job_id* is still
+    being worked on. Silence past JOB_SILENCE_SECONDS is how the API learns this
+    worker died mid-task. Its own socket: ZeroMQ sockets are not thread-safe."""
+
+    def __init__(self, context, address: str, worker_id: str, job_id):
+        super().__init__(daemon=True)
+        self._context, self._address = context, address
+        self._beat = {"type": "heartbeat", "worker_id": worker_id, "job_id": job_id}
+        self._stopped = threading.Event()
+
+    def run(self):
+        sock = apply_keepalive(self._context.socket(zmq.PUSH))
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(self._address)
+        try:
+            while not self._stopped.wait(settings.WORKER_READY_INTERVAL_SECONDS):
+                try:
+                    sock.send_json(self._beat, zmq.NOBLOCK)
+                except zmq.Again:
+                    pass  # link down; the API's watchdog is what reports that
+        finally:
+            sock.close()
+
+    def stop(self):
+        self._stopped.set()
+
+
+def _serve(context, task_receiver_socket, result_sender_socket, result_address,
+           worker_id, heartbeat):
+    finished = None
+    while True:
+        if heartbeat[0] is not None:
+            heartbeat[0].stop()
+        task = _next_task(task_receiver_socket, worker_id, finished)
+        finished = task.get("chunk_id") or task.get("conversion_id")
+        heartbeat[0] = _Heartbeat(context, result_address, worker_id, finished)
+        heartbeat[0].start()
         task_type = task.get("type", "convert")  # Default: convert
         
         if task_type == "convert":

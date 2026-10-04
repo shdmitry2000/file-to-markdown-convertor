@@ -51,7 +51,9 @@ constraint-dependencies = [
     "pygments>=2.20.0",
     "torch>=2.13.0",
     "transformers>=5.3.0",
-    "litellm>=1.96.2",
+    "litellm>=1.104.0",
+    "fsspec>=2026.6.0",
+    "multidict>=6.9.1",
 ]
 index-url = "https://pypi.org/simple"
 index-strategy = "unsafe-best-match"

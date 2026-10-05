@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Import configuration and registry
 from app.cancellation import clear_cancel, request_cancel
 from app.cancellation import sweep as sweep_cancel_markers
-from app.config import get_settings
+from app.config import get_converted_files_dir, get_settings
 from app.format_routes import converter_for
 from app.registry import registry
 from app.dispatch import Dispatcher, task_id
@@ -503,7 +503,9 @@ async def debug_convert_file(
     selected_converter = (converter_type or "").strip() or converter_for(file.filename)
     
     # Save uploaded file temporarily
-    temp_path = Path(settings.CONVERTED_FILES_DIR) / f"debug_{file.filename}"
+    # get_converted_files_dir() creates the directory: on a fresh PVC (OCP) nothing
+    # else has yet, and only the worker used to, so this upload raised FileNotFoundError.
+    temp_path = get_converted_files_dir() / f"debug_{file.filename}"
     with open(temp_path, "wb") as f:
         content = await file.read()
         f.write(content)

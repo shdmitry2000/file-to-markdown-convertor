@@ -240,3 +240,22 @@ def test_capabilities_endpoint(client):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_debug_convert_creates_a_missing_converted_dir(client, tmp_path, monkeypatch):
+    """A fresh volume (OCP PVC) has no .cache/converted_files yet; only the worker used
+    to create it, so /debug/convert raised FileNotFoundError writing the upload."""
+    import app.api.main as main
+
+    missing = tmp_path / "pvc" / ".cache" / "converted_files"
+    monkeypatch.setattr(main.settings, "CONVERTED_FILES_DIR", str(missing))
+    # Other tests clear the get_settings cache; pin the accessor to the object patched above.
+    monkeypatch.setattr("app.config.get_settings", lambda: main.settings)
+
+    def no_worker(task):  # stop right after the upload is written
+        raise main.WorkerUnavailable()
+
+    monkeypatch.setattr(main, "enqueue_task", no_worker)
+    r = client.post("/debug/convert", files={"file": ("doc.pdf", b"%PDF-1.4 test", "application/pdf")})
+    assert r.status_code != 500
+    assert (missing / "debug_doc.pdf").read_bytes() == b"%PDF-1.4 test"

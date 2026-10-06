@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from app import storage
+from app import embedded_workers, storage
 
 # Configure logging
 logging.basicConfig(
@@ -79,9 +79,19 @@ async def lifespan(app: FastAPI):
     logger.info("Starting cancel-marker sweeper background thread.")
     threading.Thread(target=_cancel_marker_sweeper, daemon=True).start()
 
+    # Started after the sockets above are bound, so the workers connect at once.
+    global _embedded_workers
+    count = embedded_workers.configured_count()
+    if count:
+        _embedded_workers = embedded_workers.EmbeddedWorkers(count)
+        _embedded_workers.start()
+
     yield
 
     # Shutdown logic
+    if _embedded_workers is not None:
+        logger.info("Stopping embedded conversion workers.")
+        _embedded_workers.stop()
     logger.info("Shutting down: closing ZeroMQ sockets and context.")
     stop.set()
     _listener_thread.join(timeout=2)
@@ -93,6 +103,7 @@ async def lifespan(app: FastAPI):
 
 _listener_thread: Optional[threading.Thread] = None
 _dispatcher_thread: Optional[threading.Thread] = None
+_embedded_workers: Optional[embedded_workers.EmbeddedWorkers] = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -959,6 +970,7 @@ async def health_check(response: Response):
         "status": "healthy" if threads_alive else "unhealthy",
         "threads_alive": threads_alive,
         "dispatch": dispatcher.snapshot(),
+        "embedded_workers": _embedded_workers.snapshot() if _embedded_workers else None,
         "service": "markdown-api",
         "environment": settings.ENVIRONMENT,
         "configuration": {

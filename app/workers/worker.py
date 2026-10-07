@@ -40,8 +40,85 @@ def _read_do_table_structure() -> bool:
 
 
 def _read_timeout_seconds() -> int:
-    """Conversion hard timeout in seconds. Default 2h."""
+    """Hard ceiling on one conversion, in seconds. Default 2h; 0 = none.
+
+    Two guards, because CPU activity proves a conversion is busy, not that it is
+    progressing: a STALL (no CPU for DOCLING_STALL_SECONDS, see _ProgressWatch) ends a
+    stuck one early, and this ceiling ends one that keeps burning CPU without ever
+    finishing. Time spent queued behind other documents does not count — the clock
+    starts when this worker takes the job.
+    """
     return int(os.getenv("DOCLING_TIMEOUT_SECONDS", "7200"))
+
+
+class _ProgressWatch:
+    """Decides, every poll, whether a running conversion should be cut.
+
+    For docling the signal is its own page handoffs (``progress``, counted inside
+    the conversion process by _install_page_progress): pages moving between
+    pipeline stages is real progress. Other converters have no such hook, so the
+    signal there is the process's CPU time (with its children). ``stalled`` means no CPU for
+    DOCLING_STALL_SECONDS (default 600 — longer than an LLM request timeout, so a VLM
+    conversion waiting on a slow answer is not mistaken for a stuck one).
+    ``timeout`` at the DOCLING_TIMEOUT_SECONDS ceiling (default 2h), busy or not.
+    """
+
+    def __init__(self, pid, timeout_seconds: int, progress=None):
+        self._deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
+        self.stall_seconds = float(os.getenv("DOCLING_STALL_SECONDS", "600"))
+        # docling's own page-handoff counter (see _install_page_progress) when the
+        # converter has one: pages moving is progress; CPU alone is only "busy".
+        self._progress = progress
+        self._seen = progress.value if progress is not None else None
+        try:
+            import psutil
+
+            self._proc = psutil.Process(pid) if pid else None
+        except Exception:  # noqa: BLE001 — without psutil, only the ceiling applies
+            self._proc = None
+        self._cpu = self._cpu_now()
+        self._last_progress = time.monotonic()
+
+    def _cpu_now(self):
+        if self._proc is None:
+            return None
+        try:
+            procs = [self._proc, *self._proc.children(recursive=True)]
+            total = 0.0
+            for p in procs:
+                try:
+                    t = p.cpu_times()
+                    total += t.user + t.system
+                except Exception:  # noqa: BLE001 — a child that just exited
+                    pass
+            return total
+        except Exception:  # noqa: BLE001 — the process itself is gone
+            return None
+
+    def slice(self) -> float:
+        """How long the next blocking wait may last."""
+        if self._deadline is None:
+            return 2.0
+        return max(0.0, min(2.0, self._deadline - time.monotonic()))
+
+    def check(self):
+        """None while the conversion may continue, else 'timeout' or 'stalled'."""
+        now = time.monotonic()
+        if self._deadline is not None and now >= self._deadline:
+            return "timeout"
+        if self._progress is not None:
+            seen = self._progress.value
+            if seen != self._seen:
+                self._seen, self._last_progress = seen, now
+            elif self.stall_seconds > 0 and now - self._last_progress >= self.stall_seconds:
+                return "stalled"
+            return None
+        cpu = self._cpu_now()
+        if cpu is not None and (self._cpu is None or cpu > self._cpu + 0.05):
+            self._cpu, self._last_progress = cpu, now
+        elif self.stall_seconds > 0 and now - self._last_progress >= self.stall_seconds:
+            return "stalled"
+        return None
 
 # Configure logging
 logging.basicConfig(
@@ -320,10 +397,48 @@ def _prewarm_convert(convert_fn, label: str) -> None:
         logger.warning("%s pre-warm convert failed; models load on first job: %s", label, e)
 
 
-def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool) -> None:
+def _install_page_progress(stage_events, pages_done) -> None:
+    """Count docling's page handoffs from inside the conversion process.
+
+    docling's convert() has no progress callback, but its PDF pipeline moves every
+    page through a chain of threaded stages (preprocess → layout → ocr →
+    layout_postprocess → table → assemble), and each handoff goes through
+    ThreadedPipelineStage._emit. Counting there is docling telling us, page by page,
+    that work is moving: ``stage_events`` is the stall signal (any stage moving any
+    page), ``pages_done`` counts pages through the final 'assemble' stage, for the UI.
+    Best-effort: if this docling version is laid out differently, nothing is counted
+    and the watch falls back to CPU activity.
+    """
+    try:
+        from docling.pipeline import standard_pdf_pipeline as spp
+
+        original = spp.ThreadedPipelineStage._emit
+        if getattr(original, "_ragp_counted", False):
+            return
+
+        def _emit(self, items):
+            items = list(items)
+            if items:
+                with stage_events.get_lock():
+                    stage_events.value += len(items)
+                if getattr(self, "name", "") == "assemble":
+                    with pages_done.get_lock():
+                        pages_done.value += len(items)
+            return original(self, items)
+
+        _emit._ragp_counted = True
+        spp.ThreadedPipelineStage._emit = _emit
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("docling page-progress hook not installed (%s); stall watch uses CPU", exc)
+
+
+def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
+                       stage_events=None, pages_done=None) -> None:
     """Persistent docling worker target: build the converter ONCE, then serve
     file paths from `in_q`, putting result tuples on `out_q`. `None` = shutdown."""
     import traceback
+    if stage_events is not None and pages_done is not None:
+        _install_page_progress(stage_events, pages_done)
     try:
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -374,7 +489,8 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool) -> N
             out_q.put(("error", str(e), traceback.format_exc()))
 
 
-def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = None):
+def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = None,
+                       progress=None):
     """Wait for a warm worker's result, polling liveness like the cold path does.
 
     A bare ``out_q.get(timeout=...)`` cannot tell "still working" from "child is
@@ -390,19 +506,19 @@ def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = N
     a stage stuck in a blocking call is simply abandoned.
 
     Returns ``(item, reason)`` where reason is None (got a result), 'timeout',
-    'died', or 'cancelled'."""
-    deadline = time.monotonic() + timeout_seconds
+    'stalled', 'died', or 'cancelled'."""
+    watch = _ProgressWatch(getattr(proc, "pid", None), timeout_seconds, progress=progress)
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None, "timeout"
         try:
-            return out_q.get(timeout=min(2.0, remaining)), None
+            return out_q.get(timeout=watch.slice()), None
         except queue_module.Empty:
             if proc is None or not proc.is_alive():
                 return None, "died"
             if conversion_id and is_cancelled(conversion_id):
                 return None, "cancelled"
+            cut = watch.check()
+            if cut:
+                return None, cut
 
 
 class _WarmDoclingWorker:
@@ -412,6 +528,8 @@ class _WarmDoclingWorker:
 
     def __init__(self) -> None:
         self._ctx = multiprocessing.get_context("spawn")
+        # docling page-handoff counters, created per child in _start (None until then).
+        self.stage_events = self.pages_done = None
         self._proc = None
         self._in = None
         self._out = None
@@ -431,9 +549,12 @@ class _WarmDoclingWorker:
     def _start(self, do_ocr: bool, do_table_structure: bool) -> None:
         self._in = self._ctx.Queue()
         self._out = self._ctx.Queue()
+        self.stage_events = self._ctx.Value("q", 0)
+        self.pages_done = self._ctx.Value("q", 0)
         self._proc = self._ctx.Process(
             target=_warm_docling_loop,
-            args=(self._in, self._out, do_ocr, do_table_structure),
+            args=(self._in, self._out, do_ocr, do_table_structure,
+                  self.stage_events, self.pages_done),
             daemon=True,
         )
         self._proc.start()
@@ -467,9 +588,13 @@ class _WarmDoclingWorker:
                 do_table_structure: bool, timeout_seconds: int) -> dict:
         with self._lock:
             self._ensure(do_ocr, do_table_structure)
+            if self.pages_done is not None:
+                with self.pages_done.get_lock():
+                    self.pages_done.value = 0      # per job, for the heartbeat
             self._in.put(file_path)
             item, reason = _await_warm_result(
-                self._out, self._proc, timeout_seconds, conversion_id)
+                self._out, self._proc, timeout_seconds, conversion_id,
+                progress=self.stage_events)
             if reason == "cancelled":
                 # Killing the child is the only way to stop docling, and it is the
                 # whole point: the slot goes back to the pool now instead of at the
@@ -480,6 +605,14 @@ class _WarmDoclingWorker:
                             conversion_id)
                 self._kill()
                 raise ConversionCancelled(f"conversion {conversion_id} was cancelled")
+            if reason == "stalled":
+                logger.warning("[%s] Conversion stalled: no CPU activity for %ss; "
+                               "restarting worker", conversion_id,
+                               int(float(os.getenv("DOCLING_STALL_SECONDS", "600"))))
+                self._kill()
+                raise TimeoutError(
+                    "Conversion stalled: no progress (no CPU activity) for "
+                    f"{int(float(os.getenv('DOCLING_STALL_SECONDS', '600')))}s and was terminated")
             if reason == "timeout":
                 # Hung conversion: kill the warm worker so it can't wedge the
                 # daemon; the next job respawns it.
@@ -610,6 +743,14 @@ class _WarmDbankWorker:
                             conversion_id)
                 self._kill()
                 raise ConversionCancelled(f"conversion {conversion_id} was cancelled")
+            if reason == "stalled":
+                logger.warning("[%s] Conversion stalled: no CPU activity for %ss; "
+                               "restarting worker", conversion_id,
+                               int(float(os.getenv("DOCLING_STALL_SECONDS", "600"))))
+                self._kill()
+                raise TimeoutError(
+                    "Conversion stalled: no progress (no CPU activity) for "
+                    f"{int(float(os.getenv('DOCLING_STALL_SECONDS', '600')))}s and was terminated")
             if reason == "timeout":
                 logger.warning(
                     "[%s] Warm dbank conversion timeout (%ss); restarting worker",
@@ -691,14 +832,12 @@ def _run_converter_with_timeout(
     process.start()
 
     # Drain the queue first; poll so we can also notice early subprocess death.
-    deadline = time.monotonic() + timeout_seconds
+    watch = _ProgressWatch(process.pid, timeout_seconds)
     item = None
+    cut = None
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
         try:
-            item = result_queue.get(timeout=min(2.0, remaining))
+            item = result_queue.get(timeout=watch.slice())
             break
         except queue_module.Empty:
             if not process.is_alive():
@@ -717,17 +856,24 @@ def _run_converter_with_timeout(
                     process.join()
                 raise ConversionCancelled(
                     f"conversion {conversion_id} was cancelled")
+            cut = watch.check()
+            if cut:
+                break
 
     if item is None:
         if process.is_alive():
             logger.warning(
-                f"[{conversion_id}] Conversion timeout ({timeout_seconds}s), terminating process..."
+                f"[{conversion_id}] Conversion {cut} — terminating process..."
             )
             process.terminate()
             process.join(timeout=5)
             if process.is_alive():
                 process.kill()
                 process.join()
+            if cut == "stalled":
+                raise TimeoutError(
+                    "Conversion stalled: no progress (no CPU activity) for "
+                    f"{int(watch.stall_seconds)}s and was terminated")
             raise TimeoutError(
                 f"Conversion exceeded {timeout_seconds}s timeout and was terminated"
             )
@@ -799,7 +945,9 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
             CONVERSION_TIMEOUT_SECONDS = _read_timeout_seconds()
             
             # Log config for debugging
-            logger.info(f"[{conversion_id}] Docling config: OCR={do_ocr}, Tables={do_table_structure}, Timeout={CONVERSION_TIMEOUT_SECONDS}s")
+            logger.info(f"[{conversion_id}] Docling config: OCR={do_ocr}, Tables={do_table_structure}, "
+                        f"Timeout={CONVERSION_TIMEOUT_SECONDS or 'none'}s, "
+                        f"stall={os.getenv('DOCLING_STALL_SECONDS', '600')}s")
             
             span.set_attribute("docling.timeout_seconds", CONVERSION_TIMEOUT_SECONDS)
             span.set_attribute("docling.ocr_enabled", do_ocr)
@@ -1182,7 +1330,9 @@ class _Heartbeat(threading.Thread):
         try:
             while not self._stopped.wait(settings.WORKER_READY_INTERVAL_SECONDS):
                 try:
-                    sock.send_json(self._beat, zmq.NOBLOCK)
+                    counter = getattr(_WARM_DOCLING, "pages_done", None)
+                    beat = dict(self._beat, pages_done=counter.value) if counter is not None else self._beat
+                    sock.send_json(beat, zmq.NOBLOCK)
                 except zmq.Again:
                     pass  # link down; the API's watchdog is what reports that
         finally:

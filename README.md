@@ -304,6 +304,49 @@ Default ports (in `app/api/main.py`):
 - Tasks: `5555` (PUSH from API, PULL by workers)
 - Results: `5556` (PUSH from workers, PULL by API)
 
+### Embedded workers (one container)
+
+`MARKDOWN_EMBEDDED_WORKERS=N` makes the API start N conversion workers inside its
+own container, connected over `127.0.0.1`; a worker that exits is restarted, and all
+of them stop with the API. Unset or `0` (the default) keeps the separate worker
+Deployment. Use it where the chart's `expose` publishes only one port (the Service
+cannot carry 5555/5556): then set `expose` to 8000 only and drop the worker
+Deployment (`pod.workers.markdown-api-worker: null`). Memory: ~2 GB + ~8 GB per
+worker. `/health` reports `embedded_workers: {configured, running, restarts}`.
+
+### Conversion limits
+
+A long conversion is not a stuck one. Each conversion is bounded in one place, the
+worker, from the moment it takes the job (time queued behind other documents does
+not count):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DOCLING_STALL_SECONDS` | `600` | Cut when nothing moves for this long. For docling the signal is its own page handoffs between pipeline stages; other converters fall back to CPU activity. |
+| `DOCLING_TIMEOUT_SECONDS` | `7200` | Hard ceiling, busy or not (`0` = none). |
+| `MARKDOWN_CONVERSION_TIMEOUT_SECONDS` (callers) | `0` | `0` = wait while the job is reported queued or converting. |
+| `INGEST_CONVERT_TIMEOUT_SECONDS` (templates) | `0` | No outer clock unless the client cap above is set. |
+
+`GET /convert/{id}` reports `elapsed_seconds` and, for docling, `pages_done`.
+`POST /debug/convert` takes `wait=false` to return the id at once — the UI polls,
+because a single held request is cut by proxies (an OpenShift Route at 30 s, Node
+fetch at 300 s) long before a large PDF finishes.
+
+### Air-gapped images
+
+Nothing is downloaded at runtime:
+- docling's layout and table models are baked at `/opt/docling-models` and read
+  through `DOCLING_ARTIFACTS_PATH` — not the HF cache, which the charts point at the
+  project volume (`HF_HOME`).
+- The `docling_hybrid` tokenizer (`minishlab/potion-multilingual-128M`, tokenizer
+  files only) is baked under `MARKDOWN_TOKENIZERS_DIR`; a space naming that Hub id
+  gets the baked copy. Any other id fails with a clear message.
+- litellm uses its bundled cost map (`LITELLM_LOCAL_MODEL_COST_MAP=True`).
+- OCR stays off (`DOCLING_DO_OCR=false`): scanned pages go to the VLM via the LLM proxy.
+
+`/health` reports `models.docling_models_baked`. Check an image with
+`docker run --network none`.
+
 ### Cancellation
 
 | Variable | Default | Effect |

@@ -217,6 +217,11 @@ def _apply_result(result: dict) -> None:
         job_id = result.get("job_id")
         if isinstance(job_id, str):
             dispatcher.note_progress(job_id)
+            # Pages docling has finished so far (its 'assemble' stage), for the status.
+            if isinstance(result.get("pages_done"), int):
+                d = conversion_details_db.get(job_id)
+                if isinstance(d, dict):
+                    d["pages_done"] = result["pages_done"]
         return
 
     if result_type == "chunk":
@@ -240,7 +245,11 @@ def _apply_result(result: dict) -> None:
     if isinstance(conversion_id, str) and isinstance(status, str):
         logger.info(f"Received status update for {conversion_id}: {status}")
         conversion_status_db[conversion_id] = status
-        conversion_details_db[conversion_id] = result
+        # Merged, not replaced: the request side recorded the filename and start time
+        # here, which the result lookup and the status's elapsed_seconds need once the
+        # caller no longer holds them (a polling caller, after /debug/convert wait=false).
+        prior = conversion_details_db.get(conversion_id)
+        conversion_details_db[conversion_id] = {**(prior if isinstance(prior, dict) else {}), **result}
         dispatcher.note_progress(conversion_id)
 
         # Promote pending -> active so /health reflects real work.
@@ -415,6 +424,10 @@ async def get_status(conversion_id: str):
         raise HTTPException(status_code=404, detail="Conversion ID not found")
     response: Dict[str, Any] = {"status": status}
     details = conversion_details_db.get(conversion_id)
+    if isinstance(details, dict) and details.get("started_at"):
+        response["elapsed_seconds"] = round(time.time() - details["started_at"], 1)
+    if isinstance(details, dict) and details.get("pages_done"):
+        response["pages_done"] = details["pages_done"]
     if isinstance(details, dict) and details.get("error"):
         response["error"] = details["error"]
     if isinstance(details, dict) and details.get("retryable"):
@@ -502,12 +515,18 @@ async def get_converted_file(file_path: str):
 async def debug_convert_file(
     file: UploadFile = File(...),
     converter_type: Optional[str] = Form(None),
+    wait: bool = Form(True),
 ):
     """Upload a document and test conversion with timing.
 
     Routes by format so the check exercises the same converter the ingest path
     would pick (PDF → docling, .xlsx/.xlsm → excel, .xls → markitdown). Pass
     `converter_type` to force a specific one.
+
+    ``wait=false`` returns as soon as the job is queued; poll ``GET /convert/{id}``
+    and fetch ``/debug/conversion/{id}/result``. A large PDF takes minutes on CPU
+    (61 pages ≈ 5 min), longer than any proxy in front of a single held request
+    allows (an OpenShift Route cuts at 30 s), so the UI must not wait inline.
     """
     logger.info(f"Debug conversion request for file: {file.filename}")
     start_time = time.time()
@@ -547,7 +566,15 @@ async def debug_convert_file(
         "filename": file.filename,
         "queued_at": start_time
     }
-    
+    if not wait:
+        return {
+            "conversion_id": conversion_id,
+            "filename": file.filename,
+            "file_size": file_size,
+            "status": "pending",
+            "converter_type": selected_converter,
+        }
+
     # Poll for completion (max 10 minutes)
     max_polls = 300  # 10 min / 2s = 300 polls
     poll_interval = 2.0

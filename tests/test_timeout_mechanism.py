@@ -177,7 +177,7 @@ class TestRoutingIntegration:
         assert mock_wrapper.called
         kwargs = mock_wrapper.call_args.kwargs
         assert kwargs["converter_type"] == "docling"
-        assert kwargs["timeout_seconds"] > 0
+        assert kwargs["timeout_seconds"] == 7200  # 2h ceiling by default (plus the stall cut)
         assert kwargs["do_ocr"] is False  # default off, passed explicitly
 
     def test_docling_path_forwards_ocr_when_env_set(self, sample_pdf_path, monkeypatch):
@@ -239,3 +239,109 @@ class TestRoutingIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+class TestStallNotClock:
+    """A long conversion is not a stuck one: only no-progress ends it."""
+
+    def test_busy_child_runs_past_the_old_ceiling(self, monkeypatch):
+        import multiprocessing as mp
+        import time as _t
+        from app.workers.worker import _ProgressWatch
+
+        monkeypatch.setenv("DOCLING_STALL_SECONDS", "2")
+        p = mp.get_context("spawn").Process(target=_burn, args=(4.0,))
+        p.start()
+        try:
+            w = _ProgressWatch(p.pid, 0)            # no ceiling
+            end = _t.monotonic() + 3.5
+            while _t.monotonic() < end:
+                _t.sleep(0.5)
+                assert w.check() is None             # busy → never cut
+        finally:
+            p.join()
+
+    def test_idle_child_is_cut_as_stalled(self, monkeypatch):
+        import multiprocessing as mp
+        import time as _t
+        from app.workers.worker import _ProgressWatch
+
+        monkeypatch.setenv("DOCLING_STALL_SECONDS", "1.5")
+        p = mp.get_context("spawn").Process(target=_t.sleep, args=(10,))
+        p.start()
+        try:
+            _t.sleep(1.0)                            # let the interpreter finish starting
+            w = _ProgressWatch(p.pid, 0)
+            verdict = None
+            end = _t.monotonic() + 5
+            while verdict is None and _t.monotonic() < end:
+                _t.sleep(0.5)
+                verdict = w.check()
+            assert verdict == "stalled"
+        finally:
+            p.terminate(); p.join()
+
+    def test_optional_ceiling_still_applies(self):
+        import os
+        from app.workers.worker import _ProgressWatch
+
+        w = _ProgressWatch(os.getpid(), 1)
+        import time as _t
+        _t.sleep(1.1)
+        assert w.check() == "timeout"
+
+
+def _burn(seconds):
+    import time as _t
+    end = _t.monotonic() + seconds
+    x = 0
+    while _t.monotonic() < end:
+        x += 1
+
+
+class TestPageProgress:
+    """With docling's page counter the watch trusts pages moving, not CPU."""
+
+    def test_pages_moving_is_progress(self, monkeypatch):
+        import multiprocessing as mp, time as _t
+        from app.workers.worker import _ProgressWatch
+
+        monkeypatch.setenv("DOCLING_STALL_SECONDS", "1")
+        counter = mp.get_context("spawn").Value("q", 0)
+        w = _ProgressWatch(None, 0, progress=counter)
+        for _ in range(4):
+            _t.sleep(0.4)
+            counter.value += 6          # a page went through the six stages
+            assert w.check() is None
+
+    def test_busy_but_no_pages_is_stalled(self, monkeypatch):
+        """CPU may be pegged, but if no page moves the conversion is stuck."""
+        import multiprocessing as mp, os, time as _t
+        from app.workers.worker import _ProgressWatch
+
+        monkeypatch.setenv("DOCLING_STALL_SECONDS", "1")
+        counter = mp.get_context("spawn").Value("q", 5)
+        w = _ProgressWatch(os.getpid(), 0, progress=counter)   # this process is busy
+        _t.sleep(1.2)
+        assert w.check() == "stalled"
+
+
+def test_page_hook_counts_every_stage_and_finished_pages():
+    import multiprocessing as mp
+    from docling.pipeline import standard_pdf_pipeline as spp
+    from app.workers.worker import _install_page_progress
+
+    original = spp.ThreadedPipelineStage._emit
+    try:
+        ctx = mp.get_context("spawn")
+        events, pages = ctx.Value("q", 0), ctx.Value("q", 0)
+        _install_page_progress(events, pages)
+
+        class _Stage:
+            def __init__(self, name):
+                self.name, self._outputs, self._postprocess = name, [], None
+        spp.ThreadedPipelineStage._emit(_Stage("layout"), [1, 2])
+        spp.ThreadedPipelineStage._emit(_Stage("assemble"), [1])
+        assert events.value == 3 and pages.value == 1
+    finally:
+        spp.ThreadedPipelineStage._emit = original

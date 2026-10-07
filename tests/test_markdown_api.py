@@ -259,3 +259,32 @@ def test_debug_convert_creates_a_missing_converted_dir(client, tmp_path, monkeyp
     r = client.post("/debug/convert", files={"file": ("doc.pdf", b"%PDF-1.4 test", "application/pdf")})
     assert r.status_code != 500
     assert (missing / "debug_doc.pdf").read_bytes() == b"%PDF-1.4 test"
+
+
+def test_debug_convert_without_waiting_returns_the_id_at_once(monkeypatch, tmp_path):
+    """The UI polls instead of holding one request open for minutes (OCP Routes cut at 30 s)."""
+    from fastapi.testclient import TestClient
+    import app.api.main as m
+
+    monkeypatch.setattr(m, "get_converted_files_dir", lambda: tmp_path)
+    monkeypatch.setattr(m, "enqueue_task", lambda task: None)
+    client = TestClient(m.app)
+    r = client.post("/debug/convert", files={"file": ("big.pdf", b"%PDF-1.4 x")}, data={"wait": "false"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "pending" and body["conversion_id"]
+    s = client.get(f"/convert/{body['conversion_id']}").json()
+    assert s["status"] == "pending" and "elapsed_seconds" in s
+
+
+def test_worker_updates_keep_the_request_details():
+    """A polling caller fetches the result after the worker reported: the filename and
+    start time recorded at upload must survive the worker's status messages."""
+    import app.api.main as m
+
+    cid = "keep-1"
+    m.conversion_details_db[cid] = {"filename": "big.pdf", "file_size": 3, "started_at": 1.0}
+    m._apply_result({"conversion_id": cid, "status": "processing"})
+    m._apply_result({"conversion_id": cid, "status": "completed"})
+    d = m.conversion_details_db[cid]
+    assert d["filename"] == "big.pdf" and d["started_at"] == 1.0 and d["status"] == "completed"

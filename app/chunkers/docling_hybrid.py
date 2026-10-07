@@ -24,6 +24,7 @@ and `tokenizer` from chunker.params.tokenizer.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,23 @@ from app.chunkers.base import Chunker
 from app.registry import register_chunker
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_tokenizer(tokenizer_id: str) -> str:
+    """The baked copy of a Hub tokenizer when the image has one, else the id unchanged.
+
+    Spaces name tokenizers by Hub id (``minishlab/potion-multilingual-128M``). The image
+    bakes the ones it supports under MARKDOWN_TOKENIZERS_DIR as ``<org>--<name>``, so the
+    same setting works in an air-gapped cluster without editing any space.
+    """
+    import os
+
+    base = os.environ.get("MARKDOWN_TOKENIZERS_DIR")
+    if base and "/" in tokenizer_id:
+        local = os.path.join(base, tokenizer_id.replace("/", "--"))
+        if os.path.isfile(os.path.join(local, "tokenizer.json")):
+            return local
+    return tokenizer_id
 
 
 @register_chunker(
@@ -102,14 +120,34 @@ class DoclingHybridChunkerImpl(Chunker):
         
         # Step 1: PDF → DoclingDocument
         logger.info(f"Converting PDF to DoclingDocument: {file_path}")
-        converter = DocumentConverter()
+        # Same pipeline as the converter: OCR follows DOCLING_DO_OCR (off by default —
+        # scanned pages go to the VLM instead), and the models come from
+        # DOCLING_ARTIFACTS_PATH — never downloaded.
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import PdfFormatOption
+
+        pdf_opts = PdfPipelineOptions()
+        pdf_opts.do_ocr = os.getenv("DOCLING_DO_OCR", "false").lower() in ("true", "1", "yes")
+        converter = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)})
         result = converter.convert(str(path))
         dl_doc = result.document
         logger.info(f"Converted PDF: {dl_doc.num_pages()} pages")
         
         # Step 2: Tokenizer setup (8K token support for up to 4K chunks)
         logger.info(f"Loading tokenizer: {tokenizer_id}")
-        hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        try:
+            hf_tokenizer = AutoTokenizer.from_pretrained(resolve_tokenizer(tokenizer_id))
+        except OSError as exc:
+            # The tokenizer is a per-space choice, so it is not baked into the image;
+            # in a closed network a Hub id fails here with a bare connection error.
+            raise RuntimeError(
+                f"docling_hybrid: tokenizer {tokenizer_id!r} is not available locally and "
+                f"could not be downloaded ({exc.__class__.__name__}). In an air-gapped "
+                "cluster set chunker.params.tokenizer to a tokenizer directory present "
+                "in the image or on the project volume."
+            ) from exc
         tokenizer = HuggingFaceTokenizer(tokenizer=hf_tokenizer, max_tokens=max_tokens)
         
         # Step 3: Hebrew-optimized serializer (markdown tables for better embeddings)

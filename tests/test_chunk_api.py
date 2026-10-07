@@ -103,3 +103,18 @@ def test_chunker_real_invocation_returns_chunks(sample_pdf):
     assert len(chunks) > 0
     for c in chunks:
         assert "text" in c and isinstance(c["text"], str) and c["text"].strip()
+
+
+def test_tokenizer_id_resolves_to_the_baked_copy(tmp_path, monkeypatch):
+    """Air-gapped: a space's Hub tokenizer id loads from the image, not the Hub."""
+    from app.chunkers.docling_hybrid import resolve_tokenizer
+
+    baked = tmp_path / "minishlab--potion-multilingual-128M"
+    baked.mkdir()
+    (baked / "tokenizer.json").write_text("{}")
+    monkeypatch.setenv("MARKDOWN_TOKENIZERS_DIR", str(tmp_path))
+    assert resolve_tokenizer("minishlab/potion-multilingual-128M") == str(baked)
+    # Not baked → the id is passed through (and fails clearly when offline).
+    assert resolve_tokenizer("org/other-tokenizer") == "org/other-tokenizer"
+    monkeypatch.delenv("MARKDOWN_TOKENIZERS_DIR")
+    assert resolve_tokenizer("minishlab/potion-multilingual-128M") == "minishlab/potion-multilingual-128M"

@@ -143,17 +143,33 @@ RUN $VENV -c "import pathlib, pymupdf; \
       assert u.find_spec('pymupdf.__main__') is None, 'pymupdf CLI still present'; \
       print('pymupdf CLI entry point removed; pymupdf + pymupdf4llm intact')"
 
-# Pre-download docling models (layout + table extraction, WITHOUT OCR)
-# Match runtime API (DocumentConverter + PdfFormatOption + InputFormat).
+# Bake docling's models into the image (layout + table structure, WITHOUT OCR).
+# This used to only construct a DocumentConverter, which since docling 2.x loads
+# models lazily on the first convert — so it downloaded nothing, the image shipped
+# an empty cache, and in an air-gapped cluster every PDF failed with "ConnectError:
+# Name or service not known" fetching docling-layout-heron from the HF Hub.
+# The models go to a fixed path read through DOCLING_ARTIFACTS_PATH (set in the
+# runtime stage), NOT the HF cache: the charts point HF_HOME at the project volume,
+# which would hide anything baked under the image's HF cache.
 RUN $VENV -c "\
-from docling.document_converter import DocumentConverter, PdfFormatOption; \
-from docling.datamodel.pipeline_options import PdfPipelineOptions; \
-from docling.datamodel.base_models import InputFormat; \
-opts = PdfPipelineOptions(); \
-opts.do_ocr = False; \
-opts.do_table_structure = True; \
-converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}); \
-print('Docling models downloaded (layout + table, without OCR)'); \
+from pathlib import Path; \
+from docling.utils.model_downloader import download_models; \
+download_models(output_dir=Path('/opt/docling-models'), with_layout=True, \
+    with_tableformer=True, with_code_formula=False, with_picture_classifier=False, \
+    with_rapidocr=False); \
+print('Docling models baked into /opt/docling-models (layout + table, without OCR)'); \
+"
+
+# Bake the docling_hybrid chunker's tokenizer (tokenizer files only, ~25 MB — not the
+# 512 MB model weights, which chunking never loads). The chunker maps the Hub id a space
+# names to this copy (MARKDOWN_TOKENIZERS_DIR), so an air-gapped cluster never fetches it.
+RUN $VENV -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('minishlab/potion-multilingual-128M', \
+    local_dir='/opt/hf-tokenizers/minishlab--potion-multilingual-128M', \
+    allow_patterns=['tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', \
+                    'vocab.txt', 'config.json']); \
+print('docling_hybrid tokenizer baked: minishlab/potion-multilingual-128M'); \
 "
 
 # Bundle whatever landed under /root/.cache (HF hub, docling, etc.) for the runtime stage.
@@ -203,6 +219,17 @@ RUN rm -rf /opt/app-root/lib64/python3.12/site-packages/pip \
 # Group-writable so an arbitrary GKE UID can still write there. The rapidocr
 # models directory that used to be pre-created 777 went with rapidocr itself.
 RUN mkdir -p /home/appuser && chown 1001:0 /home/appuser && chmod g=u /home/appuser
+
+# docling's models, baked in the builder; DOCLING_ARTIFACTS_PATH makes docling load
+# them from here and never from the network (see the builder step).
+COPY --from=builder --chown=1001:0 /opt/docling-models /opt/docling-models
+ENV DOCLING_ARTIFACTS_PATH=/opt/docling-models
+COPY --from=builder --chown=1001:0 /opt/hf-tokenizers /opt/hf-tokenizers
+ENV MARKDOWN_TOKENIZERS_DIR=/opt/hf-tokenizers
+
+# litellm (VLM fallback) would fetch its model cost map from GitHub at import.
+ENV LITELLM_LOCAL_MODEL_COST_MAP=True \
+    LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS=True
 
 # Copy pre-downloaded caches (HF / docling artifacts from builder)
 COPY --from=builder --chown=1001:0 /export/root-cache/ /home/appuser/.cache/

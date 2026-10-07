@@ -948,6 +948,20 @@ async def get_chunk_status(chunk_id: str):
 # ==================== END CHUNK ENDPOINTS ====================
 
 
+def _models_status() -> dict:
+    """Where docling's models come from. In an air-gapped cluster a conversion can only
+    succeed when they are baked into the image (DOCLING_ARTIFACTS_PATH) — otherwise
+    docling tries the HuggingFace Hub on the first PDF and fails."""
+    path = os.environ.get("DOCLING_ARTIFACTS_PATH") or ""
+    present = bool(path) and os.path.isdir(path) and any(os.scandir(path))
+    return {
+        "docling_artifacts_path": path or None,
+        "docling_models_baked": present,
+        "hf_home": os.environ.get("HF_HOME"),
+        "hf_offline": (os.environ.get("HF_HUB_OFFLINE") or "").lower() in ("1", "true", "yes"),
+    }
+
+
 @app.get("/health")
 async def health_check(response: Response):
     """Health check endpoint for monitoring with diagnostic information."""
@@ -984,6 +998,7 @@ async def health_check(response: Response):
             "task_queue": settings.ZMQ_TASK_PORT,
             "result_queue": settings.ZMQ_RESULT_PORT
         },
+        "models": _models_status(),
         "queue": {
             "pending": len(pending_conversions_db),
             "active": len(active_conversions_db),

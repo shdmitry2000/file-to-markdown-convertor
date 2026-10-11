@@ -51,10 +51,14 @@ RUN microdnf install -y \
 RUN pip install --no-cache-dir uv
 
 # Copy project file and app code for building
-COPY pyproject.toml .
+COPY pyproject.toml uv.lock ./
 COPY ./app ./app
 
-# Install ALL dependencies from pyproject.toml.
+# Install ALL dependencies from uv.lock, not a fresh resolve of pyproject.toml.
+# A fresh resolve floats every package to the newest release: the 1.4.1 build
+# pulled ~100 versions the lock never had (pandas 3, opencv 5 headless-only,
+# google-cloud-aiplatform 2) and broke the opencv swap below. --inexact keeps
+# what the base venv already holds (pip, uv itself).
 #
 # Target /opt/app-root explicitly. UV_SYSTEM_PYTHON, which this used to set,
 # resolves to the 3.12 under /usr on this base, while `python3` on PATH is the
@@ -64,7 +68,7 @@ ENV VENV=/opt/app-root/bin/python3
 # Docling v2 pulls layout/table weights via Hugging Face — pin cache path for reproducible COPY.
 ENV HF_HOME=/root/.cache/huggingface
 RUN mkdir -p "${HF_HOME}"
-RUN uv pip install --python $VENV --no-cache-dir .
+RUN UV_PROJECT_ENVIRONMENT=/opt/app-root uv sync --frozen --no-dev --inexact --no-cache
 
 # Swap opencv-python for opencv-python-headless at the same version. The GUI
 # build links against mesa-libGL, and mesa drags libX11, llvm-libs and the

@@ -254,6 +254,12 @@ ENV TORCHDYNAMO_DISABLE=1
 # not enable OCR — it makes docling raise on the first convert.
 ENV DOCLING_DO_OCR=false
 
+# python3.12-pip-wheel only feeds ensurepip (python -m venv with pip). Nothing in
+# this runtime stage creates a venv or runs pip (deps are installed in the builder
+# with uv), and the wheel bundles pip/urllib3/requests/msgpack/idna that Xray flags
+# High with no RHEL fix. --nodeps: python3.12-libs lists it only for ensurepip.
+RUN rpm -e --nodeps python3.12-pip-wheel
+
 USER 1001
 WORKDIR /home/appuser/app
 

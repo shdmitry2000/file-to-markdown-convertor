@@ -97,3 +97,21 @@ def test_in_flight_sharing_keys_on_the_identity_that_was_sent(client, stored_pdf
     first = client.post("/convert", json={"file_key": stored_pdf}).json()["conversion_id"]
     second = client.post("/convert", json={"file_key": stored_pdf}).json()["conversion_id"]
     assert first == second
+
+
+def test_health_reports_storage_keys_available(client):
+    assert client.get("/health").json()["configuration"]["storage_keys_available"] is True
+
+
+def test_a_build_without_file_storage_is_visible_before_the_first_503(client, monkeypatch):
+    """The OCP image shipped without shared/file_storage: /health and the upload test
+    passed while every templates' key-addressed /convert answered 503. /health has to
+    say so, and the /convert 503 is the one the templates actually hit."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "shared.file_storage", None)
+    monkeypatch.setitem(sys.modules, "shared.file_storage.keys", None)
+    assert client.get("/health").json()["configuration"]["storage_keys_available"] is False
+    response = client.post("/convert", json={"file_key": "64/raw/doc.pdf"})
+    assert response.status_code == 503
+    assert "cannot resolve storage keys" in response.json()["detail"]

@@ -64,6 +64,13 @@ async def lifespan(app: FastAPI):
     # Startup logic. /health reports these threads, so one that dies is a pod
     # restart instead of a service that accepts work and never finishes it.
     global _listener_thread, _dispatcher_thread
+    if not storage.keys_available():
+        # Not fatal: uploads and file_path conversions still work. But every
+        # storage-key /convert — what the templates send — will answer 503.
+        logger.error(
+            "shared.file_storage is not in this image: storage-key /convert requests "
+            "will be refused with 503. Rebuild with shared/ vendored."
+        )
     stop = threading.Event()
     logger.info("Starting result listener background thread.")
     _listener_thread = threading.Thread(target=result_listener, args=(stop,), daemon=True)
@@ -1019,6 +1026,7 @@ async def health_check(response: Response):
             "projects_accessible": projects_accessible,
             "converted_files_dir": settings.CONVERTED_FILES_DIR,
             "converted_dir_accessible": converted_accessible,
+            "storage_keys_available": storage.keys_available(),
             "zeromq_host": settings.ZEROMQ_HOST
         },
         "zmq_ports": {

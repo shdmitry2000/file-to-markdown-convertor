@@ -54,6 +54,16 @@ def reset() -> None:
     _cached = _UNSET
 
 
+def keys_available() -> bool:
+    """Whether this build can resolve storage keys — checked at startup and in /health,
+    so a build without shared/file_storage is visible before the first /convert 503s."""
+    try:
+        from shared.file_storage import keys  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def normalize_key(key: str) -> str:
     """Validate a key from the network. Raises StorageUnavailable when this build
     cannot resolve keys at all, so the caller can answer 503 rather than 400."""

@@ -267,16 +267,29 @@ COPY --chown=1001:0 ./app /home/appuser/app
 # guarded lazy import that falls back to the global connector credentials.
 #
 # `share[d]` is an optional glob — present when built from the enterprise repo (the sync
-# vendors it), absent in a standalone submodule build, where those two code paths remain
-# unavailable exactly as they are today. pyproject.toml always matches, which is what lets
-# a COPY containing a non-matching glob succeed; it is removed again below.
+# vendors it), absent in a standalone submodule build. pyproject.toml always matches,
+# which is what lets a COPY containing a non-matching glob succeed; it is removed below.
+#
+# REQUIRED by default: an image without shared/ builds fine and then answers every
+# storage-key /convert — the only kind the templates send — with 503. That shipped to
+# OCP unnoticed, because the enterprise build is automatic and only a pass/fail is
+# visible. So the build itself fails. A deliberate standalone build opts out with
+# --build-arg REQUIRE_SHARED_LIBS=0. The import (not a directory test) also catches a
+# partial copy.
+ARG REQUIRE_SHARED_LIBS=1
 COPY --chown=1001:0 ./pyproject.toml ./share[d]/ /home/appuser/shared/
-RUN if [ -d /home/appuser/shared/llm_factory ]; then \
+RUN rm -f /home/appuser/shared/pyproject.toml; \
+    if cd /home/appuser && python -c "import shared.file_storage.keys" \
+       && [ -d /home/appuser/shared/llm_factory ]; then \
       echo "shared libs: vendored"; \
+    elif [ "$REQUIRE_SHARED_LIBS" = "0" ]; then \
+      echo "shared libs: absent (standalone build — storage keys and VLM_BACKEND=factory unavailable)"; \
     else \
-      echo "shared libs: absent (standalone build — VLM_BACKEND=factory unavailable)"; \
-    fi; \
-    rm -f /home/appuser/shared/pyproject.toml
+      echo "ERROR: shared libs missing — shared/file_storage and shared/llm_factory must be" \
+           "vendored next to this Dockerfile (make vendor-markdown-shared, or the enterprise" \
+           "sync). Pass --build-arg REQUIRE_SHARED_LIBS=0 only for a standalone build." >&2; \
+      exit 1; \
+    fi
 
 # Set PYTHONPATH so 'app' and 'shared' modules can be found
 ENV PYTHONPATH=/home/appuser

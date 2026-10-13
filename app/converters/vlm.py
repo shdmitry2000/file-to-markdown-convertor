@@ -112,10 +112,13 @@ class VLMConverter(PDFConverter):
         )
         self._user_prompt = user_prompt
         self._on_progress = on_progress
-        # backend: "openai" (default, OpenAI-compatible/Ollama) or "factory"
-        # (route vision through the shared LLMFactory -> litellm -> Gemini/Vertex,
-        # using the same provider + credentials the rest of the platform uses).
-        self._backend = (backend or os.getenv("VLM_BACKEND", "openai")).lower()
+        # backend: "factory" (default — route vision through the shared LLMFactory
+        # -> litellm -> Gemini/Vertex, the same provider + credentials the rest of
+        # the platform uses: template -> markdown -> LLM) or "openai" (an
+        # OpenAI-compatible endpoint such as a local Ollama, opt-in via VLM_BACKEND).
+        # The default was "openai", so an image on a platform lane went to an
+        # endpoint that does not exist there and failed with a connection error.
+        self._backend = (backend or os.getenv("VLM_BACKEND", "factory")).lower()
 
         if self._backend == "factory":
             from shared.llm_factory import LLMFactory

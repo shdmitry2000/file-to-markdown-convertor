@@ -20,6 +20,11 @@ critical 224-page Bank Hapoalim report (duah_hapoalim.pdf):
    COMPLETENESS GUARD: if docling captured < ``completeness_min`` of the page's
    text-layer Hebrew words, fall back to the VLM. This is the check that caught
    kreuzberg silently dropping ~60% of text on most pages.
+5. NUMBER CHECK on VLM pages that have a text layer: every number >= 1000 the
+   VLM writes must be on the page (see number_check.py). A page that fails is
+   transcribed once more; if the better attempt still fails it is kept, logged,
+   and tagged with an HTML comment listing the numbers, so the flag travels with
+   the page into chunks.
 
 The docling converter and one VLM client are built once per conversion and
 reused across pages.
@@ -37,6 +42,7 @@ import pymupdf as fitz  # `fitz` is the deprecated alias for the same module
 
 from app.registry import register_converter
 from .base import PDFConverter
+from .number_check import not_on_page, page_numbers
 
 logger = logging.getLogger(__name__)
 
@@ -165,13 +171,35 @@ class DbankConverter(PDFConverter):
         sub.close()
         return Path(name)
 
+    def _transcribe_checked(self, img_b64: str, ref, page_index: int) -> str:
+        """Transcribe a page; if it has numbers the page does not, try once more."""
+        md = self._vlm.transcribe_page(img_b64)
+        if ref is None:
+            return md
+        bad = not_on_page(md, ref)
+        if not bad:
+            return md
+        retry = self._vlm.transcribe_page(img_b64)
+        retry_bad = not_on_page(retry, ref)
+        if len(retry_bad) < len(bad):
+            md, bad = retry, retry_bad
+        if not bad:
+            logger.info("dbank: page %d number check passed on retry", page_index)
+            return md
+        shown = ", ".join(f"{v:,}" for v in bad[:20])
+        logger.warning("dbank: page %d has numbers not on the page after retry: %s",
+                       page_index, shown)
+        return f"{md}\n\n<!-- dbank: numbers not on the page: {shown} -->"
+
     # -- PDFConverter interface --------------------------------------------
 
     def convert(self, pdf_path: Path) -> str:
         self.validate_path(pdf_path)
 
-        # Each kept page becomes ["md", text] (final) or ["vlm", img_b64] (pending
-        # parallel transcription). Order is preserved for the final join.
+        # Each kept page becomes ["md", text] (final) or ["vlm", img_b64, ref, page]
+        # (pending parallel transcription; ref = the page's numbers to check the
+        # transcription against, None when there is nothing to check). Order is
+        # preserved for the final join.
         slots: list[list] = []
         dropped: list[int] = []
         n_docling = 0
@@ -203,7 +231,9 @@ class DbankConverter(PDFConverter):
                     continue
 
                 if scanned or self._has_significant_image(page):
-                    slots.append(["vlm", self._render(page)])
+                    # No check: a scanned page has no text layer, and figures in an
+                    # image page carry numbers the text layer does not have.
+                    slots.append(["vlm", self._render(page), None, i])
                     continue
 
                 tmp = self._write_page(doc, i)
@@ -213,7 +243,7 @@ class DbankConverter(PDFConverter):
                     tmp.unlink(missing_ok=True)
 
                 if n_tables > 0:
-                    slots.append(["vlm", self._render(page)])
+                    slots.append(["vlm", self._render(page), page_numbers(page), i])
                     continue
 
                 ref_words = _heb_word_count(text)
@@ -222,7 +252,7 @@ class DbankConverter(PDFConverter):
                         "dbank: docling dropped text on page %d (%d/%d Hebrew words) "
                         "— VLM fallback", i, _heb_word_count(md), ref_words,
                     )
-                    slots.append(["vlm", self._render(page)])
+                    slots.append(["vlm", self._render(page), page_numbers(page), i])
                 else:
                     slots.append(["md", md])
                     n_docling += 1
@@ -233,7 +263,7 @@ class DbankConverter(PDFConverter):
                 self._ensure_vlm()
                 workers = min(self._vlm_concurrency, len(vlm_slots))
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {ex.submit(self._vlm.transcribe_page, slots[k][1]): k
+                    futs = {ex.submit(self._transcribe_checked, *slots[k][1:]): k
                             for k in vlm_slots}
                     for fut in as_completed(futs):
                         k = futs[fut]

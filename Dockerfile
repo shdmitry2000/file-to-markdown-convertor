@@ -266,28 +266,20 @@ COPY --chown=1001:0 ./app /home/appuser/app
 # shared/db is deliberately not vendored: connector_credentials reaches it through a
 # guarded lazy import that falls back to the global connector credentials.
 #
-# `share[d]` is an optional glob — present when built from the enterprise repo (the sync
-# vendors it), absent in a standalone submodule build. pyproject.toml always matches,
-# which is what lets a COPY containing a non-matching glob succeed; it is removed below.
-#
-# REQUIRED by default: an image without shared/ builds fine and then answers every
-# storage-key /convert — the only kind the templates send — with 503. That shipped to
-# OCP unnoticed, because the enterprise build is automatic and only a pass/fail is
-# visible. So the build itself fails. A deliberate standalone build opts out with
-# --build-arg REQUIRE_SHARED_LIBS=0. The import (not a directory test) also catches a
-# partial copy.
-ARG REQUIRE_SHARED_LIBS=1
-COPY --chown=1001:0 ./pyproject.toml ./share[d]/ /home/appuser/shared/
-RUN rm -f /home/appuser/shared/pyproject.toml; \
-    if cd /home/appuser && python -c "import shared.file_storage.keys" \
+# REQUIRED, and copied by its plain name. It used to be an optional `./share[d]/` glob;
+# the enterprise CI builds with the legacy (non-BuildKit) builder, which silently
+# matches nothing for that glob, so every enterprise image since 1.2.9 shipped without
+# shared/ and answered each storage-key /convert — the only kind the templates send —
+# with 503, while /health and the upload test passed. A build without shared/ now fails
+# at this COPY; vendor it first (make vendor-markdown-shared, or the enterprise sync).
+# The import below catches a partial copy.
+COPY --chown=1001:0 ./shared/ /home/appuser/shared/
+RUN if cd /home/appuser && python -c "import shared.file_storage.keys" \
        && [ -d /home/appuser/shared/llm_factory ]; then \
       echo "shared libs: vendored"; \
-    elif [ "$REQUIRE_SHARED_LIBS" = "0" ]; then \
-      echo "shared libs: absent (standalone build — storage keys and VLM_BACKEND=factory unavailable)"; \
     else \
-      echo "ERROR: shared libs missing — shared/file_storage and shared/llm_factory must be" \
-           "vendored next to this Dockerfile (make vendor-markdown-shared, or the enterprise" \
-           "sync). Pass --build-arg REQUIRE_SHARED_LIBS=0 only for a standalone build." >&2; \
+      echo "ERROR: shared libs incomplete — shared/file_storage and shared/llm_factory must be" \
+           "vendored next to this Dockerfile (make vendor-markdown-shared, or the enterprise sync)." >&2; \
       exit 1; \
     fi
 

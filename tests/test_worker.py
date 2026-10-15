@@ -258,3 +258,33 @@ def test_same_stem_and_same_file_other_converter_never_share_an_output(sample_pd
            _output_identity(str(pdf), "pymupdf")[1]}
     assert len(ids) == 3
     assert _output_identity(str(pdf), "docling") == _output_identity(str(pdf), "docling")
+
+
+def test_a_staged_copy_records_the_original_name(sample_pdf, monkeypatch, tmp_path):
+    """A conversion by storage key runs on a staged local copy whose name is not the
+    upload's. The frontmatter `source_file` must be the ORIGINAL name: templates and
+    the evaluator name results after it, and the output file itself is md5-named."""
+    import frontmatter
+    from app.workers import worker
+    from app.workers.worker import convert_file_to_markdown
+
+    converted_dir = tmp_path / "converted_files"
+    monkeypatch.setenv("CONVERTED_FILES_DIR", str(converted_dir))
+    from app.config import get_settings
+    get_settings.cache_clear()
+    staged = tmp_path / "stage_8f2a.pdf"
+    staged.write_bytes(sample_pdf.read_bytes())
+
+    with patch('app.workers.worker._run_converter_with_timeout') as mock_wrapper:
+        mock_wrapper.return_value = _fake_docling_result(markdown="# Content", name="x.pdf")
+        convert_file_to_markdown(str(staged), "job-1", MagicMock(),
+                                 source_name="דוח כספי, 2024.pdf")
+
+    (out,) = converted_dir.glob("*.md")
+    meta = frontmatter.load(out).metadata
+    assert meta["source_file"] == "דוח כספי, 2024.pdf"
+    assert meta["source_md5"] and meta["output_id"] == out.stem
+
+    import inspect
+    assert "source_name=os.path.basename(file_key)" in inspect.getsource(worker), \
+        "the dispatch must hand the key's own name to the converter"

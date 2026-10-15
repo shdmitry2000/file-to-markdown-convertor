@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import zmq
 import uuid
 import os
+import re
 import json
 import time
 import asyncio
@@ -137,6 +138,10 @@ active_conversions_db: Dict[str, Dict] = {}  # Active conversions with metadata
 # SAME file; without this every one of them queues its own full conversion behind
 # the others. Callers share a conversion_id instead and all poll the same job.
 inflight_conversions: Dict[tuple, str] = {}
+# display name -> latest conversion_id. Output is written under an internal md5
+# name (reported as `output_file`), so the legacy by-name /converted route maps a
+# name to its newest conversion here.
+latest_conversion_by_name: Dict[str, str] = {}
 # conversion_id -> how many callers are waiting on it. The sharing above means a
 # cancel is not necessarily "nobody wants this any more": one space cancelling its
 # ingest must not stop the conversion another space is still waiting for. Only the
@@ -365,7 +370,8 @@ async def convert_file(request: ConversionRequest):
             )
         if not store.exists(file_key):
             logger.warning("No object at key: %s", file_key)
-            raise HTTPException(status_code=404, detail="File not found")
+            # Name the key: a bare "File not found" gave the caller nothing to act on.
+            raise HTTPException(status_code=404, detail=f"File not found in storage at key {file_key!r}")
         file_path = None
         identity = file_key
         display_name = os.path.basename(file_key)
@@ -373,7 +379,7 @@ async def convert_file(request: ConversionRequest):
         file_path = request.file_path
         if not os.path.exists(file_path):
             logger.warning(f"File not found at path: {file_path}")
-            raise HTTPException(status_code=404, detail="File not found")
+            raise HTTPException(status_code=404, detail=f"File not found at path {file_path!r}")
         file_key = None
         identity = file_path
         display_name = os.path.basename(file_path)
@@ -397,6 +403,8 @@ async def convert_file(request: ConversionRequest):
         "filename": display_name,
         "queued_at": time.time(),
     }
+    latest_conversion_by_name[display_name] = conversion_id
+    _prune_converted_outputs()
 
     task = {
         "conversion_id": conversion_id,
@@ -494,14 +502,67 @@ async def cancel_conversion(conversion_id: str):
     return {"conversion_id": conversion_id, "status": "cancelled"}
 
 
+#: Hours a <conversion_id>.md output is kept; 0 (the default) keeps it forever.
+#: The templates own their converted markdown and its lifecycle (their manifest);
+#: this is only an opt-in safety net for the service's own hand-off directory.
+_CONVERTED_RETENTION_SECONDS = float(os.getenv("CONVERTED_FILES_RETENTION_HOURS", "0")) * 3600
+_CONVERSION_OUTPUT = re.compile(r"^[0-9a-f]{32}\.md$")
+
+
+def _prune_converted_outputs() -> None:
+    """Delete md5-named outputs older than the retention (none when it is 0). Never raises."""
+    if _CONVERTED_RETENTION_SECONDS <= 0:
+        return
+    cutoff = time.time() - _CONVERTED_RETENTION_SECONDS
+    try:
+        for entry in os.scandir(settings.CONVERTED_FILES_DIR):
+            if _CONVERSION_OUTPUT.match(entry.name) and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+    except OSError as exc:
+        logger.debug("prune converted outputs: %s", exc)
+
+
+def _read_converted(path: str) -> Dict[str, str]:
+    if not os.path.exists(path):
+        logger.warning(f"Converted file not found: {path}")
+        raise HTTPException(status_code=404, detail="Converted file not found")
+    with open(path, "r", encoding="utf-8") as f:
+        return {"content": f.read()}
+
+
+def _output_path(conversion_id: Optional[str]) -> Optional[str]:
+    """Where a finished conversion's markdown is: the internal name its worker reported."""
+    details = conversion_details_db.get(conversion_id) if conversion_id else None
+    name = details.get("output_file") if isinstance(details, dict) else None
+    if not name or not _CONVERSION_OUTPUT.match(name):
+        return None
+    return os.path.join(settings.CONVERTED_FILES_DIR, name)
+
+
+@app.get("/convert/{conversion_id}/content")
+async def get_conversion_content(conversion_id: str):
+    """The markdown one conversion produced — addressed by its job, so a caller can
+    never receive another job's output for a file with the same name. The internal
+    md5 file name is never part of the contract."""
+    path = _output_path(conversion_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Converted file not found")
+    return _read_converted(path)
+
+
 @app.get("/converted/{file_path:path}")
 async def get_converted_file(file_path: str):
+    """Legacy by-name lookup, kept for clients older than /convert/{id}/content."""
     logger.info(f"Request to retrieve converted file: {file_path}")
-    # Use configured converted files directory
     converted_dir = settings.CONVERTED_FILES_DIR
-    # Rag-template requests by original name (e.g. 439.pdf); worker writes <stem>.md
+    name = os.path.basename(file_path)
+    latest = _output_path(latest_conversion_by_name.get(name))
+    if latest and os.path.exists(latest):
+        return _read_converted(latest)
+    # Pre-id outputs were <stem>.md for EVERY source type (the old extension list
+    # left out .pptx, .csv, images, so those always 404'd here).
     base, ext = os.path.splitext(file_path)
-    if ext.lower() in (".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".xls") and not file_path.lower().endswith(".md"):
+    if ext and ext.lower() != ".md":
         lookup_path = os.path.join(converted_dir, os.path.basename(base) + ".md")
     else:
         lookup_path = os.path.join(converted_dir, file_path)
@@ -601,7 +662,9 @@ async def debug_convert_file(
             output_path = None
             converted_dir = Path(settings.CONVERTED_FILES_DIR)
             stem = temp_path.stem.replace("debug_", "")
-            for candidate in (converted_dir / f"debug_{stem}.md", converted_dir / f"{stem}.md"):
+            reported = _output_path(conversion_id)
+            for candidate in ((Path(reported) if reported else converted_dir / "-"),
+                              converted_dir / f"debug_{stem}.md", converted_dir / f"{stem}.md"):
                 if candidate.exists():
                     output_path = str(candidate)
                     conversion_details_db[conversion_id]["output_path"] = output_path
@@ -653,7 +716,9 @@ async def get_converted_result(conversion_id: str, download: bool = False):
         if filename:
             converted_dir = Path(settings.CONVERTED_FILES_DIR)
             stem = Path(filename).stem
+            reported = _output_path(conversion_id)
             potential_paths = [
+                Path(reported) if reported else converted_dir / "-",
                 converted_dir / f"{stem}.md",
                 converted_dir / f"debug_{stem}.md"
             ]

@@ -138,8 +138,11 @@ def test_convert_file_creates_output_directory(sample_pdf, monkeypatch, tmp_path
         mock_wrapper.return_value = _fake_docling_result(markdown="# Content", name="nested.pdf")
         convert_file_to_markdown("files_to_convert/subdir/nested.pdf", "test-789", mock_socket)
 
-    expected_file = converted_dir / "nested.md"
-    assert expected_file.exists()
+    # Stored under an internal md5 name; the original name is in the frontmatter.
+    outputs = list(converted_dir.glob("*.md"))
+    assert len(outputs) == 1 and len(outputs[0].stem) == 32
+    import frontmatter
+    assert frontmatter.load(outputs[0]).metadata["source_file"] == "nested.pdf"
 
 
 def test_worker_metadata_in_output(sample_pdf, monkeypatch, tmp_path):
@@ -167,8 +170,9 @@ def test_worker_metadata_in_output(sample_pdf, monkeypatch, tmp_path):
         mock_wrapper.return_value = _fake_docling_result(markdown="# Test", name="test_document.pdf")
         convert_file_to_markdown("files_to_convert/test_document.pdf", conversion_id, mock_socket)
 
-    output_file = converted_dir / "test_document.md"
-    assert output_file.exists(), f"Output file not found at {output_file}"
+    outputs = list(converted_dir.glob("*.md"))
+    assert len(outputs) == 1, f"expected one output in {converted_dir}"
+    output_file = outputs[0]
 
     content = output_file.read_text()
     assert "---" in content
@@ -239,3 +243,18 @@ def test_convert_file_timeout(sample_pdf, monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_same_stem_and_same_file_other_converter_never_share_an_output(sample_pdf, monkeypatch, tmp_path):
+    """report.pdf / report.docx (same stem) and one file under two converters each get
+    their own internal output — `<stem>.md` made them overwrite each other."""
+    from app.workers.worker import _output_identity
+
+    pdf, docx = tmp_path / "report.pdf", tmp_path / "report.docx"
+    pdf.write_bytes(sample_pdf.read_bytes())
+    docx.write_bytes(b"PK docx bytes")
+
+    ids = {_output_identity(str(pdf), "docling")[1], _output_identity(str(docx), "markitdown")[1],
+           _output_identity(str(pdf), "pymupdf")[1]}
+    assert len(ids) == 3
+    assert _output_identity(str(pdf), "docling") == _output_identity(str(pdf), "docling")

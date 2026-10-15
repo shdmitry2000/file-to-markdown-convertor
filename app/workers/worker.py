@@ -12,6 +12,7 @@ from datetime import datetime
 import logging
 import argparse
 import uuid
+import hashlib
 
 # Import configuration
 from app.cancellation import ConversionCancelled, is_cancelled
@@ -952,7 +953,28 @@ def _run_converter_with_timeout(
     return item[1]
 
 
-def _convert_with_docling(file_path: str, conversion_id: str, result_sender_socket):
+def _output_identity(file_path: str, converter_type: str) -> tuple[str, str]:
+    """(source_md5, output_id) for one conversion.
+
+    The output is named `<output_id>.md`: md5 of the source bytes plus everything
+    that shapes the markdown (converter and its OCR/table switches). Internal only —
+    the directory is flat and shared by every space and system, and `<stem>.md` let
+    report.pdf / report.docx, or one name in two spaces, overwrite each other. Same
+    bytes + same settings → same name, so a re-conversion rewrites its own file.
+    The original name lives in the file's frontmatter (`source_file`).
+    """
+    digest = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    source_md5 = digest.hexdigest()
+    settings_key = f"{converter_type}|ocr={_read_do_ocr()}|tables={_read_do_table_structure()}"
+    output_id = hashlib.md5(f"{source_md5}|{settings_key}".encode()).hexdigest()
+    return source_md5, output_id
+
+
+def _convert_with_docling(file_path: str, conversion_id: str, result_sender_socket,
+                          source_name: str | None = None):
     """
     Docling conversion with timeout protection via multiprocessing.
     """
@@ -985,9 +1007,9 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
             # Write converted files to shared cache directory on the mounted volume.
             converted_dir = get_converted_files_dir()
 
-            # Use file stem for flat structure (e.g., 439.pdf -> 439.md)
-            stem = Path(file_path).stem
-            converted_file_path = converted_dir / f"{stem}.md"
+            # Internal name: <md5 of bytes + settings>.md — see _output_identity.
+            source_md5, output_id = _output_identity(file_path, "docling")
+            converted_file_path = converted_dir / f"{output_id}.md"
             span.set_attribute("output.path", str(converted_file_path))
             
             logger.info(f"[{conversion_id}] Converting: {file_path} -> {converted_file_path}")
@@ -1075,7 +1097,11 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
 
                 # Create metadata
                 metadata = {
-                    "source_file": file_path,
+                    # The ORIGINAL name: templates and the evaluator take a result's
+                    # source from this key, so it must never be the internal name.
+                    "source_file": source_name or Path(file_path).name,
+                    "source_md5": source_md5,
+                    "output_id": output_id,
                     "conversion_id": conversion_id,
                     "conversion_date": datetime.now().isoformat(),
                     "docling_name": doc_name,
@@ -1096,7 +1122,8 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                 os.replace(tmp_file_path, converted_file_path)
 
             result_sender_socket.send_json(
-                {"conversion_id": conversion_id, "status": "completed"}
+                {"conversion_id": conversion_id, "status": "completed",
+                 "output_file": converted_file_path.name}
             )
             logger.info(f"[{conversion_id}] Successfully converted to {converted_file_path}")
 
@@ -1121,12 +1148,13 @@ def _fail_conversion(conversion_id: str, result_sender_socket, error: str) -> No
     )
 
 
-def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_socket, converter_type: str = "docling"):
+def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_socket,
+                             converter_type: str = "docling", source_name: str | None = None):
     """
     Routing proxy that delegates Docling tasks to strict insulation or dynamically uses other plugins.
     """
     if converter_type == "docling" or not converter_type:
-        return _convert_with_docling(file_path, conversion_id, result_sender_socket)
+        return _convert_with_docling(file_path, conversion_id, result_sender_socket, source_name)
         
     # Use PyMuPDF, MarkItDown, VLM, etc plugin with timeout protection
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
@@ -1150,8 +1178,9 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                 return
             
             converted_dir = get_converted_files_dir()
-            stem = Path(file_path).stem
-            converted_file_path = converted_dir / f"{stem}.md"
+            # Internal name — see _output_identity.
+            source_md5, output_id = _output_identity(file_path, converter_type)
+            converted_file_path = converted_dir / f"{output_id}.md"
             span.set_attribute("output.path", str(converted_file_path))
             
             CONVERSION_TIMEOUT_SECONDS = _read_timeout_seconds()
@@ -1199,7 +1228,10 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                 write_span.set_attribute("output.path", str(converted_file_path))
                 
                 metadata = {
-                    "source_file": file_path,
+                    # The ORIGINAL name — see _convert_with_docling.
+                    "source_file": source_name or Path(file_path).name,
+                    "source_md5": source_md5,
+                    "output_id": output_id,
                     "conversion_id": conversion_id,
                     "conversion_date": datetime.now().isoformat(),
                     "converter_used": converter_type,
@@ -1216,7 +1248,8 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                     f.write(frontmatter.dumps(post))
                 os.replace(tmp_file_path, converted_file_path)
 
-            result_sender_socket.send_json({"conversion_id": conversion_id, "status": "completed"})
+            result_sender_socket.send_json({"conversion_id": conversion_id, "status": "completed",
+                                            "output_file": converted_file_path.name})
             logger.info(f"[{conversion_id}] Successfully converted via {converter_type} to {converted_file_path}")
 
         except Exception as e:
@@ -1441,7 +1474,7 @@ def _serve(context, task_receiver_socket, result_sender_socket, result_address,
                     with store.materialize(file_key) as local:
                         convert_file_to_markdown(
                             str(local), conversion_id, result_sender_socket,
-                            converter_type,
+                            converter_type, source_name=os.path.basename(file_key),
                         )
                 except FileNotFoundError:
                     _fail_conversion(

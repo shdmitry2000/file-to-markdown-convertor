@@ -53,6 +53,10 @@ _SCANNED_MAX_CHARS = 50   # avg text-layer chars/page below this => treat doc as
 _IMAGE_MIN_AREA_FRAC = 0.10  # a page image covering >= this fraction routes to VLM
 _VLM_CONCURRENCY = int(os.getenv("DBANK_VLM_CONCURRENCY", "8"))  # parallel VLM page calls
 _PAGE_SEP = "\n\n---\n\n"
+# Each kept page starts with its ORIGINAL 1-based page number. Dropped (non-Hebrew)
+# pages leave gaps, so counting separators cannot recover page numbers; templates use
+# the marker for citations and to align the text with an outline built from the PDF.
+_PAGE_MARK = "<!-- page {} -->"
 
 
 def _heb_word_count(text: str) -> int:
@@ -196,7 +200,7 @@ class DbankConverter(PDFConverter):
     def convert(self, pdf_path: Path) -> str:
         self.validate_path(pdf_path)
 
-        # Each kept page becomes ["md", text] (final) or ["vlm", img_b64, ref, page]
+        # Each kept page becomes ["md", text, page] (final) or ["vlm", img_b64, ref, page]
         # (pending parallel transcription; ref = the page's numbers to check the
         # transcription against, None when there is nothing to check). Order is
         # preserved for the final join.
@@ -254,7 +258,7 @@ class DbankConverter(PDFConverter):
                     )
                     slots.append(["vlm", self._render(page), page_numbers(page), i])
                 else:
-                    slots.append(["md", md])
+                    slots.append(["md", md, i])
                     n_docling += 1
 
             # Phase 2 (parallel, network): transcribe every VLM-bound page at once.
@@ -267,11 +271,11 @@ class DbankConverter(PDFConverter):
                             for k in vlm_slots}
                     for fut in as_completed(futs):
                         k = futs[fut]
-                        slots[k] = ["md", fut.result()]
+                        slots[k] = ["md", fut.result(), slots[k][3]]
 
         logger.info(
             "dbank %s: %d pages -> %d docling, %d vlm (x%d), %d dropped(non-Hebrew)%s",
             pdf_path.name, total, n_docling, len(vlm_slots), self._vlm_concurrency,
             len(dropped), f" {dropped[:30]}" if dropped else "",
         )
-        return _PAGE_SEP.join(s[1] for s in slots)
+        return _PAGE_SEP.join(f"{_PAGE_MARK.format(s[2] + 1)}\n\n{s[1]}" for s in slots)

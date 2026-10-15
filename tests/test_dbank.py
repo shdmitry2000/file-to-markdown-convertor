@@ -138,3 +138,20 @@ def test_scanned_page_is_not_number_checked():
     # no text layer -> nothing to check against -> one call, no flag
     out, _, vlm = _run([_page("")], (HEB, 0), vlm_outputs=["| 1,536,991 |"])
     assert vlm.transcribe_page.call_count == 1 and "dbank:" not in out
+
+
+# -- page markers ------------------------------------------------------------------
+
+def test_pages_carry_original_page_numbers_across_dropped_pages():
+    # page 2 (English) is dropped; page 3 is a VLM table page -> markers 1 and 3, in order
+    out, _, _ = _run([_page(HEB), _page(ENG), _page(HEB)], (HEB, 0),
+                     vlm_outputs=None)
+    assert out.startswith("<!-- page 1 -->")
+    assert "<!-- page 2 -->" not in out and "<!-- page 3 -->" in out
+    assert out.index("<!-- page 1 -->") < out.index("<!-- page 3 -->")
+
+
+def test_vlm_page_keeps_its_page_number():
+    out, _, vlm = _run([_page(HEB), _page(HEB, image=True)], (HEB, 0))
+    assert vlm.transcribe_page.called
+    assert out.index("<!-- page 1 -->") < out.index("<!-- page 2 -->")

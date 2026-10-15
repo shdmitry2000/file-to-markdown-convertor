@@ -9,6 +9,7 @@ from .vlm import VLMConverter
 from .docling import DoclingConverter
 from .dbank import DbankConverter
 from .excel import ExcelConverter
+from .slides import SlidesConverter
 
 __all__ = [
     "PDFConverter",
@@ -18,4 +19,5 @@ __all__ = [
     "DoclingConverter",
     "DbankConverter",
     "ExcelConverter",
+    "SlidesConverter",
 ]

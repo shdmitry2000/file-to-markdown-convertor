@@ -285,6 +285,7 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
             from app.converters.vlm import VLMConverter
             from app.converters.dbank import DbankConverter
             from app.converters.excel import ExcelConverter
+            from app.converters.slides import SlidesConverter
 
             converters_map = {
                 "pymupdf": PyMuPDFConverter,
@@ -292,6 +293,7 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
                 "vlm": VLMConverter,
                 "dbank": DbankConverter,
                 "excel": ExcelConverter,
+                "slides": SlidesConverter,
             }
             cls = converters_map.get(converter_type)
             if not cls:
@@ -782,6 +784,34 @@ class _WarmDbankWorker:
 _WARM_DBANK = _WarmDbankWorker()
 
 
+def _dbank_reads_natively(file_path: str) -> bool | None:
+    """True for a PDF or an image (by content, not by name), False otherwise,
+    None when the file cannot be read (dbank then reports the real error)."""
+    try:
+        with open(file_path, "rb") as fh:
+            if b"%PDF-" in fh.read(1024):
+                return True
+        from PIL import Image
+        try:
+            with Image.open(file_path) as im:
+                im.verify()
+            return True
+        except Exception:
+            return False
+    except OSError:
+        return None
+
+
+def _slide_deck_reason(file_path: str) -> str | None:
+    """`is_slide_deck` that never raises: a precheck fault must not cost a document."""
+    try:
+        from app.converters.slides import is_slide_deck
+        return is_slide_deck(file_path)
+    except Exception as exc:  # noqa: BLE001 — unreadable file etc.; docling reports it properly
+        logger.warning("slide-deck precheck failed for %s: %s", file_path, exc)
+        return None
+
+
 def _run_converter_with_timeout(
     file_path: str,
     conversion_id: str,
@@ -797,7 +827,8 @@ def _run_converter_with_timeout(
     Args:
         file_path: Path to file to convert.
         conversion_id: Used for log correlation.
-        converter_type: docling | pymupdf | markitdown | vlm.
+        converter_type: docling | pymupdf | markitdown | vlm | dbank | excel | slides.
+            A detected slide deck on the dbank lane is rerouted to slides.
         timeout_seconds: Hard wall-clock limit; process is killed if exceeded.
         do_ocr: Forwarded to the docling pipeline. Caller decides — there is no
             implicit env lookup here, so the parent's OTel attributes and the
@@ -810,6 +841,27 @@ def _run_converter_with_timeout(
     we deadlock until the timeout, then kill a process that actually succeeded.
     Reading from the queue first unblocks the put and lets the child exit.
     """
+    # dbank is a PDF pipeline (page-by-page PDF surgery + a Hebrew page filter).
+    # Handed a Word/PowerPoint/HTML/CSV/text file it failed ("source or target not
+    # a PDF") or, for English, returned nothing. Those take the docling route, the
+    # same result the docling option gives. Images stay: dbank reads them through
+    # the VLM.
+    if converter_type == "dbank" and _dbank_reads_natively(file_path) is False:
+        logger.info("[%s] dbank: not a PDF or image — converting with docling", conversion_id)
+        converter_type = "docling"
+
+    # Precheck on the dbank lane only: a presentation deck saved as PDF would have
+    # its non-Hebrew slides dropped and its maps/diagrams reduced to a one-line
+    # alt text, so a detected deck goes to the slides converter (VLM per slide).
+    # docling and every other converter are deliberately left as they are.
+    # A precheck error never blocks the dbank path.
+    if converter_type == "dbank":
+        reason = _slide_deck_reason(file_path)
+        if reason:
+            logger.info("[%s] slide deck detected (%s) — routing to the slides converter",
+                        conversion_id, reason)
+            converter_type = "slides"
+
     # Warm path for docling: reuse one long-lived converter instead of reloading
     # the models per job (turns a ~14s/job cold start into ~1s). Skipped when a
     # test injects `_target`, or when explicitly disabled via DOCLING_WARM_WORKER.

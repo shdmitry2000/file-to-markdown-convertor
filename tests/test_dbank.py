@@ -2,10 +2,17 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from app.converters.dbank import DbankConverter, _heb_word_count, _heb_ratio
+from app.converters.dbank import (
+    DbankConverter, _control_ratio, _heb_ratio, _heb_word_count, _word_precision,
+)
 
 HEB = "בנקאות פתוחה בישראל מאפשרת ללקוחות גישה למידע פיננסי"  # 8 Hebrew words
 ENG = "Open banking in Israel grants third parties access to financial data"
+# A text layer from a broken font encoding: glyph ids extracted as control characters.
+# Long enough that a document of it plus one empty page stays above the scanned-doc
+# threshold (avg 50 chars/page), so the empty page is judged on its own.
+PROSE = " ".join([HEB] * 3)
+GARBAGE = "\x01\x02\x03\x04\x05\x06\x07\x08 \x07 \x03 \x06 \x01\x02 $ \x01# \x02\x02\x02\x02"
 
 
 def _page(text, image=False, rawdict=None):
@@ -51,6 +58,8 @@ def test_pure_helpers():
     assert _heb_word_count(HEB) == 8
     assert _heb_ratio(HEB) > 0.9
     assert _heb_ratio(ENG) == 0.0
+    assert _control_ratio(HEB) == 0.0 and _control_ratio("") == 0.0
+    assert _control_ratio(GARBAGE) > 0.8
 
 
 def test_prose_page_uses_docling():
@@ -59,9 +68,31 @@ def test_prose_page_uses_docling():
     assert d.called and not vlm.transcribe_page.called
 
 
-def test_english_page_dropped_by_prefilter():
-    out, d, vlm = _run([_page(ENG)], (HEB, 0))
-    assert out == "" and not d.called and not vlm.transcribe_page.called
+def test_english_page_is_converted():
+    # no language filter: an English page takes the docling route like any other
+    out, d, vlm = _run([_page(ENG)], (ENG, 0))
+    assert d.called and not vlm.transcribe_page.called
+    assert ENG in out
+
+
+def test_unreadable_text_layer_routes_to_vlm():
+    # broken font encoding -> the text layer is garbage -> VLM reads the image instead
+    out, d, vlm = _run([_page(PROSE), _page(GARBAGE)], (PROSE, 0))
+    assert vlm.transcribe_page.call_count == 1
+    assert "<!-- page 2 -->" in out
+
+
+def test_blank_page_is_skipped():
+    out, _, vlm = _run([_page(PROSE), _page("")], (PROSE, 0))
+    assert not vlm.transcribe_page.called
+    assert "<!-- page 1 -->" in out and "<!-- page 2 -->" not in out
+
+
+def test_image_only_page_routes_to_vlm():
+    # no text but a large figure, in a document that is not scanned
+    out, _, vlm = _run([_page(PROSE), _page("", image=True)], (PROSE, 0))
+    assert vlm.transcribe_page.call_count == 1
+    assert "<!-- page 2 -->" in out
 
 
 def test_table_page_routes_to_vlm():
@@ -74,6 +105,55 @@ def test_completeness_guard_falls_back_to_vlm():
     # docling returns almost no Hebrew -> below 85% of the page's text-layer words
     _, d, vlm = _run([_page(HEB)], ("x", 0))
     assert d.called and vlm.transcribe_page.called
+
+
+# A Hebrew page with English terms, and docling's rendering of it with the English
+# words reversed (seen on E062_bidi_mixed_rtl_ltr.pdf: "Unicode" -> "edocinU").
+MIXED = HEB + " the Unicode BiDi algorithm handles direction for mixed text in every paragraph"
+MIXED_REVERSED = HEB + " eht edocinU iDiB mhtirogla seldnah noitcerid rof dexim txet yreve hpargarap"
+
+
+def test_word_precision():
+    assert _word_precision(MIXED, MIXED) == 1.0
+    assert _word_precision(MIXED_REVERSED, MIXED) < 0.2
+    # docling's placeholders are not page words
+    assert _word_precision(MIXED + " <!-- formula-not-decoded -->" * 5, MIXED) == 1.0
+    # too few words in a script to judge it
+    assert _word_precision(HEB + " edocinU", HEB) == 1.0
+
+
+def test_clean_mixed_page_stays_on_docling():
+    _, d, vlm = _run([_page(MIXED)], (MIXED, 0))
+    assert d.called and not vlm.transcribe_page.called
+
+
+def test_scrambled_latin_routes_to_vlm():
+    _, d, vlm = _run([_page(MIXED)], (MIXED_REVERSED, 0))
+    assert d.called and vlm.transcribe_page.call_count == 1
+
+
+def test_scrambled_hebrew_routes_to_vlm():
+    # same Hebrew word count (completeness passes) but the words are not the page's
+    scrambled = " ".join(w[::-1] for w in PROSE.split())
+    _, d, vlm = _run([_page(PROSE)], (scrambled, 0))
+    assert d.called and vlm.transcribe_page.call_count == 1
+
+
+def test_empty_vlm_answer_is_retried_once():
+    out, _, vlm = _run([_page(HEB)], (HEB, 1), vlm_outputs=["", "| VLM table |"])
+    assert vlm.transcribe_page.call_count == 2 and "| VLM table |" in out
+
+
+def test_empty_vlm_answer_keeps_docling_text():
+    # e.g. Vertex blocks the page (content_filter) on both attempts
+    out, _, vlm = _run([_page(MIXED)], (MIXED_REVERSED, 0), vlm_outputs=["", ""])
+    assert vlm.transcribe_page.call_count == 2 and MIXED_REVERSED in out
+
+
+def test_empty_vlm_answer_on_image_page_leaves_page_empty():
+    # docling never saw an image page, so there is nothing to fall back to
+    out, _, vlm = _run([_page(PROSE), _page("", image=True)], (PROSE, 0), vlm_outputs=["", ""])
+    assert vlm.transcribe_page.call_count == 2 and "<!-- page 2 -->" in out
 
 
 def test_image_page_routes_to_vlm():
@@ -142,9 +222,9 @@ def test_scanned_page_is_not_number_checked():
 
 # -- page markers ------------------------------------------------------------------
 
-def test_pages_carry_original_page_numbers_across_dropped_pages():
-    # page 2 (English) is dropped; page 3 is a VLM table page -> markers 1 and 3, in order
-    out, _, _ = _run([_page(HEB), _page(ENG), _page(HEB)], (HEB, 0),
+def test_pages_carry_original_page_numbers_across_skipped_pages():
+    # page 2 (blank) is skipped -> markers 1 and 3, in order
+    out, _, _ = _run([_page(PROSE), _page(""), _page(PROSE)], (PROSE, 0),
                      vlm_outputs=None)
     assert out.startswith("<!-- page 1 -->")
     assert "<!-- page 2 -->" not in out and "<!-- page 3 -->" in out

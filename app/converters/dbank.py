@@ -4,8 +4,11 @@ Dbank path — the validated pipeline for Hebrew banking-regulation PDFs.
 Encodes, per page, the routing we benchmarked on 368_8.pdf and validated on the
 critical 224-page Bank Hapoalim report (duah_hapoalim.pdf):
 
-1. PREFILTER (PyMuPDF char-ratio): keep Hebrew-dominant pages, drop the
-   English-appendix noise. Dropped pages are logged (never silent).
+1. EVERY PAGE WITH TEXT IS KEPT, whatever its language. Only pages with an empty
+   text layer and no figure are skipped (logged). A page whose text layer is
+   unreadable (broken font encoding: mostly control characters) goes to the VLM.
+   There used to be a Hebrew-ratio prefilter here; it emptied English PDFs and
+   dropped Hebrew pages heavy with English terms (46-48% Hebrew).
 2. TABLE DETECTION via docling's layout model. A single cheap docling pass
    (``do_table_structure=False``, ~0.7s/page on 1-CPU) already reports table
    regions in ``document.tables`` — TableFormer (2–4s/page) is NOT needed just
@@ -20,11 +23,20 @@ critical 224-page Bank Hapoalim report (duah_hapoalim.pdf):
    COMPLETENESS GUARD: if docling captured < ``completeness_min`` of the page's
    text-layer Hebrew words, fall back to the VLM. This is the check that caught
    kreuzberg silently dropping ~60% of text on most pages.
+   A PRECISION GUARD covers the opposite failure: on pages mixing Hebrew and
+   Latin script docling can scramble words (reversed Latin words such as
+   "edocinU", Hebrew split apart at its vowel marks). If fewer than
+   ``precision_min`` of docling's words, per script, exist on the page's text
+   layer, the page goes to the VLM.
 5. NUMBER CHECK on VLM pages that have a text layer: every number >= 1000 the
    VLM writes must be on the page (see number_check.py). A page that fails is
    transcribed once more; if the better attempt still fails it is kept, logged,
    and tagged with an HTML comment listing the numbers, so the flag travels with
    the page into chunks.
+6. EMPTY VLM ANSWER: Vertex can block a harmless page outright (finish reason
+   content_filter, promptFeedback SAFETY, not switchable via safety_settings).
+   The page is asked once more; if it is still empty, a page docling already
+   converted keeps docling's text rather than vanishing.
 
 The docling converter and one VLM client are built once per conversion and
 reused across pages.
@@ -47,13 +59,21 @@ from .number_check import not_on_page, page_numbers
 logger = logging.getLogger(__name__)
 
 _HEB = re.compile(r"[֐-׿]+")
-_MIN_HEB_RATIO = 0.5      # prefilter: keep pages at least this Hebrew
 _COMPLETENESS_MIN = 0.85  # docling must capture >= this fraction of text-layer words
+# Of docling's words (per script), at least this fraction must exist on the text layer.
+# Measured on 73 sample pages: scrambled pages 0.00 and 0.77, every clean page >= 0.94.
+_PRECISION_MIN = 0.85
+_PRECISION_MIN_WORDS = 10  # a script with fewer words in docling's output is not judged
+_LAT_WORD = re.compile(r"[A-Za-z]{3,}")
+_DOCLING_PLACEHOLDER = re.compile(r"<!--.*?-->", re.S)  # e.g. <!-- formula-not-decoded -->
 _SCANNED_MAX_CHARS = 50   # avg text-layer chars/page below this => treat doc as scanned
 _IMAGE_MIN_AREA_FRAC = 0.10  # a page image covering >= this fraction routes to VLM
+# Text layers from a broken font encoding are mostly C0 control characters (measured
+# 0.82-0.95 on such pages, <= 0.04 on every readable page of the sample set).
+_UNREADABLE_CTRL_RATIO = 0.20
 _VLM_CONCURRENCY = int(os.getenv("DBANK_VLM_CONCURRENCY", "8"))  # parallel VLM page calls
 _PAGE_SEP = "\n\n---\n\n"
-# Each kept page starts with its ORIGINAL 1-based page number. Dropped (non-Hebrew)
+# Each kept page starts with its ORIGINAL 1-based page number. Skipped (blank)
 # pages leave gaps, so counting separators cannot recover page numbers; templates use
 # the marker for citations and to align the text with an outline built from the PDF.
 _PAGE_MARK = "<!-- page {} -->"
@@ -61,6 +81,33 @@ _PAGE_MARK = "<!-- page {} -->"
 
 def _heb_word_count(text: str) -> int:
     return sum(1 for t in _HEB.findall(text) if len(t) >= 2)
+
+
+def _word_precision(md: str, text: str) -> float:
+    """Lowest share, over Hebrew and Latin, of docling's words found on the text layer.
+
+    Scrambled output (reversed or split words) is made of words the page does not
+    contain. Docling's own placeholder comments are not page words, so they are
+    removed first.
+    """
+    md = _DOCLING_PLACEHOLDER.sub(" ", md)
+    worst = 1.0
+    for words in (
+        lambda t: [w for w in _HEB.findall(t) if len(w) >= 2],
+        _LAT_WORD.findall,
+    ):
+        out = words(md)
+        if len(out) >= _PRECISION_MIN_WORDS:
+            ref = set(words(text))
+            worst = min(worst, sum(w in ref for w in out) / len(out))
+    return worst
+
+
+def _control_ratio(text: str) -> float:
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return 0.0
+    return sum(ord(c) < 32 for c in chars) / len(chars)
 
 
 def _heb_ratio(text: str) -> float:
@@ -74,7 +121,7 @@ def _heb_ratio(text: str) -> float:
     name="dbank",
     label="Dbank (Hebrew pipeline)",
     description=(
-        "Hebrew banking-doc pipeline: PyMuPDF prefilter (drop non-Hebrew pages) -> "
+        "Hebrew banking-doc pipeline: "
         "docling for prose + docling-detected table/image pages to a parallel VLM "
         "(gemini), with a per-page completeness guard that falls back to the VLM "
         "when docling drops text."
@@ -83,15 +130,13 @@ def _heb_ratio(text: str) -> float:
 class DbankConverter(PDFConverter):
     def __init__(
         self,
-        prefilter: bool = True,
-        min_heb_ratio: float = _MIN_HEB_RATIO,
         completeness_min: float = _COMPLETENESS_MIN,
+        precision_min: float = _PRECISION_MIN,
         scanned_max_chars: int = _SCANNED_MAX_CHARS,
         vlm_concurrency: int = _VLM_CONCURRENCY,
     ) -> None:
-        self._prefilter = prefilter
-        self._min_heb = min_heb_ratio
         self._completeness_min = completeness_min
+        self._precision_min = precision_min
         self._scanned_max_chars = scanned_max_chars
         self._vlm_concurrency = max(1, vlm_concurrency)
         self._docling = None
@@ -178,6 +223,8 @@ class DbankConverter(PDFConverter):
     def _transcribe_checked(self, img_b64: str, ref, page_index: int) -> str:
         """Transcribe a page; if it has numbers the page does not, try once more."""
         md = self._vlm.transcribe_page(img_b64)
+        if not md.strip():
+            md = self._vlm.transcribe_page(img_b64)  # a provider block is intermittent
         if ref is None:
             return md
         bad = not_on_page(md, ref)
@@ -200,20 +247,22 @@ class DbankConverter(PDFConverter):
     def convert(self, pdf_path: Path) -> str:
         self.validate_path(pdf_path)
 
-        # Each kept page becomes ["md", text, page] (final) or ["vlm", img_b64, ref, page]
+        # Each kept page becomes ["md", text, page] (final) or
+        # ["vlm", img_b64, ref, page, docling_md] (docling_md: kept if the VLM answers
+        # empty; None for pages docling never saw)
         # (pending parallel transcription; ref = the page's numbers to check the
         # transcription against, None when there is nothing to check). Order is
         # preserved for the final join.
         slots: list[list] = []
-        dropped: list[int] = []
+        blank: list[int] = []
         n_docling = 0
 
         with fitz.open(str(pdf_path)) as doc:
             total = doc.page_count
 
-            # Scanned-doc guard: the prefilter and completeness guard both read the
-            # text layer, so a scanned PDF (no text layer) would score heb_ratio 0
-            # on every page and be dropped entirely. Detect a near-empty text layer
+            # Scanned-doc guard: routing and the completeness guard both read the
+            # text layer, so a scanned PDF (no text layer) would have every page
+            # skipped as blank. Detect a near-empty text layer
             # up-front and route every page to the VLM (which reads the rendered image).
             avg_text = (sum(len(doc[i].get_text().strip()) for i in range(total)) / total
                         ) if total else 0.0
@@ -224,20 +273,22 @@ class DbankConverter(PDFConverter):
                     "scanned, routing all %d pages to VLM", pdf_path.name, avg_text, total,
                 )
 
-            # Phase 1 (serial, CPU): prefilter, docling detection + prose, render
-            # VLM-bound pages. fitz/docling run on the main thread only.
+            # Phase 1 (serial, CPU): docling detection + prose, render VLM-bound
+            # pages. fitz/docling run on the main thread only.
             for i in range(total):
                 page = doc[i]
                 text = page.get_text()
 
-                if not scanned and self._prefilter and _heb_ratio(text) < self._min_heb:
-                    dropped.append(i)
+                if (scanned or self._has_significant_image(page)
+                        or _control_ratio(text) >= _UNREADABLE_CTRL_RATIO):
+                    # No check: a scanned page has no text layer, figures in an
+                    # image page carry numbers the text layer does not have, and an
+                    # unreadable text layer has no trustworthy numbers.
+                    slots.append(["vlm", self._render(page), None, i, None])
                     continue
 
-                if scanned or self._has_significant_image(page):
-                    # No check: a scanned page has no text layer, and figures in an
-                    # image page carry numbers the text layer does not have.
-                    slots.append(["vlm", self._render(page), None, i])
+                if not text.strip():
+                    blank.append(i)
                     continue
 
                 tmp = self._write_page(doc, i)
@@ -247,7 +298,7 @@ class DbankConverter(PDFConverter):
                     tmp.unlink(missing_ok=True)
 
                 if n_tables > 0:
-                    slots.append(["vlm", self._render(page), page_numbers(page), i])
+                    slots.append(["vlm", self._render(page), page_numbers(page), i, md])
                     continue
 
                 ref_words = _heb_word_count(text)
@@ -256,7 +307,13 @@ class DbankConverter(PDFConverter):
                         "dbank: docling dropped text on page %d (%d/%d Hebrew words) "
                         "— VLM fallback", i, _heb_word_count(md), ref_words,
                     )
-                    slots.append(["vlm", self._render(page), page_numbers(page), i])
+                    slots.append(["vlm", self._render(page), page_numbers(page), i, md])
+                elif (precision := _word_precision(md, text)) < self._precision_min:
+                    logger.warning(
+                        "dbank: docling scrambled words on page %d (%.0f%% found on the "
+                        "page) — VLM fallback", i, precision * 100,
+                    )
+                    slots.append(["vlm", self._render(page), page_numbers(page), i, md])
                 else:
                     slots.append(["md", md, i])
                     n_docling += 1
@@ -267,15 +324,22 @@ class DbankConverter(PDFConverter):
                 self._ensure_vlm()
                 workers = min(self._vlm_concurrency, len(vlm_slots))
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {ex.submit(self._transcribe_checked, *slots[k][1:]): k
+                    futs = {ex.submit(self._transcribe_checked, *slots[k][1:4]): k
                             for k in vlm_slots}
                     for fut in as_completed(futs):
                         k = futs[fut]
-                        slots[k] = ["md", fut.result(), slots[k][3]]
+                        md, page_i, docling_md = fut.result(), slots[k][3], slots[k][4]
+                        if not md.strip():
+                            logger.warning(
+                                "dbank: VLM returned nothing for page %d — %s", page_i,
+                                "keeping docling's text" if docling_md else "page left empty",
+                            )
+                            md = docling_md or ""
+                        slots[k] = ["md", md, page_i]
 
         logger.info(
-            "dbank %s: %d pages -> %d docling, %d vlm (x%d), %d dropped(non-Hebrew)%s",
+            "dbank %s: %d pages -> %d docling, %d vlm (x%d), %d blank skipped%s",
             pdf_path.name, total, n_docling, len(vlm_slots), self._vlm_concurrency,
-            len(dropped), f" {dropped[:30]}" if dropped else "",
+            len(blank), f" {blank[:30]}" if blank else "",
         )
         return _PAGE_SEP.join(f"{_PAGE_MARK.format(s[2] + 1)}\n\n{s[1]}" for s in slots)

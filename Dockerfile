@@ -203,6 +203,10 @@ RUN microdnf install -y \
 # them in the pinned layer. So this is a blanket update now, not a named list: a
 # named list only ever covers the errata somebody remembered to add to it, which
 # is a gate that fails quietly. The digest still pins what the build starts from.
+# Changes daily (build-and-push.sh passes the date) so this layer is rebuilt and new
+# errata land: a cached update layer kept pcre2 10.40-6 (three Highs) weeks after
+# Red Hat fixed it. Unset (enterprise CI) it is empty and nothing changes.
+ARG OS_UPDATE_DATE=
 RUN microdnf update -y \
  && microdnf clean all
 

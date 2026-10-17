@@ -31,6 +31,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(main.settings, "CONVERTED_FILES_DIR", str(tmp_path))
     monkeypatch.setattr(main, "latest_conversion_by_name", {})
     monkeypatch.setattr(main, "conversion_details_db", {})
+    monkeypatch.setattr(main, "conversion_status_db", {})
+    monkeypatch.setattr(main, "conversion_waiters", {})
+    monkeypatch.setattr(main, "_output_readers", {})
     with TestClient(main.app) as c:
         yield c, main, tmp_path
 
@@ -80,8 +83,19 @@ def _aged(path, days):
     os.utime(path, (past, past))
 
 
-def test_nothing_is_deleted_by_default(api):
+def test_by_default_an_unfetched_output_goes_after_a_day(api):
     _client, main, out = api
+    old, fresh = out / f"{'a' * 32}.md", out / f"{'b' * 32}.md"
+    for p in (old, fresh):
+        p.write_text("x", encoding="utf-8")
+    _aged(old, 2)
+    main._prune_converted_outputs()
+    assert not old.exists() and fresh.exists()
+
+
+def test_retention_zero_keeps_everything(api, monkeypatch):
+    _client, main, out = api
+    monkeypatch.setattr(main, "_CONVERTED_RETENTION_SECONDS", 0)
     old = out / f"{'a' * 32}.md"
     old.write_text("x", encoding="utf-8")
     _aged(old, 365)
@@ -93,12 +107,81 @@ def test_with_a_retention_only_old_internal_outputs_go(api, monkeypatch):
     _client, main, out = api
     monkeypatch.setattr(main, "_CONVERTED_RETENTION_SECONDS", 24 * 3600)
     old, fresh, legacy = out / f"{'a' * 32}.md", out / f"{'b' * 32}.md", out / "report.md"
-    for p in (old, fresh, legacy):
+    debug_upload = out / "debug_דוח.pdf"
+    for p in (old, fresh, legacy, debug_upload):
         p.write_text("x", encoding="utf-8")
     _aged(old, 3)
     _aged(legacy, 3)
+    _aged(debug_upload, 3)
 
     main._prune_converted_outputs()
 
-    assert not old.exists()
+    assert not old.exists() and not debug_upload.exists()
     assert fresh.exists() and legacy.exists()
+
+
+# --- the output is a hand-off: deleted once every waiting caller has fetched it ---
+
+def _complete(main, out, content, waiters=1):
+    """A job that finished through the result path, with `waiters` callers on it."""
+    cid = str(uuid.uuid4())
+    name = hashlib.md5(content.encode()).hexdigest() + ".md"
+    (out / name).write_text(content, encoding="utf-8")
+    main.conversion_status_db[cid] = "processing"
+    main.conversion_waiters[cid] = waiters
+    main._apply_result({"conversion_id": cid, "status": "completed", "output_file": name})
+    return cid, out / name
+
+
+def test_one_caller_reads_and_the_output_is_gone(api):
+    client, main, out = api
+    cid, path = _complete(main, out, "# one")
+    assert client.get(f"/convert/{cid}/content").json()["content"] == "# one"
+    assert not path.exists()
+    assert client.get(f"/convert/{cid}/content").status_code == 404   # the client re-submits
+
+
+def test_a_shared_conversion_stays_until_the_last_caller_reads(api):
+    client, main, out = api
+    cid, path = _complete(main, out, "# shared", waiters=2)
+    assert client.get(f"/convert/{cid}/content").status_code == 200
+    assert path.exists()
+    assert client.get(f"/convert/{cid}/content").status_code == 200
+    assert not path.exists()
+
+
+def test_identical_bytes_from_two_jobs_share_one_file(api):
+    client, main, out = api
+    a, path = _complete(main, out, "# same")
+    b, _ = _complete(main, out, "# same")
+    client.get(f"/convert/{a}/content")
+    assert path.exists()                       # job b has not fetched it yet
+    assert client.get(f"/convert/{b}/content").json()["content"] == "# same"
+    assert not path.exists()
+
+
+def test_a_caller_cancelling_a_finished_job_releases_its_read(api):
+    client, main, out = api
+    cid, path = _complete(main, out, "# left", waiters=2)
+    client.delete(f"/convert/{cid}")
+    assert path.exists()
+    client.get(f"/convert/{cid}/content")
+    assert not path.exists()
+
+
+def test_the_legacy_name_route_also_releases(api):
+    client, main, out = api
+    cid, path = _complete(main, out, "# legacy")
+    main.latest_conversion_by_name["deck.pptx"] = cid
+    assert client.get("/converted/deck.pptx").json()["content"] == "# legacy"
+    assert not path.exists()
+
+
+def test_a_debug_upload_is_removed_when_its_job_ends(api):
+    _client, main, out = api
+    upload = out / "debug_report.pdf"
+    upload.write_bytes(b"%PDF")
+    cid = str(uuid.uuid4())
+    main.conversion_details_db[cid] = {"debug_input": str(upload)}
+    main._apply_result({"conversion_id": cid, "status": "completed", "output_file": "a" * 32 + ".md"})
+    assert not upload.exists()

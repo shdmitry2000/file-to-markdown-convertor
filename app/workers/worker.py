@@ -963,13 +963,13 @@ def _output_identity(file_path: str, converter_type: str) -> tuple[str, str]:
     bytes + same settings → same name, so a re-conversion rewrites its own file.
     The original name lives in the file's frontmatter (`source_file`).
     """
-    digest = hashlib.md5()
+    digest = hashlib.md5(usedforsecurity=False)
     with open(file_path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             digest.update(block)
     source_md5 = digest.hexdigest()
     settings_key = f"{converter_type}|ocr={_read_do_ocr()}|tables={_read_do_table_structure()}"
-    output_id = hashlib.md5(f"{source_md5}|{settings_key}".encode()).hexdigest()
+    output_id = hashlib.md5(f"{source_md5}|{settings_key}".encode(), usedforsecurity=False).hexdigest()
     return source_md5, output_id
 
 

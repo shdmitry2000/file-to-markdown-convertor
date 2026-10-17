@@ -258,7 +258,9 @@ def test_debug_convert_creates_a_missing_converted_dir(client, tmp_path, monkeyp
     monkeypatch.setattr(main, "enqueue_task", no_worker)
     r = client.post("/debug/convert", files={"file": ("doc.pdf", b"%PDF-1.4 test", "application/pdf")})
     assert r.status_code != 500
-    assert (missing / "debug_doc.pdf").read_bytes() == b"%PDF-1.4 test"
+    assert missing.is_dir()
+    # No worker took it, so the temporary upload is not left behind.
+    assert not (missing / "debug_doc.pdf").exists()
 
 
 def test_debug_convert_without_waiting_returns_the_id_at_once(monkeypatch, tmp_path):

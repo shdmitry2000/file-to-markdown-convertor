@@ -147,6 +147,11 @@ latest_conversion_by_name: Dict[str, str] = {}
 # ingest must not stop the conversion another space is still waiting for. Only the
 # LAST waiter to leave cancels the work.
 conversion_waiters: Dict[str, int] = {}
+# output file name -> callers that have not fetched it yet. The output is a hand-off,
+# not an archive: the caller stores its own copy, so the file is deleted once the
+# last caller has read it (see _release_output). Keyed by FILE, not job: two jobs
+# for identical bytes write the same <md5>.md.
+_output_readers: Dict[str, int] = {}
 last_completion_timestamp = time.time()  # Track last successful conversion
 
 # In-memory database for chunking tasks
@@ -293,7 +298,15 @@ def _apply_result(result: dict) -> None:
                 del active_conversions_db[conversion_id]
             if conversion_id in pending_conversions_db:
                 del pending_conversions_db[conversion_id]
-            conversion_waiters.pop(conversion_id, None)
+            waiters = conversion_waiters.pop(conversion_id, None)
+            output_file = result.get("output_file")
+            if waiters and isinstance(output_file, str) and _CONVERSION_OUTPUT.match(output_file):
+                _output_readers[output_file] = _output_readers.get(output_file, 0) + waiters
+            # A /debug/convert upload is a temporary copy of the input: the job is
+            # over, so nothing reads it again.
+            debug_input = (conversion_details_db.get(conversion_id) or {}).get("debug_input")
+            if debug_input:
+                _unlink_quietly(debug_input)
             # Finished, so it can no longer be shared by a new caller.
             for key, cid in list(inflight_conversions.items()):
                 if cid == conversion_id:
@@ -476,6 +489,8 @@ async def cancel_conversion(conversion_id: str):
     current_status = conversion_status_db[conversion_id]
     if current_status in ["completed", "success", "failed"]:
         logger.info(f"Conversion {conversion_id} already finished with status: {current_status}")
+        # This caller leaves without fetching the output: one reader fewer.
+        _release_output(conversion_id)
         return {"conversion_id": conversion_id, "status": current_status, "message": "Already finished"}
 
     # One conversion can be shared by several callers (see inflight_conversions).
@@ -502,11 +517,39 @@ async def cancel_conversion(conversion_id: str):
     return {"conversion_id": conversion_id, "status": "cancelled"}
 
 
-#: Hours a <conversion_id>.md output is kept; 0 (the default) keeps it forever.
-#: The templates own their converted markdown and its lifecycle (their manifest);
-#: this is only an opt-in safety net for the service's own hand-off directory.
-_CONVERTED_RETENTION_SECONDS = float(os.getenv("CONVERTED_FILES_RETENTION_HOURS", "0")) * 3600
+#: Hours an output nobody fetched is kept (a caller that died or timed out, a
+#: /debug result); 0 keeps it forever. A fetched output is deleted at once — the
+#: templates own their converted markdown (their manifest); this directory is only
+#: the service's hand-off, and it holds every space's document text.
+_CONVERTED_RETENTION_SECONDS = float(os.getenv("CONVERTED_FILES_RETENTION_HOURS", "24")) * 3600
 _CONVERSION_OUTPUT = re.compile(r"^[0-9a-f]{32}\.md$")
+#: What the prune may remove: internal outputs and leftover /debug uploads.
+_PRUNABLE = re.compile(r"^(?:[0-9a-f]{32}\.md|debug_.+)$")
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        logger.debug("remove %s: %s", path, exc)
+
+
+def _release_output(conversion_id: Optional[str]) -> None:
+    """One caller is done with this job's output; delete it when it was the last.
+
+    An output with no count recorded (the API restarted, or it was read before the
+    result arrived here) counts as one reader. Never raises.
+    """
+    path = _output_path(conversion_id)
+    if path is None:
+        return
+    name = os.path.basename(path)
+    left = _output_readers.get(name, 1) - 1
+    if left > 0:
+        _output_readers[name] = left
+        return
+    _output_readers.pop(name, None)
+    _unlink_quietly(path)
 
 
 def _prune_converted_outputs() -> None:
@@ -516,7 +559,7 @@ def _prune_converted_outputs() -> None:
     cutoff = time.time() - _CONVERTED_RETENTION_SECONDS
     try:
         for entry in os.scandir(settings.CONVERTED_FILES_DIR):
-            if _CONVERSION_OUTPUT.match(entry.name) and entry.stat().st_mtime < cutoff:
+            if _PRUNABLE.match(entry.name) and entry.stat().st_mtime < cutoff:
                 os.unlink(entry.path)
     except OSError as exc:
         logger.debug("prune converted outputs: %s", exc)
@@ -547,7 +590,9 @@ async def get_conversion_content(conversion_id: str):
     path = _output_path(conversion_id)
     if path is None:
         raise HTTPException(status_code=404, detail="Converted file not found")
-    return _read_converted(path)
+    content = _read_converted(path)
+    _release_output(conversion_id)
+    return content
 
 
 @app.get("/converted/{file_path:path}")
@@ -556,9 +601,12 @@ async def get_converted_file(file_path: str):
     logger.info(f"Request to retrieve converted file: {file_path}")
     converted_dir = settings.CONVERTED_FILES_DIR
     name = os.path.basename(file_path)
-    latest = _output_path(latest_conversion_by_name.get(name))
+    latest_id = latest_conversion_by_name.get(name)
+    latest = _output_path(latest_id)
     if latest and os.path.exists(latest):
-        return _read_converted(latest)
+        content = _read_converted(latest)
+        _release_output(latest_id)
+        return content
     # Pre-id outputs were <stem>.md for EVERY source type (the old extension list
     # left out .pptx, .csv, images, so those always 404'd here).
     base, ext = os.path.splitext(file_path)
@@ -623,12 +671,14 @@ async def debug_convert_file(
     try:
         enqueue_task(task)
     except WorkerUnavailable:
+        _unlink_quietly(str(temp_path))
         raise _no_worker_error()
     conversion_status_db[conversion_id] = "pending"
     conversion_details_db[conversion_id] = {
         "filename": file.filename,
         "file_size": file_size,
-        "started_at": start_time
+        "started_at": start_time,
+        "debug_input": str(temp_path),
     }
     pending_conversions_db[conversion_id] = {
         "filename": file.filename,

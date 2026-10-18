@@ -34,6 +34,12 @@ dependencies = [
 ]
 
 [tool.uv]
+# Xray (1.4.4.1): fixed versions sit above upstream caps -- docling pins
+# pillow<13 and litellm pins filelock<4 -- so they are overridden, not constrained.
+override-dependencies = [
+    "pillow>=13.0.0",
+    "filelock>=4.2.1",
+]
 constraint-dependencies = [
     "aiohttp>=3.14.4",
     "cryptography>=50.0.0",

@@ -7,7 +7,7 @@ import fitz
 from app.converters.vlm import VLMConverter
 from app.converters.dbank import _heb_ratio
 
-SRC = "/Users/dmitrysh/code/rag/rag_eval_bank/files_to_check/368_8.pdf"
+SRC = "/Users/dmitrysh/code/rag/rag_eval_bank/files_to_check/nabats/368_8.pdf"
 PAGES = [10, 40, 80]  # spread: Hebrew-region + English API-table appendix
 print("VLM_MODEL =", os.environ["VLM_MODEL"])
 

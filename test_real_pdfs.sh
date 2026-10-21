@@ -52,11 +52,11 @@ mkdir -p converted_files
 echo "   Copying test PDFs..."
 
 # Copy 439.pdf
-if [ -f "../files_to_check/439.pdf" ]; then
-    cp "../files_to_check/439.pdf" files_to_convert/
+if [ -f "../files_to_check/nabats/439.pdf" ]; then
+    cp "../files_to_check/nabats/439.pdf" files_to_convert/
     echo -e "${GREEN}   ✅ Copied 439.pdf${NC}"
 else
-    echo -e "${RED}   ❌ 439.pdf not found at ../files_to_check/439.pdf${NC}"
+    echo -e "${RED}   ❌ 439.pdf not found at ../files_to_check/nabats/439.pdf${NC}"
     exit 1
 fi
 

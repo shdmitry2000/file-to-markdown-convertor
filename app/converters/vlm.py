@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -54,9 +55,17 @@ _DEFAULT_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "32000"))
 # no thought output); on 2.5-class models it drops the thinking budget to 0.
 _DEFAULT_REASONING_EFFORT = os.getenv("VLM_REASONING_EFFORT", "disable")
 
-# Retry settings for timed-out VLM calls.
+# Retry settings for timed-out (or 5xx) VLM calls.
 _MAX_RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY_S = 1.0  # seconds; doubles each attempt (1 s, 2 s, 4 s)
+
+# A rate limit (429 / RESOURCE_EXHAUSTED) is waited out instead: retrying after 1 s and
+# 2 s only adds to the load, and dbank runs several page calls at once, so a throttled
+# minute used to abort whole documents. Doubles from the base, with jitter so parallel
+# page calls do not come back together, capped; Retry-After wins when the provider sends it.
+_RATE_LIMIT_ATTEMPTS = int(os.getenv("VLM_RATE_LIMIT_ATTEMPTS", "8"))
+_RATE_LIMIT_BASE_DELAY_S = float(os.getenv("VLM_RATE_LIMIT_BASE_SECONDS", "10"))
+_RATE_LIMIT_MAX_DELAY_S = float(os.getenv("VLM_RATE_LIMIT_MAX_SECONDS", "120"))
 
 
 @register_converter(
@@ -139,14 +148,12 @@ class VLMConverter(PDFConverter):
                     "VLM_MODEL to a vertex_ai or gemini model."
                 )
             self._model = getattr(self._client, "_model", "factory")
-            self._retry_exc: tuple = (Exception,)
             logger.info("VLMConverter backend=factory model=%s", self._model)
             return
 
-        from openai import OpenAI, APITimeoutError
+        from openai import OpenAI
 
         self._model = model
-        self._retry_exc = (APITimeoutError,)
         # If a shared client is supplied its timeout settings apply.
         # Otherwise use a conservative per-request timeout.
         client_kwargs: dict = dict(base_url=base_url, api_key=api_key)
@@ -258,29 +265,57 @@ class VLMConverter(PDFConverter):
         return self._transcribe_page_with_retry(img_b64)
 
     def _transcribe_page_with_retry(self, img_b64: str) -> str:
-        """Call ``_transcribe_page`` with exponential back-off on timeout.
+        """Call ``_transcribe_page``, retrying what another attempt can fix.
 
-        On final timeout the exception is re-raised so the caller can decide
-        whether to mark the page as failed or abort the entire conversion.
+        A rate limit waits (long, see ``_RATE_LIMIT_*``); a timeout, a 5xx or an error
+        with no status retries briefly (``_MAX_RETRY_ATTEMPTS``); a 4xx other than 429
+        fails at once. The last error is re-raised so the caller can decide whether to
+        mark the page as failed or abort the entire conversion.
         """
-        last_exc: Exception | None = None
-        for attempt in range(_MAX_RETRY_ATTEMPTS):
+        attempt = 0
+        while True:
             try:
                 return self._transcribe_page(img_b64)
-            except self._retry_exc as exc:
-                last_exc = exc
-                if attempt < _MAX_RETRY_ATTEMPTS - 1:
-                    delay = _RETRY_BASE_DELAY_S * (2 ** attempt)
-                    logger.warning(
-                        "VLM page call timed out (attempt %d/%d), retrying in %.0fs",
-                        attempt + 1,
-                        _MAX_RETRY_ATTEMPTS,
-                        delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    logger.error(
-                        "VLM page call timed out after %d attempts — aborting conversion",
-                        _MAX_RETRY_ATTEMPTS,
-                    )
-        raise last_exc  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001 - classified below
+                kind = _classify(exc)
+                if kind == "client error":
+                    raise
+                attempt += 1
+                budget = _RATE_LIMIT_ATTEMPTS if kind == "rate limited" else _MAX_RETRY_ATTEMPTS
+                detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+                if attempt >= budget:
+                    logger.error("VLM page call %s after %d attempts — aborting conversion (%s)",
+                                 kind, attempt, detail)
+                    raise
+                delay = (_rate_limit_delay(exc, attempt) if kind == "rate limited"
+                         else _RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
+                logger.warning("VLM page call %s (attempt %d/%d), retrying in %.0fs (%s)",
+                               kind, attempt, budget, delay, detail)
+                time.sleep(delay)
+
+
+def _classify(exc: Exception) -> str:
+    """"rate limited", "client error" (no retry) or "failed" (a timeout, a 5xx, unknown).
+
+    By status code and name, so openai's and litellm's exception classes both fit.
+    """
+    status = getattr(exc, "status_code", None)
+    text = str(exc)
+    if (status == 429 or "RESOURCE_EXHAUSTED" in text or "RateLimit" in type(exc).__name__
+            or "rate limit" in text.lower()):
+        return "rate limited"
+    if isinstance(status, int) and 400 <= status < 500 and status != 408:
+        return "client error"
+    return "timed out" if "timeout" in type(exc).__name__.lower() else "failed"
+
+
+def _rate_limit_delay(exc: Exception, attempt: int) -> float:
+    """Retry-After when the provider sends one, else doubling from the base with jitter."""
+    headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+    try:
+        after = float(headers.get("retry-after") or headers.get("Retry-After") or "")
+        return min(after, _RATE_LIMIT_MAX_DELAY_S)
+    except (TypeError, ValueError):
+        pass
+    delay = min(_RATE_LIMIT_BASE_DELAY_S * (2 ** (attempt - 1)), _RATE_LIMIT_MAX_DELAY_S)
+    return delay * random.uniform(0.5, 1.0)

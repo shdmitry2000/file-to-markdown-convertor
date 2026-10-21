@@ -328,7 +328,7 @@ not count):
 | `INGEST_CONVERT_TIMEOUT_SECONDS` (templates) | `0` | No outer clock unless the client cap above is set. |
 
 `GET /convert/{id}` reports `elapsed_seconds` and, for docling, `pages_done`.
-`POST /debug/convert` takes `wait=false` to return the id at once — the UI polls,
+`POST /debug/convert` returns the id at once (`wait=false` is the default) — callers poll,
 because a single held request is cut by proxies (an OpenShift Route at 30 s, Node
 fetch at 300 s) long before a large PDF finishes.
 

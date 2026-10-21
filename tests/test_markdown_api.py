@@ -279,6 +279,25 @@ def test_debug_convert_without_waiting_returns_the_id_at_once(monkeypatch, tmp_p
     assert s["status"] == "pending" and "elapsed_seconds" in s
 
 
+def test_debug_convert_does_not_wait_by_default(monkeypatch, tmp_path):
+    """A caller that leaves `wait` out must not hold the request for the whole
+    conversion — an OCP Route would cut it at 30 s."""
+    from fastapi.testclient import TestClient
+    import app.api.main as m
+
+    monkeypatch.setattr(m, "get_converted_files_dir", lambda: tmp_path)
+    monkeypatch.setattr(m, "enqueue_task", lambda task: None)
+
+    async def no_polling(_seconds):  # the wait loop would sleep; fail instead of hanging
+        raise AssertionError("/debug/convert waited although wait was not sent")
+
+    monkeypatch.setattr(m.asyncio, "sleep", no_polling)
+    r = TestClient(m.app).post("/debug/convert", files={"file": ("big.pdf", b"%PDF-1.4 x")})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "pending" and body["conversion_id"]
+
+
 def test_worker_updates_keep_the_request_details():
     """A polling caller fetches the result after the worker reported: the filename and
     start time recorded at upload must survive the worker's status messages."""

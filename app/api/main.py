@@ -631,7 +631,7 @@ async def get_converted_file(file_path: str):
 async def debug_convert_file(
     file: UploadFile = File(...),
     converter_type: Optional[str] = Form(None),
-    wait: bool = Form(True),
+    wait: bool = Form(False),
 ):
     """Upload a document and test conversion with timing.
 
@@ -639,10 +639,12 @@ async def debug_convert_file(
     would pick (PDF → docling, .xlsx/.xlsm → excel, .xls → markitdown). Pass
     `converter_type` to force a specific one.
 
-    ``wait=false`` returns as soon as the job is queued; poll ``GET /convert/{id}``
-    and fetch ``/debug/conversion/{id}/result``. A large PDF takes minutes on CPU
-    (61 pages ≈ 5 min), longer than any proxy in front of a single held request
-    allows (an OpenShift Route cuts at 30 s), so the UI must not wait inline.
+    Returns as soon as the job is queued (the default, ``wait=false``); poll
+    ``GET /convert/{id}`` and fetch ``/debug/conversion/{id}/result``. A large PDF
+    takes minutes on CPU (61 pages ≈ 5 min), longer than any proxy in front of a
+    single held request allows (an OpenShift Route cuts at 30 s), so no caller should
+    wait inline. ``wait=true`` holds the request until done (up to 10 min) — only
+    for a direct call that no proxy sits in front of.
     """
     logger.info(f"Debug conversion request for file: {file.filename}")
     start_time = time.time()

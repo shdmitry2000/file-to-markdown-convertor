@@ -1,5 +1,6 @@
 import zmq
 import socket
+from app.converters.image_ids import annotate_images
 import json
 import os
 import time
@@ -254,7 +255,7 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
                 }
             )
             result = converter.convert(file_path)
-            markdown = result.document.export_to_markdown()
+            markdown = annotate_images(result.document.export_to_markdown(), result.document)
             num_pages = result.document.num_pages()
             doc_name = repr(result.document.name)
             doc_origin = repr(result.document.origin)
@@ -467,7 +468,7 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
         file_path = job
         try:
             result = converter.convert(file_path)
-            markdown = result.document.export_to_markdown()
+            markdown = annotate_images(result.document.export_to_markdown(), result.document)
             num_pages = result.document.num_pages()
             doc_name = repr(result.document.name)
             doc_origin = repr(result.document.origin)

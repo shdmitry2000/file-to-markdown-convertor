@@ -49,4 +49,5 @@ class DoclingConverter(PDFConverter):
         )
         
         result = converter.convert(str(pdf_path))
-        return result.document.export_to_markdown()
+        from .image_ids import annotate_images
+        return annotate_images(result.document.export_to_markdown(), result.document)

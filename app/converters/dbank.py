@@ -144,7 +144,7 @@ class DbankConverter(PDFConverter):
 
     # -- lazily-built, reused engines --------------------------------------
 
-    def _docling_convert(self, pdf_path: str) -> tuple[str, int]:
+    def _docling_convert(self, pdf_path: str, page: int | None = None) -> tuple[str, int]:
         """Convert one page and report how many table regions docling detected.
 
         Returns ``(markdown, n_tables)``. do_table_structure stays False: the
@@ -175,7 +175,9 @@ class DbankConverter(PDFConverter):
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
             )
         doc = self._docling.convert(pdf_path).document
-        return doc.export_to_markdown(), len(getattr(doc, "tables", []) or [])
+        from .image_ids import annotate_images
+        # One page at a time: docling sees page 1, the caller knows the real one.
+        return annotate_images(doc.export_to_markdown(), doc, page=page), len(getattr(doc, "tables", []) or [])
 
     def _ensure_vlm(self) -> None:
         if self._vlm is None:
@@ -293,7 +295,7 @@ class DbankConverter(PDFConverter):
 
                 tmp = self._write_page(doc, i)
                 try:
-                    md, n_tables = self._docling_convert(str(tmp))
+                    md, n_tables = self._docling_convert(str(tmp), page=i + 1)
                 finally:
                     tmp.unlink(missing_ok=True)
 

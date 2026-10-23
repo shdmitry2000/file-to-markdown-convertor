@@ -219,3 +219,18 @@ def get_converted_files_dir() -> Path:
     path = Path(get_settings().CONVERTED_FILES_DIR)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def configure_litellm_logging() -> None:
+    """One copy of each LiteLLM log line, at LITELLM_LOG (default WARNING).
+
+    LiteLLM writes through its own handler AND propagates to the root handler, so
+    every line came out twice — and at INFO that was ~4 lines per VLM page call.
+    The level goes on the logger (LiteLLM itself only sets it on its handler, which
+    the root copy ignores). Call after logging.basicConfig.
+    """
+    import logging
+
+    lg = logging.getLogger("LiteLLM")
+    lg.setLevel(os.getenv("LITELLM_LOG", "WARNING").upper())
+    lg.propagate = False

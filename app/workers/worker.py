@@ -17,7 +17,7 @@ import hashlib
 
 # Import configuration
 from app.cancellation import ConversionCancelled, is_cancelled
-from app.config import get_converted_files_dir, get_settings
+from app.config import configure_litellm_logging, get_converted_files_dir, get_settings
 from app.zmq_keepalive import apply_keepalive
 
 # Import chunkers to trigger @register_chunker decorators
@@ -127,6 +127,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+configure_litellm_logging()
 
 # Load settings
 settings = get_settings()

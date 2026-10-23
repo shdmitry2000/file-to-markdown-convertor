@@ -182,9 +182,12 @@ class DbankConverter(PDFConverter):
     def _ensure_vlm(self) -> None:
         if self._vlm is None:
             from .vlm import VLMConverter
-            # temperature=0.0: table pages carry financial numbers, so decode
-            # deterministically — no sampling, minimal risk of a hallucinated digit.
-            self._vlm = VLMConverter(backend="factory", temperature=0.0)  # model via VLM_MODEL env
+            # Temperature from VLM_TEMPERATURE (unset = model default). It was pinned
+            # to 0.0 for the financial numbers; on Gemini 3 that only drew a warning
+            # per call: an A/B on Hebrew bank-report table pages found the model
+            # default as exact on digits (recall 0.998-1.0, no invented numbers)
+            # and faster.
+            self._vlm = VLMConverter(backend="factory")  # model via VLM_MODEL env
 
     @staticmethod
     def _render(page) -> str:

@@ -55,6 +55,13 @@ _DEFAULT_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "32000"))
 # no thought output); on 2.5-class models it drops the thinking budget to 0.
 _DEFAULT_REASONING_EFFORT = os.getenv("VLM_REASONING_EFFORT", "disable")
 
+# Sampling temperature per page call. Unset/empty = not sent: the model's own
+# default (1.0 on Gemini 3, which Google recommends keeping — lower values there
+# risk repetition loops, and litellm warns on every call). Set a number (e.g. 0)
+# to pin it, for a model that is deterministic at 0 such as a local Ollama VLM.
+_TEMPERATURE_ENV = os.getenv("VLM_TEMPERATURE", "").strip()
+_DEFAULT_TEMPERATURE: Optional[float] = float(_TEMPERATURE_ENV) if _TEMPERATURE_ENV else None
+
 # Retry settings for timed-out (or 5xx) VLM calls.
 _MAX_RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY_S = 1.0  # seconds; doubles each attempt (1 s, 2 s, 4 s)
@@ -105,7 +112,7 @@ class VLMConverter(PDFConverter):
         model: str = "qwen3-vl:4b-instruct-q4_K_M",
         base_url: str = _DEFAULT_BASE_URL,
         api_key: str = "ollama",
-        temperature: float = 0.0,
+        temperature: Optional[float] = _DEFAULT_TEMPERATURE,
         user_prompt: Optional[str] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
         http_client: Optional[httpx.Client] = None,
@@ -232,9 +239,10 @@ class VLMConverter(PDFConverter):
         prompt_text = self._user_prompt if self._user_prompt else _PROMPT
         if self._backend == "factory":
             return self._transcribe_page_factory(img_b64, prompt_text)
+        sampling = {} if self._temperature is None else {"temperature": self._temperature}
         response = self._client.chat.completions.create(
             model=self._model,
-            temperature=self._temperature,
+            **sampling,
             max_tokens=self._max_tokens,
             messages=[
                 {

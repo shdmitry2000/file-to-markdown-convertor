@@ -46,7 +46,7 @@ from pathlib import Path
 
 import zmq
 
-from app.config import get_settings
+from app.config import configure_litellm_logging, get_settings
 
 # Import chunkers to trigger @register_chunker decorators.
 import app.chunkers  # noqa: F401
@@ -57,6 +57,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+configure_litellm_logging()
 
 
 def _handle_request(payload: bytes) -> dict:

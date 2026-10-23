@@ -25,11 +25,12 @@ logger = logging.getLogger(__name__)
 # Import configuration and registry
 from app.cancellation import clear_cancel, request_cancel
 from app.cancellation import sweep as sweep_cancel_markers
-from app.config import get_converted_files_dir, get_settings
+from app.config import configure_litellm_logging, get_converted_files_dir, get_settings
 from app.format_routes import converter_for
 from app.registry import registry
 from app.dispatch import Dispatcher, task_id
 from app.zmq_keepalive import apply_keepalive
+configure_litellm_logging()
 
 # Import all converters so their @register_converter decorators run
 import app.converters.pymupdf      # noqa: F401
@@ -418,6 +419,7 @@ async def convert_file(request: ConversionRequest):
     }
     latest_conversion_by_name[display_name] = conversion_id
     _prune_converted_outputs()
+    _prune_finished_records()
 
     task = {
         "conversion_id": conversion_id,
@@ -552,6 +554,35 @@ def _release_output(conversion_id: Optional[str]) -> None:
     _unlink_quietly(path)
 
 
+# Finished conversions (and chunk results) kept for status polls and by-name lookups,
+# oldest dropped first. These maps only ever grew: one entry per conversion and the
+# full chunk list per chunk task, for the life of the pod.
+_MAX_FINISHED_CONVERSIONS = 5000
+_MAX_FINISHED_CHUNKS = 200
+_FINISHED = ("completed", "success", "failed", "error", "cancelled")
+
+
+def _drop_oldest_finished(status_db: Dict[str, str], keep: int, *details_dbs: Dict) -> list:
+    """Drop the oldest finished ids beyond `keep` (dicts keep insertion order = age);
+    a pending or processing one is never dropped. Returns the dropped ids."""
+    finished = [k for k, v in status_db.items() if v in _FINISHED]
+    dropped = finished[: max(0, len(finished) - keep)]
+    for k in dropped:
+        status_db.pop(k, None)
+        for db in details_dbs:
+            db.pop(k, None)
+    return dropped
+
+
+def _prune_finished_records() -> None:
+    dropped = set(_drop_oldest_finished(
+        conversion_status_db, _MAX_FINISHED_CONVERSIONS, conversion_details_db))
+    if dropped:
+        for name in [n for n, cid in latest_conversion_by_name.items() if cid in dropped]:
+            del latest_conversion_by_name[name]
+    _drop_oldest_finished(chunk_status_db, _MAX_FINISHED_CHUNKS, chunk_results_db)
+
+
 def _prune_converted_outputs() -> None:
     """Delete md5-named outputs older than the retention (none when it is 0). Never raises."""
     if _CONVERTED_RETENTION_SECONDS <= 0:
@@ -675,6 +706,7 @@ async def debug_convert_file(
     except WorkerUnavailable:
         _unlink_quietly(str(temp_path))
         raise _no_worker_error()
+    _prune_finished_records()
     conversion_status_db[conversion_id] = "pending"
     conversion_details_db[conversion_id] = {
         "filename": file.filename,
@@ -1044,6 +1076,7 @@ async def submit_chunk_task(request: ChunkAsyncRequest):
         enqueue_task(task)
     except WorkerUnavailable:
         raise _no_worker_error()
+    _prune_finished_records()
     chunk_status_db[request.chunk_id] = "pending"
     
     logger.info(f"Submitted chunk task {request.chunk_id} for {request.file_path}")

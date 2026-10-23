@@ -126,7 +126,7 @@ class SlidesConverter(PDFConverter):
     def _ensure_vlm(self) -> None:
         if self._vlm is None:
             from .vlm import VLMConverter
-            self._vlm = VLMConverter(backend="factory", temperature=0.0, user_prompt=_SLIDE_PROMPT)
+            self._vlm = VLMConverter(backend="factory", user_prompt=_SLIDE_PROMPT)
 
     @staticmethod
     def _render(page) -> str:

@@ -60,6 +60,49 @@ def _cancel_marker_sweeper():
         time.sleep(interval)
 
 
+_FINISHED = ("completed", "success", "failed", "error", "cancelled")
+
+
+def abandon_unpolled(now: Optional[float] = None) -> list:
+    """Cancel unfinished jobs whose poll lease ran out. Returns their ids.
+
+    Cancelled the way the last caller's DELETE cancels: the marker stops a queued
+    job before it starts and a running one at the worker's next check. The waiter
+    count does not matter here — callers that stopped polling are gone, however
+    many said they wanted the job.
+    """
+    if _ABANDONED_SECONDS <= 0:
+        return []
+    now = time.time() if now is None else now
+    cancelled = []
+    for conversion_id, polled in list(last_polled_at.items()):
+        if now - polled <= _ABANDONED_SECONDS:
+            continue
+        if conversion_status_db.get(conversion_id) in _FINISHED or conversion_id not in conversion_status_db:
+            last_polled_at.pop(conversion_id, None)
+            continue
+        request_cancel(conversion_id)
+        conversion_status_db[conversion_id] = "cancelled"
+        conversion_waiters[conversion_id] = 0
+        last_polled_at.pop(conversion_id, None)
+        logger.warning("Conversion %s cancelled: nobody polled it for %.0fs (caller gone)",
+                       conversion_id, now - polled)
+        cancelled.append(conversion_id)
+    return cancelled
+
+
+def _abandoned_conversion_sweeper():
+    """Cancel jobs nobody waits for, every quarter lease (at least each minute).
+    Never raises: housekeeping that dies must not take conversions with it."""
+    interval = max(15.0, min(60.0, _ABANDONED_SECONDS / 4))
+    while True:
+        time.sleep(interval)
+        try:
+            abandon_unpolled()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("abandoned-conversion sweep failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages application lifespan events for startup and shutdown."""
@@ -87,6 +130,9 @@ async def lifespan(app: FastAPI):
     # Nothing else collects those, and they live on a shared volume.
     logger.info("Starting cancel-marker sweeper background thread.")
     threading.Thread(target=_cancel_marker_sweeper, daemon=True).start()
+    if _ABANDONED_SECONDS > 0:
+        logger.info("Starting abandoned-conversion sweeper (lease %.0fs).", _ABANDONED_SECONDS)
+        threading.Thread(target=_abandoned_conversion_sweeper, daemon=True).start()
 
     # Started after the sockets above are bound, so the workers connect at once.
     global _embedded_workers
@@ -148,6 +194,14 @@ latest_conversion_by_name: Dict[str, str] = {}
 # ingest must not stop the conversion another space is still waiting for. Only the
 # LAST waiter to leave cancels the work.
 conversion_waiters: Dict[str, int] = {}
+# conversion_id -> when a caller last asked about it (created, polled, result read).
+# Callers poll every couple of seconds until the job is over, so a lease that runs
+# out means nobody is waiting: a template pod that died mid-run, a space deleted
+# under its ingest. abandon_unpolled() cancels those jobs, which nothing else could:
+# their ids were in the dead caller's memory.
+last_polled_at: Dict[str, float] = {}
+#: Seconds without a poll before an unfinished job is cancelled; 0 turns it off.
+_ABANDONED_SECONDS = float(os.getenv("CONVERSION_ABANDONED_SECONDS", "900"))
 # output file name -> callers that have not fetched it yet. The output is a hand-off,
 # not an archive: the caller stores its own copy, so the file is deleted once the
 # last caller has read it (see _release_output). Keyed by FILE, not job: two jobs
@@ -300,6 +354,7 @@ def _apply_result(result: dict) -> None:
             if conversion_id in pending_conversions_db:
                 del pending_conversions_db[conversion_id]
             waiters = conversion_waiters.pop(conversion_id, None)
+            last_polled_at.pop(conversion_id, None)
             output_file = result.get("output_file")
             if waiters and isinstance(output_file, str) and _CONVERSION_OUTPUT.match(output_file):
                 _output_readers[output_file] = _output_readers.get(output_file, 0) + waiters
@@ -406,6 +461,7 @@ async def convert_file(request: ConversionRequest):
     if existing_id and conversion_status_db.get(existing_id) in ("pending", "processing"):
         logger.info(f"Reusing in-flight conversion {existing_id} for {identity}")
         conversion_waiters[existing_id] = conversion_waiters.get(existing_id, 1) + 1
+        last_polled_at[existing_id] = time.time()
         return {"conversion_id": existing_id}
 
     conversion_id = str(uuid.uuid4())
@@ -413,6 +469,7 @@ async def convert_file(request: ConversionRequest):
     conversion_status_db[conversion_id] = "pending"
     inflight_conversions[inflight_key] = conversion_id
     conversion_waiters[conversion_id] = 1
+    last_polled_at[conversion_id] = time.time()
     pending_conversions_db[conversion_id] = {
         "filename": display_name,
         "queued_at": time.time(),
@@ -452,6 +509,8 @@ async def get_status(conversion_id: str):
     if status is None:
         logger.warning(f"Conversion ID not found: {conversion_id}")
         raise HTTPException(status_code=404, detail="Conversion ID not found")
+    if conversion_id in last_polled_at:
+        last_polled_at[conversion_id] = time.time()
     response: Dict[str, Any] = {"status": status}
     details = conversion_details_db.get(conversion_id)
     if isinstance(details, dict) and details.get("started_at"):
@@ -708,6 +767,7 @@ async def debug_convert_file(
         raise _no_worker_error()
     _prune_finished_records()
     conversion_status_db[conversion_id] = "pending"
+    last_polled_at[conversion_id] = time.time()
     conversion_details_db[conversion_id] = {
         "filename": file.filename,
         "file_size": file_size,
@@ -785,6 +845,8 @@ async def get_converted_result(conversion_id: str, download: bool = False):
     
     if conversion_id not in conversion_status_db:
         raise HTTPException(status_code=404, detail="Conversion ID not found")
+    if conversion_id in last_polled_at:
+        last_polled_at[conversion_id] = time.time()
     
     status = conversion_status_db.get(conversion_id)
     if status not in ["completed", "success"]:

@@ -73,3 +73,40 @@ class TestWarmWorkerLiveness:
         elapsed = time.monotonic() - started
 
         assert 5 <= elapsed < 30, f"timeout fired at {elapsed:.1f}s, expected ~5s"
+
+
+class TestWarmWorkerStart:
+    """The same wedge during start-up: a child that dies before reporting ready
+    used to hold the worker lock for DOCLING_WARM_START_TIMEOUT (300s) per attempt."""
+
+    @pytest.mark.parametrize("worker_cls", ["docling", "dbank"])
+    def test_child_dead_before_ready_surfaces_immediately(self, monkeypatch, worker_cls):
+        loop = "_warm_docling_loop" if worker_cls == "docling" else "_warm_dbank_loop"
+        monkeypatch.setattr(worker_mod, loop, targets.die_before_ready)
+        w = _WarmDoclingWorker() if worker_cls == "docling" else worker_mod._WarmDbankWorker()
+
+        started = time.monotonic()
+        with pytest.raises(Exception) as exc:
+            if worker_cls == "docling":
+                w.ensure_started(False, True)
+            else:
+                w._ensure()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 30, f"took {elapsed:.1f}s — start waited out its timeout"
+        assert "exit=1" in str(exc.value) and "before becoming ready" in str(exc.value)
+        assert w._proc is None, "dead child was not reaped"
+
+    def test_child_that_never_reports_ready_hits_the_start_timeout(self, monkeypatch):
+        monkeypatch.setattr(worker_mod, "_warm_docling_loop", targets.hang_before_ready)
+        monkeypatch.setenv("DOCLING_WARM_START_TIMEOUT", "4")
+        w = _WarmDoclingWorker()
+
+        started = time.monotonic()
+        with pytest.raises(Exception) as exc:
+            w.ensure_started(False, True)
+        elapsed = time.monotonic() - started
+
+        assert 4 <= elapsed < 30, f"start gave up at {elapsed:.1f}s, expected ~4s"
+        assert "did not become ready in 4s" in str(exc.value)
+        assert w._proc is None, "hung child was left running"

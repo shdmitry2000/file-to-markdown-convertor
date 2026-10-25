@@ -1,5 +1,14 @@
 """Shared test fixtures and configuration."""
 
+import os
+
+# magika (imported by markitdown) runs `load_dotenv(find_dotenv())` at import, which
+# walks up from site-packages and loads the first .env it finds into os.environ. A
+# checkout under a directory holding someone's old .env (ENVIRONMENT=development)
+# then failed 32 tests in whatever ran after the first markitdown import. The suite
+# must not depend on files outside the repository. Set before anything imports magika.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
 import pytest
 import tempfile
 import shutil

@@ -373,6 +373,83 @@ def _available_memory_gb():
         return None
 
 
+def _cgroup_memory_limit_mb():
+    """The container's memory limit in MB (cgroup v2, then v1), or None outside one.
+
+    psutil.virtual_memory() reports the NODE's memory inside a pod, so it cannot
+    tell how close the pod is to its OOM kill; the cgroup limit can."""
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if raw == "max" or not raw.isdigit() or int(raw) >= 1 << 60:
+            return None     # unlimited
+        return int(raw) / 1048576
+    return None
+
+
+def _warm_memory_budget_mb():
+    """RSS the warm children may hold between jobs, or None for no budget.
+
+    WARM_MEMORY_BUDGET_MB sets it (0 = off); by default it is 70% of the
+    container's memory limit, and off where there is no limit (a laptop)."""
+    raw = os.getenv("WARM_MEMORY_BUDGET_MB", "").strip()
+    if raw:
+        return float(raw) or None
+    limit = _cgroup_memory_limit_mb()
+    return limit * 0.7 if limit else None
+
+
+def _rss_mb(proc) -> float:
+    try:
+        import psutil
+        return psutil.Process(proc.pid).memory_info().rss / 1048576
+    except Exception:  # noqa: BLE001 — gone, or no psutil: nothing to count
+        return 0.0
+
+
+def _enforce_warm_budget(current) -> None:
+    """Stop warm children that hold more memory than the budget allows.
+
+    Both warm children live as long as the pod — docling (pre-warmed at start) and
+    dbank (from its first job) — and each keeps the memory of the largest document
+    it has converted. Two of them sat at ~3.7 GB in a 4.5 GB worker, and the next
+    85-page PDF OOM-killed the pod: the job in flight was lost and every ingest
+    waited for the restart. Between jobs, then: over budget, the idle other child
+    goes first, then the one that just ran. Either respawns on its next job (one
+    cold start, ~20 s), which is far cheaper than an OOM kill. Never raises."""
+    budget = _warm_memory_budget_mb()
+    if not budget:
+        return
+    try:
+        workers = [w for w in (_WARM_DOCLING, _WARM_DBANK) if w._proc is not None]
+        total = sum(_rss_mb(w._proc) for w in workers)
+        if total <= budget:
+            return
+        for w in [w for w in workers if w is not current] + [current]:
+            if w not in workers or total <= budget:
+                continue
+            rss = _rss_mb(w._proc)
+            logger.warning("Warm children hold %.0f MB (budget %.0f MB); stopping the %s "
+                           "child (%.0f MB) — it restarts on its next job",
+                           total, budget, w.name, rss)
+            w._kill()
+            total -= rss
+    except Exception as e:  # noqa: BLE001 — a failed check must never fail the job
+        logger.warning("Warm memory budget check failed: %s", e)
+
+
+def _release_freed_memory() -> None:
+    """Hand freed heap back to the OS (glibc only). A long-lived child otherwise
+    keeps the RSS of its largest document long after the document is done."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — macOS / musl: nothing to trim
+        pass
+
+
 def _prewarm_convert(convert_fn, label: str) -> None:
     """Force docling's lazy model load by converting a throwaway PDF, so the first
     real job is already warm.
@@ -485,13 +562,16 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
                     )
                 markdown = vlm_markdown
                 converter_used = "docling+vlm"
-            out_q.put(("success", {
+            reply = ("success", {
                 "markdown": markdown, "num_pages": num_pages,
                 "doc_name": doc_name, "doc_origin": doc_origin,
                 "converter_used": converter_used,
-            }))
+            })
         except Exception as e:
-            out_q.put(("error", str(e), traceback.format_exc()))
+            reply = ("error", str(e), traceback.format_exc())
+        result = None   # drop the document before trimming, then answer
+        _release_freed_memory()
+        out_q.put(reply)
 
 
 def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = None,
@@ -526,10 +606,37 @@ def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = N
                 return None, cut
 
 
+def _await_warm_ready(out_q, proc, name: str):
+    """Wait for a just-started warm child's first status, polling its liveness.
+
+    The same wedge as `_await_warm_result`, one step earlier: a child that dies
+    while starting (an import error, a config error, an OOM kill while loading
+    models) never puts its status, and a bare ``out_q.get(timeout=300)`` held the
+    worker lock — every conversion in the service — for the full five minutes per
+    attempt. Returns the status tuple; raises once the child is gone or the start
+    timeout passes."""
+    warm_timeout = int(os.getenv("DOCLING_WARM_START_TIMEOUT", "300"))
+    deadline = time.monotonic() + warm_timeout
+    while True:
+        try:
+            return out_q.get(timeout=max(0.1, min(2.0, deadline - time.monotonic())))
+        except queue_module.Empty:
+            if not proc.is_alive():
+                try:  # it may have put its status just before exiting
+                    return out_q.get_nowait()
+                except queue_module.Empty:
+                    raise Exception(f"Warm {name} worker exited (exit={proc.exitcode}) "
+                                    "before becoming ready")
+            if time.monotonic() >= deadline:
+                raise Exception(f"Warm {name} worker did not become ready in {warm_timeout}s")
+
+
 class _WarmDoclingWorker:
     """Manages one long-lived warm docling subprocess (lazy start; restart on
     timeout, crash, or changed options). Calls are serialized — the daemon
     processes conversions one at a time."""
+
+    name = "docling"
 
     def __init__(self) -> None:
         self._ctx = multiprocessing.get_context("spawn")
@@ -566,12 +673,11 @@ class _WarmDoclingWorker:
         self._opts = (do_ocr, do_table_structure)
         # Wait for the converter to finish loading models. Bounded generously —
         # this cold start is paid ONCE (or once per restart), never per job.
-        warm_timeout = int(os.getenv("DOCLING_WARM_START_TIMEOUT", "300"))
         try:
-            status = self._out.get(timeout=warm_timeout)
-        except queue_module.Empty:
+            status = _await_warm_ready(self._out, self._proc, "docling")
+        except Exception:
             self._kill()
-            raise Exception(f"Warm docling worker did not become ready in {warm_timeout}s")
+            raise
         if status[0] != "ready":
             detail = status[1] if len(status) > 1 else status
             self._kill()
@@ -683,20 +789,24 @@ def _warm_dbank_loop(in_q, out_q) -> None:
         file_path = job
         try:
             markdown = converter.convert(Path(file_path))
-            out_q.put(("success", {
+            reply = ("success", {
                 "markdown": markdown,
                 "num_pages": max(1, len(markdown) // 2000),
                 "doc_name": str(Path(file_path).name),
                 "doc_origin": "converter:dbank",
                 "converter_used": "dbank",
-            }))
+            })
         except Exception as e:
-            out_q.put(("error", str(e), traceback.format_exc()))
+            reply = ("error", str(e), traceback.format_exc())
+        _release_freed_memory()   # before answering, so the parent's budget check sees it
+        out_q.put(reply)
 
 
 class _WarmDbankWorker:
     """Manages one long-lived warm dbank subprocess (lazy start; restart on
     timeout or crash). Calls are serialized — one conversion at a time."""
+
+    name = "dbank"
 
     def __init__(self) -> None:
         self._ctx = multiprocessing.get_context("spawn")
@@ -720,12 +830,11 @@ class _WarmDbankWorker:
         self._out = self._ctx.Queue()
         self._proc = self._ctx.Process(target=_warm_dbank_loop, args=(self._in, self._out), daemon=True)
         self._proc.start()
-        warm_timeout = int(os.getenv("DOCLING_WARM_START_TIMEOUT", "300"))
         try:
-            status = self._out.get(timeout=warm_timeout)
-        except queue_module.Empty:
+            status = _await_warm_ready(self._out, self._proc, "dbank")
+        except Exception:
             self._kill()
-            raise Exception(f"Warm dbank worker did not become ready in {warm_timeout}s")
+            raise
         if status[0] != "ready":
             detail = status[1] if len(status) > 1 else status
             self._kill()
@@ -869,13 +978,19 @@ def _run_converter_with_timeout(
     # the models per job (turns a ~14s/job cold start into ~1s). Skipped when a
     # test injects `_target`, or when explicitly disabled via DOCLING_WARM_WORKER.
     if _target is None and _warm_enabled() and (converter_type == "docling" or not converter_type):
-        return _WARM_DOCLING.convert(
-            file_path, conversion_id, do_ocr, do_table_structure, timeout_seconds)
+        try:
+            return _WARM_DOCLING.convert(
+                file_path, conversion_id, do_ocr, do_table_structure, timeout_seconds)
+        finally:
+            _enforce_warm_budget(_WARM_DOCLING)
 
     # dbank keeps its own long-lived worker so its docling (~8s) + VLM client are
     # built once and reused across documents, not per job.
     if _target is None and _warm_enabled() and converter_type == "dbank":
-        return _WARM_DBANK.convert(file_path, conversion_id, timeout_seconds)
+        try:
+            return _WARM_DBANK.convert(file_path, conversion_id, timeout_seconds)
+        finally:
+            _enforce_warm_budget(_WARM_DBANK)
 
     target = _target or _convert_in_subprocess
     result_queue = multiprocessing.Queue()

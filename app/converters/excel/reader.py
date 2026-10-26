@@ -175,3 +175,97 @@ def read_workbook(path: str | Path, max_cells: int = DEFAULT_MAX_CELLS) -> Workb
     formulas_wb.close()
     values_wb.close()
     return model
+
+
+def _xls_value(book, cell) -> Any:
+    """An xlrd cell as the value openpyxl would give (int, float, str, bool, datetime)."""
+    import xlrd
+
+    kind = cell.ctype
+    if kind in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+        return None
+    if kind == xlrd.XL_CELL_DATE:
+        try:
+            return xlrd.xldate.xldate_as_datetime(cell.value, book.datemode)
+        except (ValueError, OverflowError, xlrd.xldate.XLDateError):
+            return cell.value
+    if kind == xlrd.XL_CELL_BOOLEAN:
+        return bool(cell.value)
+    if kind == xlrd.XL_CELL_ERROR:
+        return xlrd.error_text_from_code.get(cell.value, "#ERR")
+    if kind == xlrd.XL_CELL_NUMBER and float(cell.value).is_integer():
+        return int(cell.value)
+    return cell.value
+
+
+def read_xls_workbook(path: str | Path, max_cells: int = DEFAULT_MAX_CELLS) -> WorkbookModel:
+    """Load a legacy .xls (Excel 97-2003) into a :class:`WorkbookModel`.
+
+    xlrd reads the values Excel saved, never the formulas — the binary format
+    keeps them as parsed tokens xlrd does not decompile. So every cell arrives as
+    a value, and the tables render as they do for an .xlsx without formulas. The
+    rest of the label metadata is there: merged ranges, freeze panes, notes,
+    hidden rows/columns, bold, fills, indents, right-to-left sheets.
+    """
+    import xlrd
+
+    path = Path(path)
+    book = xlrd.open_workbook(str(path), formatting_info=True, on_demand=True)
+    model = WorkbookModel(source_name=path.name)
+    budget = max_cells
+    try:
+        for index in range(book.nsheets):
+            ws = book.sheet_by_index(index)
+            sheet = Sheet(
+                name=ws.name,
+                index=index,
+                rtl=bool(getattr(ws, "columns_from_right_to_left", 0)),
+                hidden=ws.visibility != 0,
+                # xlrd ranges are 0-based and half-open; the model is 1-based inclusive.
+                merged=[Rect(top=r0 + 1, left=c0 + 1, bottom=r1, right=c1)
+                        for r0, r1, c0, c1 in ws.merged_cells],
+                hidden_rows={r + 1 for r, info in ws.rowinfo_map.items() if info.hidden},
+                hidden_cols={c + 1 for c, info in ws.colinfo_map.items() if info.hidden},
+            )
+            if getattr(ws, "panes_are_frozen", 0):
+                sheet.freeze_row = int(ws.horz_split_pos or 0)
+                sheet.freeze_col = int(ws.vert_split_pos or 0)
+
+            for r in range(ws.nrows):
+                if budget <= 0:
+                    sheet.truncated = True
+                    logger.warning(
+                        "excel: cell budget (%d) exhausted on sheet %r — output truncated",
+                        max_cells,
+                        ws.name,
+                    )
+                    break
+                outline = getattr(ws.rowinfo_map.get(r), "outline_level", 0) or 0
+                for c in range(ws.ncols):
+                    value = _xls_value(book, ws.cell(r, c))
+                    note = ws.cell_note_map.get((r, c))
+                    comment = (note.text or "").strip() or None if note else None
+                    if value is None and comment is None:
+                        continue
+                    budget -= 1
+                    xf = book.xf_list[ws.cell_xf_index(r, c)]
+                    fmt = book.format_map.get(xf.format_key)
+                    font = book.font_list[xf.font_index] if xf.font_index < len(book.font_list) else None
+                    sheet.cells[(r + 1, c + 1)] = Cell(
+                        row=r + 1,
+                        col=c + 1,
+                        value=value,
+                        number_format=(fmt.format_str if fmt else None) or "General",
+                        comment=comment,
+                        bold=bool(font and font.bold),
+                        filled=bool(xf.background.fill_pattern),
+                        indent=int(xf.alignment.indent_level or 0),
+                        outline_level=int(outline),
+                    )
+                    sheet.max_row = max(sheet.max_row, r + 1)
+                    sheet.max_col = max(sheet.max_col, c + 1)
+            model.sheets.append(sheet)
+            book.unload_sheet(index)
+    finally:
+        book.release_resources()
+    return model

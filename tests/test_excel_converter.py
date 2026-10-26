@@ -275,11 +275,11 @@ def test_converter_produces_markdown_end_to_end():
     assert "`=SUM(C3:C7)`" in markdown
 
 
-def test_converter_refuses_legacy_xls(tmp_path):
-    legacy = tmp_path / "book.xls"
-    legacy.write_bytes(b"\xd0\xcf\x11\xe0")
+def test_converter_refuses_a_format_it_does_not_read(tmp_path):
+    other = tmp_path / "book.ods"
+    other.write_bytes(b"PK")
     with pytest.raises(ValueError, match="excel converter handles"):
-        ExcelConverter().convert(legacy)
+        ExcelConverter().convert(other)
 
 
 def test_converter_is_registered_for_the_capabilities_endpoint():
@@ -291,19 +291,16 @@ def test_converter_is_registered_for_the_capabilities_endpoint():
 
 # -- the legacy .xls route ---------------------------------------------------
 #
-# .xls does not route here — openpyxl cannot read the format and docling does
-# not support it at all, so it is format-locked to markitdown. That route had no
-# real coverage: the existing markitdown test patches the library with a
-# MagicMock, so it exercises the wrapper and nothing else. These run the real
-# thing against a real Excel 97-2003 workbook.
+# openpyxl cannot read .xls; the converter reads it with xlrd instead (values
+# only). Run against a real Excel 97-2003 workbook.
 
 
-def test_legacy_xls_actually_converts_through_markitdown():
-    from app.converters.markitdown import MarkItDownConverter
-
-    markdown = MarkItDownConverter().convert(LEGACY_XLS)
-    assert "## Sheet1" in markdown
-    assert "0.980269" in markdown                        # a real cell value
+def test_legacy_xls_converts_through_our_converter():
+    markdown = ExcelConverter().convert(LEGACY_XLS)
+    assert "## Sheet1" in markdown and "## Sheet4" in markdown
+    assert "0.9803" in markdown                          # a real cell value
+    assert "03/01/2000" in markdown                      # a date cell, not a serial number
+    assert "| i1 | a | x |" in markdown
 
 
 def test_legacy_xls_is_values_only():
@@ -315,9 +312,12 @@ def test_legacy_xls_is_values_only():
     assert not hasattr(book.sheet_by_index(0), "formula")
 
 
-def test_excel_converter_rejects_the_legacy_format_it_cannot_read():
-    with pytest.raises(ValueError, match="excel converter handles"):
-        ExcelConverter().convert(LEGACY_XLS)
+def test_legacy_xls_has_no_formulas_in_the_model():
+    from app.converters.excel.reader import read_xls_workbook
+
+    model = read_xls_workbook(LEGACY_XLS)
+    assert [s.name for s in model.sheets] == ["Sheet1", "Sheet2", "Sheet3", "Sheet4"]
+    assert not any(c.formula for s in model.sheets for c in s.cells.values())
 
 
 # -- the debug/health check --------------------------------------------------
@@ -331,7 +331,7 @@ def test_health_check_routes_each_format_to_its_real_converter():
     assert converter_for("book.xlsx") == "excel"
     assert converter_for("macros.xlsm") == "excel"
     assert converter_for("BOOK.XLSX") == "excel"          # case-insensitive
-    assert converter_for("legacy.xls") == "markitdown"    # docling cannot read it
+    assert converter_for("legacy.xls") == "excel"         # read with xlrd, values only
     assert converter_for("scan.png") == "docling"         # unchanged default
 
 

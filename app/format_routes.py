@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Formats that must not go to docling. Spreadsheets have their own converter
-# (formulas, per-region tables) and docling does not support .xls at all, so a
-# health check that assumed docling would report on a pipeline the real ingest
-# never uses. Mirrors _resolve_converter_type in the ingest client.
+# Formats with a converter of their own when the caller names none: workbooks
+# (legacy .xls too, read with xlrd) go to the formula-aware excel converter.
+# Everything else goes to docling; markitdown is not used. The ingest client's
+# rule is shared/rag_core/converter_routing.py in the main repo.
 FORMAT_ROUTES: dict[str, str] = {
     ".xlsx": "excel",
     ".xlsm": "excel",
-    ".xls": "markitdown",
+    ".xls": "excel",
 }
 
 DEFAULT_CONVERTER = "docling"

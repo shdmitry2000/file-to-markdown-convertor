@@ -726,7 +726,7 @@ async def debug_convert_file(
     """Upload a document and test conversion with timing.
 
     Routes by format so the check exercises the same converter the ingest path
-    would pick (PDF → docling, .xlsx/.xlsm → excel, .xls → markitdown). Pass
+    would pick (.xlsx/.xlsm/.xls → excel, everything else → docling). Pass
     `converter_type` to force a specific one.
 
     Returns as soon as the job is queued (the default, ``wait=false``); poll

@@ -41,9 +41,8 @@ renamed .xlsx. Legacy .xls cannot be produced by openpyxl, and the writers that
 could (xlwt) are gone from modern pandas, so this one is checked in rather than
 generated.
 
-It backs the `.xls` route: openpyxl cannot read the format at all and docling
-does not list it among its supported formats, so `.xls` routes to markitdown
-(which reads it via xlrd) and arrives values-only.
+It backs the `.xls` route: openpyxl cannot read the format, so the excel converter
+reads it with xlrd (values only; xlrd exposes no formulas).
 
 Source: `pandas/tests/io/data/excel/test1.xls` from pandas-dev/pandas,
 BSD-3-Clause. Used unmodified as a test asset.

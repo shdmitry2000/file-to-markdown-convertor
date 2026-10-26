@@ -1,9 +1,8 @@
 """Formula-aware Excel -> Markdown converter.
 
-The default `.xlsx` route (markitdown) keeps the numbers but drops every formula,
-so a totals cell arrives as a bare figure with nothing tying it to the rows that
-produced it — unanswerable for questions like "what is this total made of".
-Docling's Excel backend reads the same values-only view.
+Docling's Excel backend keeps the numbers but drops every formula, so a totals
+cell arrives as a bare figure with nothing tying it to the rows that produced it
+— unanswerable for questions like "what is this total made of".
 
 This converter reads the formulas openpyxl exposes, names each cell from metadata
 the workbook already carries (comments, defined names, Table headers, freeze
@@ -21,12 +20,12 @@ from pathlib import Path
 from app.registry import register_converter
 
 from ..base import PDFConverter
-from .reader import DEFAULT_MAX_CELLS, read_workbook
+from .reader import DEFAULT_MAX_CELLS, read_workbook, read_xls_workbook
 from .render_md import render_markdown
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUFFIXES = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+SUPPORTED_SUFFIXES = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -52,8 +51,8 @@ def _env_int(name: str, default: int) -> int:
 class ExcelConverter(PDFConverter):
     """Convert .xlsx/.xlsm to Markdown, preserving formula semantics.
 
-    Legacy .xls is not handled: openpyxl cannot read it, and xlrd exposes no
-    formulas — those files stay on the markitdown route.
+    Legacy .xls is read with xlrd: the same tables and labels, values only —
+    xlrd exposes no formulas (see reader.read_xls_workbook).
     """
 
     def __init__(
@@ -78,7 +77,8 @@ class ExcelConverter(PDFConverter):
                 f"excel converter handles {sorted(SUPPORTED_SUFFIXES)}, got {path.suffix!r}"
             )
 
-        model = read_workbook(path, max_cells=self._max_cells)
+        reader = read_xls_workbook if path.suffix.lower() == ".xls" else read_workbook
+        model = reader(path, max_cells=self._max_cells)
         markdown = render_markdown(
             model,
             max_refs=self._max_refs,

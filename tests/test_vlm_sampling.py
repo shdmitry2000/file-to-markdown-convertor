@@ -74,6 +74,9 @@ def test_openai_call_sends_temperature_only_when_set(temperature, sent):
 def test_dbank_and_slides_follow_the_env(monkeypatch, module, cls):
     made = []
     monkeypatch.setattr(vlm, "VLMConverter", lambda **kw: made.append(kw))
+    # dbank reads the pod model to decide on an escalation VLM; without one set
+    # that read raises before the VLM under test is built.
+    monkeypatch.setenv("VLM_MODEL", "vertex_ai/gemini-3.8-flash")
     conv = getattr(importlib.import_module(module), cls)()
     conv._ensure_vlm()
     assert "temperature" not in made[0]

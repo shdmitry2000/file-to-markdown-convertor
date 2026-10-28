@@ -69,3 +69,15 @@ def ignore_sigterm_then_sleep(file_path, converter_type, do_ocr, result_queue, d
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while True:
         time.sleep(1)
+
+
+def report_connector(file_path, converter_type, do_ocr, result_queue, do_table_structure=True,
+                     llm_connector=None):
+    """Echo the llm_connector the child received, as the markdown."""
+    import json
+
+    result_queue.put((
+        "success",
+        {"markdown": json.dumps(llm_connector), "num_pages": 1, "doc_name": "fake.pdf",
+         "doc_origin": "test", "converter_used": converter_type},
+    ))

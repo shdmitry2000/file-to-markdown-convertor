@@ -40,3 +40,23 @@ def die_before_ready(in_q, out_q, *args):
 def hang_before_ready(in_q, out_q, *args):
     """Stay alive and never report ready: the start timeout must still apply."""
     time.sleep(300)
+
+
+def slow_vlm_docling_loop(in_q, out_q, *args):
+    """The real warm docling loop, with a VLM that takes 1 s per picture.
+
+    Patched here, inside the spawned child, because parent patches do not cross
+    `spawn`. Lets a test drive a slow picture-description run through the real
+    stall watch.
+    """
+    from unittest.mock import patch
+
+    from app.workers.worker import _warm_docling_loop
+
+    def slow(self, img_b64):
+        time.sleep(1)
+        return "תיאור"
+
+    with patch("app.converters.vlm.VLMConverter.__init__", return_value=None), \
+         patch("app.converters.vlm.VLMConverter.transcribe_page", slow):
+        _warm_docling_loop(in_q, out_q, *args)

@@ -2,6 +2,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from app.converters.dbank import (
     DbankConverter, _control_ratio, _heb_ratio, _heb_word_count, _word_precision,
 )
@@ -214,6 +216,36 @@ def test_wrong_number_flagged_when_retry_fails():
     assert "<!-- dbank: numbers not on the page: 1,536,991 -->" in out
 
 
+def _grid(*runs):
+    """rawdict with one line per (text, x0, y) run; 4pt per glyph."""
+    lines = [{"spans": [{"chars": [{"c": ch, "bbox": (x0 + 4 * n, y, x0 + 4 * n + 4, y + 10)}
+                                   for n, ch in enumerate(text)]}]} for text, x0, y in runs]
+    return {"blocks": [{"lines": lines}]}
+
+
+# 2024 column on the right (x=300), 2023 on the left (x=200), three rows.
+GRID = _grid(("2024", 300, 100), ("2023", 200, 100),
+             ("2,505,293", 300, 120), ("1,994,001", 200, 120),
+             ("1,715,080", 300, 140), ("1,375,592", 200, 140))
+GRID_OK = "| | 2024 | 2023 |\n|---|---|---|\n| a | 2,505,293 | 1,994,001 |\n| b | 1,715,080 | 1,375,592 |"
+GRID_SWAPPED = "| | 2024 | 2023 |\n|---|---|---|\n| a | 2,505,293 | 1,994,001 |\n| b | 1,375,592 | 1,715,080 |"
+
+
+def test_value_in_the_wrong_column_fixed_by_retry():
+    # every number is on the page, so only the table check can see this
+    out, _, vlm = _run([_page(HEB, rawdict=GRID)], (HEB, 1),
+                       vlm_outputs=[GRID_SWAPPED, GRID_OK])
+    assert vlm.transcribe_page.call_count == 2
+    assert GRID_OK in out and "dbank:" not in out
+
+
+def test_value_in_the_wrong_column_flagged_when_retry_fails():
+    out, _, vlm = _run([_page(HEB, rawdict=GRID)], (HEB, 1),
+                       vlm_outputs=[GRID_SWAPPED, GRID_SWAPPED])
+    assert vlm.transcribe_page.call_count == 2
+    assert "<!-- dbank: table cells not where the page has them: 1375592 not in column 2" in out
+
+
 def test_scanned_page_is_not_number_checked():
     # no text layer -> nothing to check against -> one call, no flag
     out, _, vlm = _run([_page("")], (HEB, 0), vlm_outputs=["| 1,536,991 |"])
@@ -235,3 +267,39 @@ def test_vlm_page_keeps_its_page_number():
     out, _, vlm = _run([_page(HEB), _page(HEB, image=True)], (HEB, 0))
     assert vlm.transcribe_page.called
     assert out.index("<!-- page 1 -->") < out.index("<!-- page 2 -->")
+
+
+def test_a_failed_page_goes_to_the_stronger_model():
+    """The second attempt is the escalation model, not the same weak model again."""
+    conv = DbankConverter()
+    weak, strong = MagicMock(), MagicMock()
+    weak.transcribe_page.return_value = GRID_SWAPPED
+    strong.transcribe_page.return_value = GRID_OK
+
+    def ensure():
+        conv._vlm, conv._strong = weak, strong
+
+    with patch("app.converters.dbank.fitz.open", return_value=_fake_doc([_page(HEB, rawdict=GRID)])), \
+         patch.object(DbankConverter, "validate_path", return_value=None), \
+         patch.object(DbankConverter, "_write_page", return_value=Path("/tmp/_x.pdf")), \
+         patch.object(DbankConverter, "_render", return_value="IMG_B64"), \
+         patch.object(conv, "_docling_convert", return_value=(HEB, 1)), \
+         patch.object(conv, "_ensure_vlm", side_effect=ensure):
+        out = conv.convert(Path("/tmp/whatever.pdf"))
+    assert weak.transcribe_page.call_count == 1 and strong.transcribe_page.call_count == 1
+    assert GRID_OK in out and "dbank:" not in out
+
+
+@pytest.mark.parametrize("pod, escalates", [
+    ("vertex_ai/gemini-3.5-flash-lite", True),
+    ("vertex_ai/gemini-3.8-flash", False),  # already the strong model: plain retry
+])
+def test_escalation_only_when_the_pod_runs_a_weaker_model(monkeypatch, pod, escalates):
+    monkeypatch.setenv("VLM_MODEL", pod)
+    built = []
+    with patch("app.converters.vlm.VLMConverter.__init__",
+               lambda self, **kw: built.append(kw)):
+        conv = DbankConverter()
+        conv._ensure_vlm()
+    assert (conv._strong is not None) == escalates
+    assert built[-1].get("model_name") == ("gemini-3.8-flash" if escalates else None)

@@ -45,6 +45,11 @@ def numbers(text: str) -> Counter:
 
 def page_numbers(page) -> Counter:
     """The page's numbers, rebuilt from glyph boxes sorted left-to-right."""
+    return numbers("\n".join(run for run, _x, _y in numeric_runs(page)))
+
+
+def numeric_runs(page) -> list[tuple[str, float, float]]:
+    """Each number on the page as (text, x centre, y centre), digits left-to-right."""
     chars = []
     for block in page.get_text("rawdict")["blocks"]:
         for line in block.get("lines", []):
@@ -55,19 +60,23 @@ def page_numbers(page) -> Counter:
                         chars.append((y, c["bbox"][0], c["bbox"][2], c["c"]))
     chars.sort(key=lambda c: (c[0], c[1]))
     runs, cur = [], []
+
+    def close():
+        runs.append(("".join(x[3] for x in cur), (cur[0][1] + cur[-1][2]) / 2, cur[0][0]))
+
     for c in chars:
         numeric = c[3] in _NUMERIC_GLYPHS
         # Split on a non-digit glyph (Hebrew 'ו' in '101 ו-103'), a new line, a gap,
         # or x moving backwards (two lines a couple of points apart sort together).
         if cur and (not numeric or abs(c[0] - cur[-1][0]) > 2
                     or c[1] - cur[-1][2] > _GAP or c[1] < cur[-1][1]):
-            runs.append("".join(x[3] for x in cur))
+            close()
             cur = []
         if numeric:
             cur.append(c)
     if cur:
-        runs.append("".join(x[3] for x in cur))
-    return numbers("\n".join(runs))
+        close()
+    return runs
 
 
 def not_on_page(markdown: str, reference: Counter) -> list[int]:

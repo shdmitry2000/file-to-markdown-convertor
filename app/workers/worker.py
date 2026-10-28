@@ -234,25 +234,37 @@ def _vlm_fallback_enabled() -> bool:
     return os.getenv("VLM_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
 
 
-def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, result_queue, do_table_structure: bool = True) -> None:
+def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, result_queue,
+                           do_table_structure: bool = True, llm_connector: dict | None = None) -> None:
     """Subprocess target: run a single conversion and put the result on `result_queue`.
 
     Module-level so multiprocessing can pickle it under the `spawn` start method,
     and so tests can swap in their own callable without monkeypatching.
+    ``llm_connector``: the caller's connector for the VLM calls (see vlm_lane).
     """
+    from app.converters import vlm_lane
+
+    with vlm_lane.job(llm_connector):
+        _convert_job(file_path, converter_type, do_ocr, result_queue, do_table_structure)
+
+
+def _convert_job(file_path: str, converter_type: str, do_ocr: bool, result_queue,
+                 do_table_structure: bool) -> None:
     try:
         converter_used = converter_type or "docling"
         if converter_type == "docling" or not converter_type:
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling.datamodel.pipeline_options import PdfPipelineOptions
             from docling.datamodel.base_models import InputFormat
+            from app.converters.picture_description import office_format_options
 
             pdf_options = PdfPipelineOptions()
             pdf_options.do_ocr = do_ocr
             pdf_options.do_table_structure = do_table_structure
             converter = DocumentConverter(
                 format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
+                    **office_format_options(),
                 }
             )
             result = converter.convert(file_path)
@@ -513,6 +525,15 @@ def _install_page_progress(stage_events, pages_done) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("docling page-progress hook not installed (%s); stall watch uses CPU", exc)
 
+    # docx/pptx have no page handoffs; picture description beats instead.
+    from app.converters import picture_description
+
+    def _beat():
+        with stage_events.get_lock():
+            stage_events.value += 1
+
+    picture_description.on_progress = _beat
+
 
 def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
                        stage_events=None, pages_done=None) -> None:
@@ -526,11 +547,14 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
         from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.datamodel.base_models import InputFormat
 
+        from app.converters.picture_description import office_format_options
+
         pdf_options = PdfPipelineOptions()
         pdf_options.do_ocr = do_ocr
         pdf_options.do_table_structure = do_table_structure
         converter = DocumentConverter(
-            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)}
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
+                            **office_format_options()}
         )
         # Load the models now, before signalling ready (see _write_warmup_pdf).
         _prewarm_convert(converter.convert, "docling")
@@ -539,34 +563,37 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
         out_q.put(("init_error", str(e), traceback.format_exc()))
         return
 
+    from app.converters import vlm_lane
+
     while True:
         job = in_q.get()
         if job is None:
             return
-        file_path = job
+        file_path, llm_connector = job
         try:
-            result = converter.convert(file_path)
-            markdown = annotate_images(result.document.export_to_markdown(), result.document)
-            num_pages = result.document.num_pages()
-            doc_name = repr(result.document.name)
-            doc_origin = repr(result.document.origin)
-            converter_used = "docling"
-            # Same broken-text-layer → VLM fallback as the cold path.
-            if _vlm_fallback_enabled() and _docling_output_unusable(markdown):
-                from app.converters.vlm import VLMConverter
-                vlm_markdown = VLMConverter(backend="factory").convert(Path(file_path))
-                if _docling_output_unusable(vlm_markdown):
-                    raise Exception(
-                        "Unreadable document: both docling and VLM produced no usable "
-                        "text (likely scanned/encrypted/empty) — needs review."
-                    )
-                markdown = vlm_markdown
-                converter_used = "docling+vlm"
-            reply = ("success", {
-                "markdown": markdown, "num_pages": num_pages,
-                "doc_name": doc_name, "doc_origin": doc_origin,
-                "converter_used": converter_used,
-            })
+            with vlm_lane.job(llm_connector):
+                result = converter.convert(file_path)
+                markdown = annotate_images(result.document.export_to_markdown(), result.document)
+                num_pages = result.document.num_pages()
+                doc_name = repr(result.document.name)
+                doc_origin = repr(result.document.origin)
+                converter_used = "docling"
+                # Same broken-text-layer → VLM fallback as the cold path.
+                if _vlm_fallback_enabled() and _docling_output_unusable(markdown):
+                    from app.converters.vlm import VLMConverter
+                    vlm_markdown = VLMConverter(backend="factory").convert(Path(file_path))
+                    if _docling_output_unusable(vlm_markdown):
+                        raise Exception(
+                            "Unreadable document: both docling and VLM produced no usable "
+                            "text (likely scanned/encrypted/empty) — needs review."
+                        )
+                    markdown = vlm_markdown
+                    converter_used = "docling+vlm"
+                reply = ("success", {
+                    "markdown": markdown, "num_pages": num_pages,
+                    "doc_name": doc_name, "doc_origin": doc_origin,
+                    "converter_used": converter_used,
+                })
         except Exception as e:
             reply = ("error", str(e), traceback.format_exc())
         result = None   # drop the document before trimming, then answer
@@ -696,13 +723,14 @@ class _WarmDoclingWorker:
             self._ensure(do_ocr, do_table_structure)
 
     def convert(self, file_path: str, conversion_id: str, do_ocr: bool,
-                do_table_structure: bool, timeout_seconds: int) -> dict:
+                do_table_structure: bool, timeout_seconds: int,
+                llm_connector: dict | None = None) -> dict:
         with self._lock:
             self._ensure(do_ocr, do_table_structure)
             if self.pages_done is not None:
                 with self.pages_done.get_lock():
                     self.pages_done.value = 0      # per job, for the heartbeat
-            self._in.put(file_path)
+            self._in.put((file_path, llm_connector))
             item, reason = _await_warm_result(
                 self._out, self._proc, timeout_seconds, conversion_id,
                 progress=self.stage_events)
@@ -786,9 +814,12 @@ def _warm_dbank_loop(in_q, out_q) -> None:
         job = in_q.get()
         if job is None:
             return
-        file_path = job
+        file_path, llm_connector = job
         try:
-            markdown = converter.convert(Path(file_path))
+            from app.converters import vlm_lane
+
+            with vlm_lane.job(llm_connector):
+                markdown = converter.convert(Path(file_path))
             reply = ("success", {
                 "markdown": markdown,
                 "num_pages": max(1, len(markdown) // 2000),
@@ -846,10 +877,11 @@ class _WarmDbankWorker:
             self._kill()
             self._start()
 
-    def convert(self, file_path: str, conversion_id: str, timeout_seconds: int) -> dict:
+    def convert(self, file_path: str, conversion_id: str, timeout_seconds: int,
+                llm_connector: dict | None = None) -> dict:
         with self._lock:
             self._ensure()
-            self._in.put(file_path)
+            self._in.put((file_path, llm_connector))
             item, reason = _await_warm_result(
                 self._out, self._proc, timeout_seconds, conversion_id)
             if reason == "cancelled":
@@ -932,6 +964,7 @@ def _run_converter_with_timeout(
     do_ocr: bool = False,
     do_table_structure: bool = True,
     *,
+    llm_connector: dict | None = None,
     _target=None,
 ) -> dict:
     """Run a conversion in a separate process with a hard timeout.
@@ -980,7 +1013,8 @@ def _run_converter_with_timeout(
     if _target is None and _warm_enabled() and (converter_type == "docling" or not converter_type):
         try:
             return _WARM_DOCLING.convert(
-                file_path, conversion_id, do_ocr, do_table_structure, timeout_seconds)
+                file_path, conversion_id, do_ocr, do_table_structure, timeout_seconds,
+                llm_connector)
         finally:
             _enforce_warm_budget(_WARM_DOCLING)
 
@@ -988,7 +1022,7 @@ def _run_converter_with_timeout(
     # built once and reused across documents, not per job.
     if _target is None and _warm_enabled() and converter_type == "dbank":
         try:
-            return _WARM_DBANK.convert(file_path, conversion_id, timeout_seconds)
+            return _WARM_DBANK.convert(file_path, conversion_id, timeout_seconds, llm_connector)
         finally:
             _enforce_warm_budget(_WARM_DBANK)
 
@@ -998,6 +1032,8 @@ def _run_converter_with_timeout(
     process = multiprocessing.Process(
         target=target,
         args=(file_path, converter_type, do_ocr, result_queue, do_table_structure),
+        # Only when sent: test targets keep the five-argument signature.
+        kwargs={"llm_connector": llm_connector} if llm_connector else {},
     )
     process.start()
 
@@ -1091,7 +1127,7 @@ def _output_identity(file_path: str, converter_type: str) -> tuple[str, str]:
 
 
 def _convert_with_docling(file_path: str, conversion_id: str, result_sender_socket,
-                          source_name: str | None = None):
+                          source_name: str | None = None, llm_connector: dict | None = None):
     """
     Docling conversion with timeout protection via multiprocessing.
     """
@@ -1158,6 +1194,7 @@ def _convert_with_docling(file_path: str, conversion_id: str, result_sender_sock
                         timeout_seconds=CONVERSION_TIMEOUT_SECONDS,
                         do_ocr=do_ocr,
                         do_table_structure=do_table_structure,
+                        llm_connector=llm_connector,
                     )
                     
                     markdown_content = result_data["markdown"]
@@ -1266,12 +1303,14 @@ def _fail_conversion(conversion_id: str, result_sender_socket, error: str) -> No
 
 
 def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_socket,
-                             converter_type: str = "docling", source_name: str | None = None):
+                             converter_type: str = "docling", source_name: str | None = None,
+                             llm_connector: dict | None = None):
     """
     Routing proxy that delegates Docling tasks to strict insulation or dynamically uses other plugins.
     """
     if converter_type == "docling" or not converter_type:
-        return _convert_with_docling(file_path, conversion_id, result_sender_socket, source_name)
+        return _convert_with_docling(file_path, conversion_id, result_sender_socket, source_name,
+                                     llm_connector)
         
     # Use PyMuPDF, MarkItDown, VLM, etc plugin with timeout protection
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
@@ -1312,6 +1351,7 @@ def convert_file_to_markdown(file_path: str, conversion_id: str, result_sender_s
                         conversion_id=conversion_id,
                         converter_type=converter_type,
                         timeout_seconds=CONVERSION_TIMEOUT_SECONDS,
+                        llm_connector=llm_connector,
                     )
                     
                     markdown_content = result_data["markdown"]
@@ -1562,6 +1602,10 @@ def _serve(context, task_receiver_socket, result_sender_socket, result_address,
             file_path = task.get("file_path")
             file_key = task.get("file_key")
             converter_type = task.get("converter_type", "docling")
+            # The caller's LLM connector for VLM calls (see vlm_lane). Holds a token:
+            # passed down, never logged. Only when sent, so a job without one is
+            # called exactly as before.
+            lane = {"llm_connector": task["llm_connector"]} if task.get("llm_connector") else {}
             # Skip work nobody is waiting for. A cancelled batch of 300 files has
             # almost all of them still queued, and converting them costs the same
             # as converting wanted ones — this is where the reclaimed compute is.
@@ -1591,7 +1635,7 @@ def _serve(context, task_receiver_socket, result_sender_socket, result_address,
                     with store.materialize(file_key) as local:
                         convert_file_to_markdown(
                             str(local), conversion_id, result_sender_socket,
-                            converter_type, source_name=os.path.basename(file_key),
+                            converter_type, source_name=os.path.basename(file_key), **lane,
                         )
                 except FileNotFoundError:
                     _fail_conversion(
@@ -1600,7 +1644,7 @@ def _serve(context, task_receiver_socket, result_sender_socket, result_address,
                     )
             else:
                 convert_file_to_markdown(
-                    file_path, conversion_id, result_sender_socket, converter_type
+                    file_path, conversion_id, result_sender_socket, converter_type, **lane,
                 )
         elif task_type == "chunk":
             # Chunking via HTTP /chunk-async flow. Synchronous REQ/REP ingest

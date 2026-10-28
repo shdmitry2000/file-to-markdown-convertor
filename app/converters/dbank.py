@@ -30,9 +30,12 @@ critical 224-page Bank Hapoalim report (duah_hapoalim.pdf):
    layer, the page goes to the VLM.
 5. NUMBER CHECK on VLM pages that have a text layer: every number >= 1000 the
    VLM writes must be on the page (see number_check.py). A page that fails is
-   transcribed once more; if the better attempt still fails it is kept, logged,
+   transcribed once more — by VLM_ESCALATION_MODEL (gemini-3.8-flash) on the same
+   lane when the pod runs a weaker model; if the better attempt still fails it is kept, logged,
    and tagged with an HTML comment listing the numbers, so the flag travels with
-   the page into chunks.
+   the page into chunks. The same pass runs the TABLE CHECK (table_check.py):
+   each number in a markdown table must sit in its row and column on the page,
+   which catches a right number in the wrong cell — invisible to the number check.
 6. EMPTY VLM ANSWER: Vertex can block a harmless page outright (finish reason
    content_filter, promptFeedback SAFETY, not switchable via safety_settings).
    The page is asked once more; if it is still empty, a page docling already
@@ -54,7 +57,8 @@ import pymupdf as fitz  # `fitz` is the deprecated alias for the same module
 
 from app.registry import register_converter
 from .base import PDFConverter
-from .number_check import not_on_page, page_numbers
+from .number_check import not_on_page, numbers, numeric_runs
+from .table_check import misplaced
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,11 @@ _IMAGE_MIN_AREA_FRAC = 0.10  # a page image covering >= this fraction routes to 
 # 0.82-0.95 on such pages, <= 0.04 on every readable page of the sample set).
 _UNREADABLE_CTRL_RATIO = 0.20
 _VLM_CONCURRENCY = int(os.getenv("DBANK_VLM_CONCURRENCY", "8"))  # parallel VLM page calls
+# A page that fails the number or table check is asked again of this model, on the
+# same lane. A weaker model asked twice is a coin flip: gemini-3.5-flash-lite put a
+# year header over the wrong column on retry as often as not, while gemini-3.8-flash
+# had no misplaced cell on the 20-page table bench. Empty = retry the same model.
+_ESCALATION_MODEL = os.getenv("VLM_ESCALATION_MODEL", "gemini-3.8-flash").strip()
 _PAGE_SEP = "\n\n---\n\n"
 # Each kept page starts with its ORIGINAL 1-based page number. Skipped (blank)
 # pages leave gaps, so counting separators cannot recover page numbers; templates use
@@ -141,6 +150,7 @@ class DbankConverter(PDFConverter):
         self._vlm_concurrency = max(1, vlm_concurrency)
         self._docling = None
         self._vlm = None
+        self._strong = None  # the escalation model, when it differs from the VLM's
 
     # -- lazily-built, reused engines --------------------------------------
 
@@ -188,6 +198,9 @@ class DbankConverter(PDFConverter):
             # default as exact on digits (recall 0.998-1.0, no invented numbers)
             # and faster.
             self._vlm = VLMConverter(backend="factory")  # model via VLM_MODEL env
+            from . import vlm_lane
+            if _ESCALATION_MODEL and _ESCALATION_MODEL != vlm_lane.pod_model().rpartition("/")[2]:
+                self._strong = VLMConverter(backend="factory", model_name=_ESCALATION_MODEL)
 
     @staticmethod
     def _render(page) -> str:
@@ -225,27 +238,42 @@ class DbankConverter(PDFConverter):
         sub.close()
         return Path(name)
 
-    def _transcribe_checked(self, img_b64: str, ref, page_index: int) -> str:
-        """Transcribe a page; if it has numbers the page does not, try once more."""
+    def _transcribe_checked(self, img_b64: str, runs, page_index: int) -> str:
+        """Transcribe a page; if it has numbers the page does not, or numbers in the
+        wrong table cell, try once more. ``runs``: the page's numeric_runs."""
         md = self._vlm.transcribe_page(img_b64)
         if not md.strip():
             md = self._vlm.transcribe_page(img_b64)  # a provider block is intermittent
-        if ref is None:
+        if runs is None:
             return md
-        bad = not_on_page(md, ref)
-        if not bad:
+        ref = numbers("\n".join(text for text, _x, _y in runs))
+
+        def check(text):
+            return not_on_page(text, ref), misplaced(text, runs)[1]
+
+        bad, cells = check(md)
+        if not bad and not cells:
             return md
-        retry = self._vlm.transcribe_page(img_b64)
-        retry_bad = not_on_page(retry, ref)
-        if len(retry_bad) < len(bad):
-            md, bad = retry, retry_bad
-        if not bad:
-            logger.info("dbank: page %d number check passed on retry", page_index)
+        retry = (self._strong or self._vlm).transcribe_page(img_b64)
+        retry_bad, retry_cells = check(retry)
+        if len(retry_bad) + len(retry_cells) < len(bad) + len(cells):
+            md, bad, cells = retry, retry_bad, retry_cells
+        if not bad and not cells:
+            logger.info("dbank: page %d number/table check passed on retry%s", page_index,
+                        f" ({_ESCALATION_MODEL})" if self._strong else "")
             return md
-        shown = ", ".join(f"{v:,}" for v in bad[:20])
-        logger.warning("dbank: page %d has numbers not on the page after retry: %s",
-                       page_index, shown)
-        return f"{md}\n\n<!-- dbank: numbers not on the page: {shown} -->"
+        notes = []
+        if bad:
+            shown = ", ".join(f"{v:,}" for v in bad[:20])
+            logger.warning("dbank: page %d has numbers not on the page after retry: %s",
+                           page_index, shown)
+            notes.append(f"<!-- dbank: numbers not on the page: {shown} -->")
+        if cells:
+            shown = "; ".join(cells[:20])
+            logger.warning("dbank: page %d has table cells off their place after retry: %s",
+                           page_index, shown)
+            notes.append(f"<!-- dbank: table cells not where the page has them: {shown} -->")
+        return md + "\n\n" + "\n".join(notes)
 
     # -- PDFConverter interface --------------------------------------------
 
@@ -303,7 +331,7 @@ class DbankConverter(PDFConverter):
                     tmp.unlink(missing_ok=True)
 
                 if n_tables > 0:
-                    slots.append(["vlm", self._render(page), page_numbers(page), i, md])
+                    slots.append(["vlm", self._render(page), numeric_runs(page), i, md])
                     continue
 
                 ref_words = _heb_word_count(text)
@@ -312,13 +340,13 @@ class DbankConverter(PDFConverter):
                         "dbank: docling dropped text on page %d (%d/%d Hebrew words) "
                         "— VLM fallback", i, _heb_word_count(md), ref_words,
                     )
-                    slots.append(["vlm", self._render(page), page_numbers(page), i, md])
+                    slots.append(["vlm", self._render(page), numeric_runs(page), i, md])
                 elif (precision := _word_precision(md, text)) < self._precision_min:
                     logger.warning(
                         "dbank: docling scrambled words on page %d (%.0f%% found on the "
                         "page) — VLM fallback", i, precision * 100,
                     )
-                    slots.append(["vlm", self._render(page), page_numbers(page), i, md])
+                    slots.append(["vlm", self._render(page), numeric_runs(page), i, md])
                 else:
                     slots.append(["md", md, i])
                     n_docling += 1

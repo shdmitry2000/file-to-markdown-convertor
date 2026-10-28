@@ -107,6 +107,8 @@ class VLMConverter(PDFConverter):
         )
     """
 
+    _model_name: Optional[str] = None  # another model on the same lane (see __init__)
+
     def __init__(
         self,
         model: str = "qwen3-vl:4b-instruct-q4_K_M",
@@ -119,6 +121,7 @@ class VLMConverter(PDFConverter):
         backend: Optional[str] = None,
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
+        model_name: Optional[str] = None,
     ) -> None:
         self._temperature = temperature
         self._max_tokens = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
@@ -146,6 +149,12 @@ class VLMConverter(PDFConverter):
             # client owns vertex_location (gemini-3.x is global-only) and does the
             # vision call via vision_sync — no model/region config duplicated here.
             model_override = os.getenv("VLM_MODEL")
+            # model_name: another model on the same lane (dbank's escalation).
+            self._model_name = model_name
+            if model_name:
+                from . import vlm_lane
+                lane = vlm_lane.pod_model().rpartition("/")[0]
+                model_override = f"{lane}/{model_name}" if lane else model_name
             self._client = (LLMFactory.build(model_override) if model_override
                             else LLMFactory.from_env())
             if not hasattr(self._client, "vision_sync"):
@@ -223,8 +232,11 @@ class VLMConverter(PDFConverter):
     def _transcribe_page_factory(self, img_b64: str, prompt_text: str) -> str:
         """Transcribe one page through the shared LLMFactory client's vision_sync
         (the factory owns model + region + provider auth; the thinking-disable
-        fallback for models that reject it lives there too)."""
-        content = self._client.vision_sync(
+        fallback for models that reject it lives there too). A job that brought its
+        caller's connector goes through that instead (see vlm_lane)."""
+        from . import vlm_lane
+
+        content = (vlm_lane.client(self._model_name) or self._client).vision_sync(
             prompt_text, [img_b64],
             max_tokens=self._max_tokens,
             temperature=self._temperature,

@@ -407,6 +407,12 @@ class ConversionRequest(BaseModel):
     file_path: Optional[str] = None
     file_key: Optional[str] = None
     converter_type: str = "docling"  # Default to docling for backward compatibility
+    # Optional: the LLM connector the caller's project uses, for this job's VLM
+    # calls — {"model", "base_url", "connector_id", "auth_token", "project",
+    # "location"} (see app/converters/vlm_lane.py). It picks the lane, not the
+    # output, so a running conversion of the same file is still shared. Holds a
+    # token: it rides on the task to the worker and is never logged or stored.
+    llm_connector: Optional[dict] = None
 
 
 @app.post("/convert")
@@ -482,7 +488,8 @@ async def convert_file(request: ConversionRequest):
         "conversion_id": conversion_id,
         "file_path": file_path,
         "file_key": file_key,
-        "converter_type": request.converter_type
+        "converter_type": request.converter_type,
+        **({"llm_connector": request.llm_connector} if request.llm_connector else {}),
     }
 
     logger.info(f"Sending task {conversion_id} to the ZeroMQ queue with converter {request.converter_type}.")

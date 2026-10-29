@@ -125,10 +125,10 @@ class WorkerSettings(BaseSettings):
         if not base:
             return
         try:
-            from shared.file_storage import _local_root
+            from shared.file_storage import local_projects_root
         except ImportError:
             return
-        self.PROJECTS_BASE_PATH = str(_local_root(base))
+        self.PROJECTS_BASE_PATH = str(local_projects_root(base))
 
     def _configure_paths(self):
         """Resolve CONVERTED_FILES_DIR. Does NOT create it — see get_converted_files_dir().

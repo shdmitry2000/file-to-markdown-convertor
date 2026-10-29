@@ -282,16 +282,11 @@ COPY --chown=1001:0 ./app /home/appuser/app
 # shared/ and answered each storage-key /convert — the only kind the templates send —
 # with 503, while /health and the upload test passed. A build without shared/ now fails
 # at this COPY; vendor it first (make vendor-markdown-shared, or the enterprise sync).
-# The import below catches a partial copy.
+# The check below catches a partial copy: it imports every shared.* module app/ imports,
+# lazy ones included (1.4.8.2 reached enterprise without shared/space_llm.py and its VLM
+# calls answered 503 while this step only checked file_storage and llm_factory).
 COPY --chown=1001:0 ./shared/ /home/appuser/shared/
-RUN if cd /home/appuser && python -c "import shared.file_storage.keys" \
-       && [ -d /home/appuser/shared/llm_factory ]; then \
-      echo "shared libs: vendored"; \
-    else \
-      echo "ERROR: shared libs incomplete — shared/file_storage and shared/llm_factory must be" \
-           "vendored next to this Dockerfile (make vendor-markdown-shared, or the enterprise sync)." >&2; \
-      exit 1; \
-    fi
+RUN cd /home/appuser && python -m app.shared_check
 
 # Set PYTHONPATH so 'app' and 'shared' modules can be found
 ENV PYTHONPATH=/home/appuser

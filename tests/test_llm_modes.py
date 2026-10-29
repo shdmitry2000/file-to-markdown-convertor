@@ -264,3 +264,14 @@ def test_params_mode_on_this_pod_fails_page_converters_with_the_pods_reason(tmp_
     """Params mode uses the pod's lane, so OCP's missing token is what the user sees."""
     status, detail = _cold(_slide_pdf(tmp_path / "deck.pdf"), "vlm", {"mode": "params"})[:2]
     assert status == "error" and "PROXY_AUTH_TOKEN" in detail
+
+
+def test_a_lane_that_cannot_be_built_fails_at_once_without_retries(monkeypatch):
+    """A misconfiguration is not a transient fault: no backoff before the message."""
+    from app.converters.vlm import VLMConverter
+
+    sleeps = []
+    monkeypatch.setattr("app.converters.vlm.time.sleep", sleeps.append)
+    with pytest.raises(ValueError, match="PROXY_AUTH_TOKEN"):
+        VLMConverter(backend="factory").transcribe_page("aW1n")
+    assert sleeps == []

@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from app import __version__, embedded_workers, storage
+from app import __version__, embedded_workers, llm_settings, storage
 
 # Configure logging
 logging.basicConfig(
@@ -417,16 +417,16 @@ class ConversionRequest(BaseModel):
     llm_connector: Optional[dict] = None
 
 
-def _job_lane(request: ConversionRequest) -> Optional[dict]:
-    """The lane dict the worker gets: ``llm`` (mode defaults to params), else the
-    pre-1.4.9 ``llm_connector`` as it came (no mode)."""
-    if request.llm:
-        mode = request.llm.get("mode") or "params"
+def _job_lane(llm: Optional[dict], llm_connector: Optional[dict] = None) -> Optional[dict]:
+    """The lane a caller sent: ``llm`` (mode defaults to params), else the pre-1.4.9
+    ``llm_connector`` as it came (no mode). None = the converter LLM."""
+    if llm:
+        mode = llm.get("mode") or "params"
         if mode not in ("space", "params"):
             raise HTTPException(status_code=400,
                                 detail=f"llm.mode must be 'space' or 'params', got {mode!r}")
-        return {**request.llm, "mode": mode}
-    return request.llm_connector or None
+        return {**llm, "mode": mode}
+    return llm_connector or None
 
 
 @app.post("/convert")
@@ -440,7 +440,7 @@ async def convert_file(request: ConversionRequest):
             status_code=400,
             detail="send exactly one of file_key (preferred) or file_path",
         )
-    lane = _job_lane(request)
+    lane = llm_settings.job_lane(_job_lane(request.llm, request.llm_connector))
 
     if request.file_key:
         try:
@@ -739,17 +739,99 @@ async def get_converted_file(file_path: str):
 
 # ==================== DEBUG ENDPOINTS ====================
 
+class ConverterLLM(BaseModel):
+    """The converter LLM, as the fields a space connector has."""
+    model: str  # "<connection type>/<model>", e.g. vertex_proxy/gemini-3.8-flash
+    base_url: Optional[str] = None
+    connector_id: Optional[str] = None
+    auth_token: Optional[str] = None
+    project: Optional[str] = None
+    location: Optional[str] = None
+
+
+# A 1x1 PNG: the smallest image a vision call accepts.
+_PROBE_PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+              "hKmMIQAAAABJRU5ErkJggg==")
+
+
+@app.get("/llm")
+async def get_converter_llm():
+    """The converter LLM in use (runtime or env) — never the token itself."""
+    return llm_settings.describe()
+
+
+@app.post("/llm/test")
+async def test_converter_llm():
+    """One tiny vision call on the converter LLM: does it answer, and how fast."""
+    from app.converters import vlm_lane
+
+    def probe():
+        started = time.time()
+        with vlm_lane.job(llm_settings.job_lane(None)):
+            spec = vlm_lane.model()
+            vlm_lane.client().vision_sync("Reply with the word OK.", [_PROBE_PNG], max_tokens=16)
+        return spec, round((time.time() - started) * 1000)
+
+    try:
+        spec, ms = await asyncio.to_thread(probe)
+    except Exception as exc:  # noqa: BLE001 - the answer IS the error
+        # Whole message on one line: the factory puts the missing setting on line two.
+        return {"ok": False, "error": f"{type(exc).__name__}: {' '.join(str(exc).split())[:500]}"}
+    return {"ok": True, "model": spec, "latency_ms": ms}
+
+
+def _require_runtime_change() -> None:
+    if not llm_settings.runtime_change_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="the converter LLM is set by this deployment (env/Helm); "
+                   "LLM_RUNTIME_CHANGE=true enables changing it here")
+
+
+@app.put("/llm")
+async def put_converter_llm(body: ConverterLLM):
+    """Replace the converter LLM until restart (LLM_RUNTIME_CHANGE only)."""
+    from app.converters import vlm_lane
+
+    _require_runtime_change()
+    value = {k: v for k, v in body.model_dump().items() if v}
+    if "/" not in value["model"]:
+        raise HTTPException(status_code=400,
+                            detail="model is '<connection type>/<model>', e.g. vertex_proxy/gemini-3.8-flash")
+    missing = vlm_lane._missing(value, value["model"])
+    if missing:
+        raise HTTPException(status_code=400,
+                            detail=f"{value['model']} needs {', '.join(missing)}")
+    try:
+        llm_settings.store().set(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.info("Converter LLM set at runtime: %s", value["model"])
+    return llm_settings.describe()
+
+
+@app.delete("/llm")
+async def delete_converter_llm():
+    """Back to the env default (LLM_RUNTIME_CHANGE only)."""
+    _require_runtime_change()
+    llm_settings.store().clear()
+    logger.info("Converter LLM back to the env default")
+    return llm_settings.describe()
+
+
 @app.post("/debug/convert")
 async def debug_convert_file(
     file: UploadFile = File(...),
     converter_type: Optional[str] = Form(None),
     wait: bool = Form(False),
+    llm: Optional[str] = Form(None),
 ):
     """Upload a document and test conversion with timing.
 
     Routes by format so the check exercises the same converter the ingest path
     would pick (.xlsx/.xlsm/.xls → excel, everything else → docling). Pass
-    `converter_type` to force a specific one.
+    `converter_type` to force a specific one, and `llm` (the JSON object /convert
+    takes) to convert with another LLM than the converter LLM.
 
     Returns as soon as the job is queued (the default, ``wait=false``); poll
     ``GET /convert/{id}`` and fetch ``/debug/conversion/{id}/result``. A large PDF
@@ -759,6 +841,11 @@ async def debug_convert_file(
     for a direct call that no proxy sits in front of.
     """
     logger.info(f"Debug conversion request for file: {file.filename}")
+    try:
+        sent = json.loads(llm) if llm else None
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"llm is not JSON: {exc.msg}")
+    lane = llm_settings.job_lane(_job_lane(sent))
     start_time = time.time()
     selected_converter = (converter_type or "").strip() or converter_for(file.filename)
     
@@ -778,7 +865,8 @@ async def debug_convert_file(
     task = {
         "conversion_id": conversion_id,
         "file_path": str(temp_path),
-        "converter_type": selected_converter
+        "converter_type": selected_converter,
+        **({"llm_connector": lane} if lane else {}),
     }
     logger.info(f"Debug conversion {conversion_id} routed to converter {selected_converter}")
 

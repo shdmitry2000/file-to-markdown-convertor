@@ -119,6 +119,21 @@ def _missing(conn: dict, spec: str) -> list[str]:
     return [c for c in need if not (conn.get(c) or "").strip()]
 
 
+_IDENTITY = ("base_url", "connector_id", "auth_token", "project", "location")
+
+
+def _own_identity(conn: dict) -> bool:
+    """Whether the job's own identity is used rather than this pod's env: always in
+    space mode; in params mode when the request (or the runtime converter LLM) sends
+    any; with no mode, only with a token (1.4.8.1)."""
+    mode = conn.get("mode")
+    if mode == "space":
+        return True
+    if mode == "params":
+        return any(conn.get(k) for k in _IDENTITY)
+    return bool(conn.get("auth_token"))
+
+
 def _creds(conn: dict, spec: str):
     from shared.connector_credentials import ConnectorCreds
 
@@ -127,7 +142,7 @@ def _creds(conn: dict, spec: str):
         connector_id=conn.get("connector_id") or "",
         auth_token=conn.get("auth_token") or "",
         # The identity is the caller's own, so pinned_client uses it instead of env.
-        source="space" if conn.get("auth_token") or conn.get("mode") == "space" else "global",
+        source="space" if _own_identity(conn) else "global",
         project=conn.get("project"), location=conn.get("location"), model=spec,
     )
 
@@ -142,7 +157,7 @@ def _build(conn: dict, name: Optional[str]):
         check(conn)
         return pinned_client(_creds(conn, spec), spec)
     if mode == "params":
-        if conn.get("auth_token"):
+        if _own_identity(conn):
             return pinned_client(_creds(conn, spec), spec)
         return LLMFactory.build(spec)
     if conn.get("model"):  # no mode: a 1.4.7.8–1.4.8.x caller
@@ -165,10 +180,8 @@ def client(name: Optional[str] = None):
     conn = _job or {}
     # Keyed on what is built: the spec, plus the identity only when the caller's is used
     # — so "params, no fields" and "no llm at all" share the pod's one client.
-    own = conn.get("mode") == "space" or bool(conn.get("auth_token")) or (
-        conn.get("mode") is None and bool(conn.get("model")))
-    ident = [conn.get(k) for k in ("base_url", "connector_id", "auth_token", "project",
-                                   "location")] if own else None
+    own = _own_identity(conn) or (conn.get("mode") is None and bool(conn.get("model")))
+    ident = [conn.get(k) for k in _IDENTITY] if own else None
     key = hashlib.sha256(json.dumps([model(name), ident]).encode()).hexdigest()
     if key not in _clients:
         built = _build(conn, name)

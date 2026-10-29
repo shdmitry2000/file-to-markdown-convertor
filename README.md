@@ -194,6 +194,73 @@ curl http://localhost:8000/converted/document.md
 curl http://localhost:8000/health
 ```
 
+## Choosing the LLM
+
+Converters that read images (dbank's table, image and scanned pages, pictures inside
+Word and PowerPoint files, `slides`, `vlm`, and the fallback for a PDF whose text
+layer is broken) call an LLM. Which one is decided per conversion:
+
+1. **The LLM the request sends** (`llm` on `POST /convert` or `/debug/convert`), if any.
+2. Otherwise **the converter LLM**: markdown-api's own.
+
+### The converter LLM
+
+Set it in the environment, with the names the RAG platform's spaces use. Any type
+works:
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `LLM_CONNECTOR_TYPE` | `vertex_proxy`, `vertex_ai`, `openai` | Connection type |
+| `LLM_TYPE` | `gemini-3.8-flash` | Model name, without the type |
+| `VLM_MODEL` | `vertex_ai/gemini-3.5-flash-lite` | Optional: another model for images, as `<type>/<model>` |
+| `PROXY_BASE_URL`, `PROXY_CONNECTOR_ID`, `PROXY_AUTH_TOKEN` | | `vertex_proxy`: address, connector id, token (a secret) |
+| `GOOGLE_CLOUD_PROJECT_ID`, `VERTEX_LOCATION` | | `vertex_ai`: project and region |
+| `OPENAI_API_KEY` | | `openai` |
+
+See what is in use, and try it:
+
+```bash
+curl http://localhost:8000/llm        # type/model, address, project … and whether a token is set (never the token)
+curl -X POST http://localhost:8000/llm/test   # one small call: {"ok": true, "model": …, "latency_ms": …} or the reason it failed
+```
+
+### Changing it without a restart
+
+With `LLM_RUNTIME_CHANGE=true`, the converter LLM can be replaced through the API:
+
+```bash
+curl -X PUT http://localhost:8000/llm -H "Content-Type: application/json" -d '{
+  "model": "vertex_proxy/gemini-3.8-flash",
+  "base_url": "https://proxy.example", "connector_id": "my-connector", "auth_token": "…"}'
+curl -X DELETE http://localhost:8000/llm      # back to the environment
+```
+
+A change lasts until the service restarts; then the environment applies again. The
+fields a type needs are checked first (a `vertex_proxy` needs `base_url`,
+`connector_id` and `auth_token`; a `vertex_ai` needs `project`), and a request
+missing one is refused with the field named. Without `LLM_RUNTIME_CHANGE`, `PUT` and
+`DELETE` answer 403. The service has no login of its own: turn this on only where
+nobody but its callers can reach it. Inside the RAG platform it is off — the
+converter LLM comes from Helm, and each space sends its own.
+
+### Sending an LLM with a conversion
+
+```bash
+curl -X POST http://localhost:8000/convert -H "Content-Type: application/json" -d '{
+  "file_path": "files_to_convert/report.pdf", "converter_type": "dbank",
+  "llm": {"mode": "space", "model": "vertex_proxy/gemini-3.8-flash",
+          "base_url": "https://proxy.example", "connector_id": "c-1", "auth_token": "…"}}'
+```
+
+- `"mode": "space"` — use exactly this LLM, nothing from markdown-api's environment.
+  If a field the type needs is missing, the conversion fails and names it.
+- `"mode": "params"` (or no `mode`) — the converter LLM, with the fields sent on top
+  (for example only `"model"`, to use another model on the same connection).
+
+`/debug/convert` takes the same object as a form field: `-F 'llm={"model": "…"}'`.
+The token is kept in memory for that one conversion; it is never logged, stored or
+written into the output. The older `llm_connector` field still works as before.
+
 ## File Structure
 
 ```

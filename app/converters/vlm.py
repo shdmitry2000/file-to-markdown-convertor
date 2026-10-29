@@ -108,6 +108,7 @@ class VLMConverter(PDFConverter):
     """
 
     _model_name: Optional[str] = None  # another model on the same lane (see __init__)
+    _backend: Optional[str] = None  # set by __init__; None = no lane to build
 
     def __init__(
         self,
@@ -181,6 +182,7 @@ class VLMConverter(PDFConverter):
         import fitz  # PyMuPDF
 
         self.validate_path(pdf_path)
+        self._build_lane()
 
         pages: list[str] = []
 
@@ -263,7 +265,16 @@ class VLMConverter(PDFConverter):
         thread pool over this method parallelises cleanly while one converter
         instance (and its factory/client config) is shared read-only.
         """
+        self._build_lane()
         return self._transcribe_page_with_retry(img_b64)
+
+    def _build_lane(self) -> None:
+        """Build this job's client before the retry loop (cached after the first call):
+        a lane that cannot be built is a configuration error, and retrying it only
+        delays the message that says which setting is missing."""
+        if self._backend == "factory":
+            from . import vlm_lane
+            vlm_lane.client(self._model_name)
 
     def _transcribe_page_with_retry(self, img_b64: str) -> str:
         """Call ``_transcribe_page``, retrying what another attempt can fix.

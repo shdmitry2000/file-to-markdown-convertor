@@ -8,6 +8,8 @@ call, and each LiteLLM line came out twice (its own handler + the root one).
 import importlib
 import logging
 
+from unittest.mock import patch
+
 import pytest
 
 import app.converters.vlm as vlm
@@ -48,8 +50,8 @@ def test_factory_call_omits_temperature_when_unset():
             return "page"
 
     conv = _converter("factory", None)
-    conv._client = Client()
-    assert conv._transcribe_page("img") == "page"
+    with patch("app.converters.vlm_lane.client", return_value=Client()):
+        assert conv._transcribe_page("img") == "page"
     assert seen["temperature"] is None  # vision_sync sends nothing for None
 
 

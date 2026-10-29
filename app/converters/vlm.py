@@ -140,31 +140,12 @@ class VLMConverter(PDFConverter):
         self._backend = (backend or os.getenv("VLM_BACKEND", "factory")).lower()
 
         if self._backend == "factory":
-            from shared.llm_factory import LLMFactory
-
-            # Use the factory as the single source of truth for model + region +
-            # provider auth. Model comes from LLM_FACTORY_PROVIDER (e.g.
-            # vertex_ai/gemini-3.5-flash); set VLM_MODEL only to give the vision
-            # lane a *different* model than the general LLM lane. The factory
-            # client owns vertex_location (gemini-3.x is global-only) and does the
-            # vision call via vision_sync — no model/region config duplicated here.
-            model_override = os.getenv("VLM_MODEL")
+            # The lane (type, model, identity) is picked per job by vlm_lane — the
+            # space's connector or this pod's env — and built on the first call, so a
+            # converter that never calls the LLM never needs its credentials.
             # model_name: another model on the same lane (dbank's escalation).
             self._model_name = model_name
-            if model_name:
-                from . import vlm_lane
-                lane = vlm_lane.pod_model().rpartition("/")[0]
-                model_override = f"{lane}/{model_name}" if lane else model_name
-            self._client = (LLMFactory.build(model_override) if model_override
-                            else LLMFactory.from_env())
-            if not hasattr(self._client, "vision_sync"):
-                raise RuntimeError(
-                    "VLM factory backend needs a litellm/vertex provider with vision "
-                    f"(got {type(self._client).__name__}); set LLM_FACTORY_PROVIDER / "
-                    "VLM_MODEL to a vertex_ai or gemini model."
-                )
-            self._model = getattr(self._client, "_model", "factory")
-            logger.info("VLMConverter backend=factory model=%s", self._model)
+            self._model = "factory"
             return
 
         from openai import OpenAI
@@ -236,7 +217,7 @@ class VLMConverter(PDFConverter):
         caller's connector goes through that instead (see vlm_lane)."""
         from . import vlm_lane
 
-        content = (vlm_lane.client(self._model_name) or self._client).vision_sync(
+        content = vlm_lane.client(self._model_name).vision_sync(
             prompt_text, [img_b64],
             max_tokens=self._max_tokens,
             temperature=self._temperature,

@@ -197,10 +197,22 @@ class DbankConverter(PDFConverter):
             # per call: an A/B on Hebrew bank-report table pages found the model
             # default as exact on digits (recall 0.998-1.0, no invented numbers)
             # and faster.
-            self._vlm = VLMConverter(backend="factory")  # model via VLM_MODEL env
-            from . import vlm_lane
-            if _ESCALATION_MODEL and _ESCALATION_MODEL != vlm_lane.pod_model().rpartition("/")[2]:
+            self._vlm = VLMConverter(backend="factory")  # the job's lane (vlm_lane)
+            if _ESCALATION_MODEL:
+                # Same lane, stronger model. The lane differs per job (space or pod), so
+                # whether it is really another model is only known at call time.
                 self._strong = VLMConverter(backend="factory", model_name=_ESCALATION_MODEL)
+
+    def _escalates(self) -> bool:
+        """Whether a retry goes to the escalation model: not when this job's lane (the
+        space's or the pod's) already runs it. An unknown lane escalates as configured."""
+        if self._strong is None:
+            return False
+        from . import vlm_lane
+        try:
+            return vlm_lane.model() != vlm_lane.model(_ESCALATION_MODEL)
+        except Exception:  # noqa: BLE001 - no lane configured; the call itself will say
+            return True
 
     @staticmethod
     def _render(page) -> str:
@@ -254,13 +266,14 @@ class DbankConverter(PDFConverter):
         bad, cells = check(md)
         if not bad and not cells:
             return md
-        retry = (self._strong or self._vlm).transcribe_page(img_b64)
+        strong = self._strong if self._escalates() else None
+        retry = (strong or self._vlm).transcribe_page(img_b64)
         retry_bad, retry_cells = check(retry)
         if len(retry_bad) + len(retry_cells) < len(bad) + len(cells):
             md, bad, cells = retry, retry_bad, retry_cells
         if not bad and not cells:
             logger.info("dbank: page %d number/table check passed on retry%s", page_index,
-                        f" ({_ESCALATION_MODEL})" if self._strong else "")
+                        f" ({_ESCALATION_MODEL})" if strong else "")
             return md
         notes = []
         if bad:

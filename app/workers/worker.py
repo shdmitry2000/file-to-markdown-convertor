@@ -259,8 +259,15 @@ def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, re
     and so tests can swap in their own callable without monkeypatching.
     ``llm_connector``: the caller's connector for the VLM calls (see vlm_lane).
     """
+    import traceback
+
     from app.converters import vlm_lane
 
+    try:
+        vlm_lane.check(llm_connector)
+    except vlm_lane.LaneError as e:  # before any work, so the caller gets the reason
+        result_queue.put(("error", str(e), traceback.format_exc()))
+        return
     with vlm_lane.job(llm_connector):
         _convert_job(file_path, converter_type, do_ocr, result_queue, do_table_structure)
 

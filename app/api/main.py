@@ -407,12 +407,26 @@ class ConversionRequest(BaseModel):
     file_path: Optional[str] = None
     file_key: Optional[str] = None
     converter_type: str = "docling"  # Default to docling for backward compatibility
-    # Optional: the LLM connector the caller's project uses, for this job's VLM
-    # calls — {"model", "base_url", "connector_id", "auth_token", "project",
-    # "location"} (see app/converters/vlm_lane.py). It picks the lane, not the
-    # output, so a running conversion of the same file is still shared. Holds a
-    # token: it rides on the task to the worker and is never logged or stored.
+    # Optional: the LLM for this job's calls — {"mode": "space" | "params", "model",
+    # "base_url", "connector_id", "auth_token", "project", "location"} (see
+    # app/converters/vlm_lane.py). space = the caller's space connector only;
+    # params = this pod's lane with these fields on top. Holds a token: it rides on
+    # the task to the worker and is never logged or stored.
+    llm: Optional[dict] = None
+    # Before 1.4.9: the caller's connector with no mode (vlm_lane's no-mode rules).
     llm_connector: Optional[dict] = None
+
+
+def _job_lane(request: ConversionRequest) -> Optional[dict]:
+    """The lane dict the worker gets: ``llm`` (mode defaults to params), else the
+    pre-1.4.9 ``llm_connector`` as it came (no mode)."""
+    if request.llm:
+        mode = request.llm.get("mode") or "params"
+        if mode not in ("space", "params"):
+            raise HTTPException(status_code=400,
+                                detail=f"llm.mode must be 'space' or 'params', got {mode!r}")
+        return {**request.llm, "mode": mode}
+    return request.llm_connector or None
 
 
 @app.post("/convert")
@@ -426,6 +440,7 @@ async def convert_file(request: ConversionRequest):
             status_code=400,
             detail="send exactly one of file_key (preferred) or file_path",
         )
+    lane = _job_lane(request)
 
     if request.file_key:
         try:
@@ -489,7 +504,7 @@ async def convert_file(request: ConversionRequest):
         "file_path": file_path,
         "file_key": file_key,
         "converter_type": request.converter_type,
-        **({"llm_connector": request.llm_connector} if request.llm_connector else {}),
+        **({"llm_connector": lane} if lane else {}),
     }
 
     logger.info(f"Sending task {conversion_id} to the ZeroMQ queue with converter {request.converter_type}.")

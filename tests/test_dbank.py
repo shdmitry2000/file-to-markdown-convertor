@@ -296,10 +296,23 @@ def test_a_failed_page_goes_to_the_stronger_model():
 ])
 def test_escalation_only_when_the_pod_runs_a_weaker_model(monkeypatch, pod, escalates):
     monkeypatch.setenv("VLM_MODEL", pod)
-    built = []
-    with patch("app.converters.vlm.VLMConverter.__init__",
-               lambda self, **kw: built.append(kw)):
+    with patch("app.converters.vlm.VLMConverter.__init__", lambda self, **kw: None):
         conv = DbankConverter()
         conv._ensure_vlm()
-    assert (conv._strong is not None) == escalates
-    assert built[-1].get("model_name") == ("gemini-3.8-flash" if escalates else None)
+    assert conv._escalates() == escalates
+
+
+@pytest.mark.parametrize("space_model, escalates", [
+    ("vertex_proxy/gemini-3.5-flash-lite", True),
+    ("vertex_proxy/gemini-3.8-flash", False),
+])
+def test_escalation_follows_the_spaces_model_not_the_pods(monkeypatch, space_model, escalates):
+    from app.converters import vlm_lane
+    monkeypatch.setenv("VLM_MODEL", "vertex_ai/gemini-3.5-flash-lite")
+    space = {"mode": "space", "model": space_model, "base_url": "https://p",
+             "connector_id": "c", "auth_token": "t"}
+    with patch("app.converters.vlm.VLMConverter.__init__", lambda self, **kw: None):
+        conv = DbankConverter()
+        conv._ensure_vlm()
+    with vlm_lane.job(space):
+        assert conv._escalates() == escalates

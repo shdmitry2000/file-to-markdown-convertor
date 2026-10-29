@@ -11,6 +11,8 @@ from app.converters import vlm_lane
 from app.workers import worker
 from tests import _timeout_targets as targets
 
+ENV_CLIENT = MagicMock(name="env-client")
+PROXY_CLIENT = MagicMock(name="proxy-client")
 PROXY = {"model": "vertex_proxy/gemini-3.5-flash", "base_url": "https://proxy",
          "connector_id": "c-1", "auth_token": "SECRET-TOKEN", "project": "p"}
 
@@ -31,17 +33,20 @@ def test_another_provider_keeps_its_own_model():
 
 
 def test_no_connector_means_the_pods_env_lane():
-    assert vlm_lane.client() is None
-    with vlm_lane.job(None):
-        assert vlm_lane.client() is None
+    with patch("shared.llm_factory.LLMFactory.build", return_value=ENV_CLIENT) as build:
+        assert vlm_lane.client() is ENV_CLIENT
+        with vlm_lane.job(None):
+            assert vlm_lane.client() is ENV_CLIENT
+    build.assert_called_once_with("vertex_ai/gemini-3.8-flash")  # built once, cached
 
 
 def test_the_connector_is_pinned_for_the_job_only():
-    with patch("shared.space_llm.pinned_client", return_value="proxy-client") as pin:
+    with patch("shared.space_llm.pinned_client", return_value=PROXY_CLIENT) as pin, \
+         patch("shared.llm_factory.LLMFactory.build", return_value=ENV_CLIENT):
         with vlm_lane.job(PROXY):
-            assert vlm_lane.client() == "proxy-client"
-            assert vlm_lane.client() == "proxy-client"  # built once per connector
-        assert vlm_lane.client() is None
+            assert vlm_lane.client() is PROXY_CLIENT
+            assert vlm_lane.client() is PROXY_CLIENT  # built once per connector
+        assert vlm_lane.client() is ENV_CLIENT
     creds, spec = pin.call_args.args
     assert pin.call_count == 1 and spec == "vertex_proxy/gemini-3.8-flash"
     assert (creds.base_url, creds.connector_id, creds.auth_token, creds.source) == (
@@ -52,10 +57,10 @@ def test_vlm_calls_go_through_the_jobs_lane():
     env, lane = MagicMock(), MagicMock()
     env.vision_sync.return_value = "env"
     lane.vision_sync.return_value = "proxy"
-    with patch("shared.llm_factory.LLMFactory.build", return_value=env):
-        from app.converters.vlm import VLMConverter
-        vlm = VLMConverter(backend="factory")
-    with patch("shared.space_llm.pinned_client", return_value=lane):
+    from app.converters.vlm import VLMConverter
+    vlm = VLMConverter(backend="factory")
+    with patch("shared.space_llm.pinned_client", return_value=lane), \
+         patch("shared.llm_factory.LLMFactory.build", return_value=env):
         assert vlm.transcribe_page("aW1n") == "env"
         with vlm_lane.job(PROXY):
             assert vlm.transcribe_page("aW1n") == "proxy"
@@ -93,11 +98,10 @@ def test_another_model_on_the_same_lane():
     # env lane: the pod's lane, the asked-for model
     env = MagicMock()
     with patch("shared.llm_factory.LLMFactory.build", return_value=env) as build:
-        from app.converters.vlm import VLMConverter
-        VLMConverter(backend="factory", model_name="gemini-9-pro")
+        vlm_lane.client("gemini-9-pro")
     build.assert_called_with("vertex_ai/gemini-9-pro")
     # a caller's lane: its connector type, the asked-for model
-    with patch("shared.space_llm.pinned_client", return_value="c") as pin, vlm_lane.job(PROXY):
+    with patch("shared.space_llm.pinned_client", return_value=PROXY_CLIENT) as pin, vlm_lane.job(PROXY):
         vlm_lane.client("gemini-9-pro")
     assert pin.call_args.args[1] == "vertex_proxy/gemini-9-pro"
 
@@ -129,18 +133,25 @@ def test_a_lane_sent_without_credentials_falls_back_to_the_pods_lane(no_proxy_en
     """What a 1.4.7.8–1.4.7.9 template sends on the deployment's connector: every page
     failed with 'vertex_proxy: missing required env var PROXY_AUTH_TOKEN'."""
     caplog.set_level(logging.WARNING)
-    with vlm_lane.job({"model": "vertex_proxy/gemini-3.5-flash", "project": "p"}):
-        assert vlm_lane.client() is None
+    from shared.llm_factory import LLMFactory
+    real = LLMFactory.build
+
+    def build(spec, creds=None):  # the real check for the proxy, a stub for the pod
+        return real(spec, creds) if spec.startswith("vertex_proxy/") else ENV_CLIENT
+
+    with patch("shared.llm_factory.LLMFactory.build", side_effect=build), \
+         vlm_lane.job({"model": "vertex_proxy/gemini-3.5-flash", "project": "p"}):
+        assert vlm_lane.client() is ENV_CLIENT
     assert "came without credentials" in caplog.text
 
 
 def test_vlm_calls_on_a_lane_without_credentials_use_the_pods_lane(no_proxy_env):
     env = MagicMock()
     env.vision_sync.return_value = "env"
-    with patch("shared.llm_factory.LLMFactory.build", return_value=env):
-        from app.converters.vlm import VLMConverter
-        vlm = VLMConverter(backend="factory")
-    with vlm_lane.job({"model": "vertex_proxy/gemini-3.5-flash"}):
+    from app.converters.vlm import VLMConverter
+    vlm = VLMConverter(backend="factory")
+    with patch("shared.llm_factory.LLMFactory.build", return_value=env), \
+         vlm_lane.job({"model": "vertex_proxy/gemini-3.5-flash"}):
         assert vlm.transcribe_page("aW1n") == "env"
 
 

@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from app import embedded_workers, storage
+from app import __version__, embedded_workers, storage
 
 # Configure logging
 logging.basicConfig(
@@ -161,7 +161,7 @@ _dispatcher_thread: Optional[threading.Thread] = None
 _embedded_workers: Optional[embedded_workers.EmbeddedWorkers] = None
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(version=__version__, lifespan=lifespan)
 
 # Guarded like every other shared/ import in this service (see vlm.py,
 # worker.py): the platform libs are vendored only when the image is built from

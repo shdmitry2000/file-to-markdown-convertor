@@ -234,6 +234,23 @@ def _vlm_fallback_enabled() -> bool:
     return os.getenv("VLM_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
 
 
+def _vlm_fallback_wanted(file_path: str, markdown: str) -> bool:
+    """Whether unusable docling output should be re-read by the VLM.
+
+    PDFs only: the VLM reads rendered PDF pages, and a broken text layer is a PDF
+    problem. A table-heavy docx (a form of `|` and blanks) reads as unusable by
+    letter ratio, and sending it to the VLM failed the whole file. Other formats
+    keep docling's output, unless there is none at all.
+    """
+    if not (_vlm_fallback_enabled() and _docling_output_unusable(markdown)):
+        return False
+    if Path(file_path).suffix.lower() == ".pdf":
+        return True
+    if not markdown.strip():
+        raise Exception("Unreadable document: docling produced no text — needs review.")
+    return False
+
+
 def _convert_in_subprocess(file_path: str, converter_type: str, do_ocr: bool, result_queue,
                            do_table_structure: bool = True, llm_connector: dict | None = None) -> None:
     """Subprocess target: run a single conversion and put the result on `result_queue`.
@@ -278,7 +295,7 @@ def _convert_job(file_path: str, converter_type: str, do_ocr: bool, result_queue
             # letters. Retry such docs with the VLM (vision) converter, which reads
             # the rendered page instead of the text layer. Fail loudly if even VLM
             # produces nothing, so the doc is flagged rather than silently indexed.
-            if _vlm_fallback_enabled() and _docling_output_unusable(markdown):
+            if _vlm_fallback_wanted(file_path, markdown):
                 logger.warning(
                     "docling output unusable for %s (letters=%d, len=%d) — falling back to VLM",
                     file_path, _letter_count(markdown), len(markdown),
@@ -579,7 +596,7 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
                 doc_origin = repr(result.document.origin)
                 converter_used = "docling"
                 # Same broken-text-layer → VLM fallback as the cold path.
-                if _vlm_fallback_enabled() and _docling_output_unusable(markdown):
+                if _vlm_fallback_wanted(file_path, markdown):
                     from app.converters.vlm import VLMConverter
                     vlm_markdown = VLMConverter(backend="factory").convert(Path(file_path))
                     if _docling_output_unusable(vlm_markdown):

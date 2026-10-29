@@ -100,3 +100,53 @@ def test_another_model_on_the_same_lane():
     with patch("shared.space_llm.pinned_client", return_value="c") as pin, vlm_lane.job(PROXY):
         vlm_lane.client("gemini-9-pro")
     assert pin.call_args.args[1] == "vertex_proxy/gemini-9-pro"
+
+
+# --- the lane on a pod with no proxy env (OCP: "missing PROXY_AUTH_TOKEN") -----------
+# These build the real client: the defect lived in what pinned_client does with the
+# connector it is given, which the mocks above never reach.
+
+_PROXY_ENV = ("PROXY_AUTH_TOKEN", "PROXY_BASE_URL", "PROXY_CONNECTOR_ID", "PROXY_URL")
+
+
+@pytest.fixture
+def no_proxy_env(monkeypatch):
+    for name in _PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_a_complete_connector_needs_no_proxy_env_on_this_pod(no_proxy_env):
+    from shared.llm_factory.backends.litellm.vertex_proxy import VertexProxyClient
+
+    with vlm_lane.job(PROXY):
+        c = vlm_lane.client()
+    assert isinstance(c, VertexProxyClient)
+    assert (c._base_url, c._connector_id, c._auth_token) == ("https://proxy", "c-1", "SECRET-TOKEN")
+    assert c.provider == "vertex_proxy/gemini-3.8-flash"     # the pod's vision model
+
+
+def test_a_lane_sent_without_credentials_falls_back_to_the_pods_lane(no_proxy_env, caplog):
+    """What a 1.4.7.8–1.4.7.9 template sends on the deployment's connector: every page
+    failed with 'vertex_proxy: missing required env var PROXY_AUTH_TOKEN'."""
+    caplog.set_level(logging.WARNING)
+    with vlm_lane.job({"model": "vertex_proxy/gemini-3.5-flash", "project": "p"}):
+        assert vlm_lane.client() is None
+    assert "came without credentials" in caplog.text
+
+
+def test_vlm_calls_on_a_lane_without_credentials_use_the_pods_lane(no_proxy_env):
+    env = MagicMock()
+    env.vision_sync.return_value = "env"
+    with patch("shared.llm_factory.LLMFactory.build", return_value=env):
+        from app.converters.vlm import VLMConverter
+        vlm = VLMConverter(backend="factory")
+    with vlm_lane.job({"model": "vertex_proxy/gemini-3.5-flash"}):
+        assert vlm.transcribe_page("aW1n") == "env"
+
+
+def test_a_complete_connector_that_cannot_be_built_still_fails():
+    """Only a lane with no identity falls back: a broken one with its own token is an
+    error to see, not one to route around."""
+    with patch("shared.space_llm.pinned_client", side_effect=ValueError("bad endpoint")):
+        with vlm_lane.job(PROXY), pytest.raises(ValueError):
+            vlm_lane.client()

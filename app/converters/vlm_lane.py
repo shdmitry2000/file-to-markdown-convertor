@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from contextlib import contextmanager
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 _GEMINI_SCHEMES = {"vertex_proxy", "vertex_ai", "gemini", "gemini_proxy", "google_genai"}
 
@@ -84,5 +87,17 @@ def client(name: Optional[str] = None):
             source="space" if conn.get("auth_token") else "global",
             project=conn.get("project"), location=conn.get("location"), model=spec,
         )
-        _clients[key] = pinned_client(creds, spec)
+        try:
+            _clients[key] = pinned_client(creds, spec)
+        except ValueError as exc:
+            # A lane with no identity of its own (a 1.4.7.8–1.4.7.9 caller on the
+            # deployment's connector sends only the type) needs this pod's env for that
+            # lane, e.g. PROXY_AUTH_TOKEN. Without it every page would fail: use the
+            # pod's own lane instead, as before connectors were forwarded.
+            if conn.get("auth_token"):
+                raise
+            logger.warning("VLM lane %s came without credentials and this pod cannot "
+                           "build it (%s); using the pod's own lane",
+                           spec, str(exc).splitlines()[0][:120])
+            _clients[key] = None
     return _clients[key]

@@ -217,6 +217,14 @@ works:
 | `GOOGLE_CLOUD_PROJECT_ID`, `VERTEX_LOCATION` | | `vertex_ai`: project and region |
 | `OPENAI_API_KEY` | | `openai` |
 
+Page calls to the LLM are limited and retried:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DBANK_VLM_CONCURRENCY` | `8` | Page calls in flight per file (dbank, slides) |
+| `LLM_MAX_CONCURRENCY` | `8` | Model calls in flight in the whole pod, shared with every other LLM call in it (the shared LLM client's cap) |
+| `VLM_RATE_LIMIT_ATTEMPTS` / `VLM_RATE_LIMIT_BASE_SECONDS` / `VLM_RATE_LIMIT_MAX_SECONDS` | `8` / `10` / `120` | A rate-limited page call (429 / RESOURCE_EXHAUSTED) waits and retries, doubling from the base to the cap; Retry-After wins. A daily token cap ("tokens per day") stops at once. Timeouts and 5xx get 3 short retries |
+
 See what is in use, and try it:
 
 ```bash

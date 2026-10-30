@@ -292,6 +292,13 @@ class VLMConverter(PDFConverter):
                 kind = _classify(exc)
                 if kind == "client error":
                     raise
+                if kind == "daily limit":
+                    # Waiting minutes cannot help a per-day cap: stop now and say so.
+                    detail = str(exc)[:300]
+                    logger.error("VLM lane hit its daily token limit — aborting (%s)", detail)
+                    raise RuntimeError(
+                        "LLM daily token limit reached on this lane; conversions that need "
+                        f"the VLM work again once it resets ({detail})") from exc
                 attempt += 1
                 budget = _RATE_LIMIT_ATTEMPTS if kind == "rate limited" else _MAX_RETRY_ATTEMPTS
                 detail = f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -307,18 +314,32 @@ class VLMConverter(PDFConverter):
 
 
 def _classify(exc: Exception) -> str:
-    """"rate limited", "client error" (no retry) or "failed" (a timeout, a 5xx, unknown).
+    """"rate limited", "daily limit" or "client error" (no retry), or "failed" (a
+    timeout, a 5xx, unknown).
 
     By status code and name, so openai's and litellm's exception classes both fit.
+    The proxy lane raises a plain RuntimeError ("HTTP 429 for '<url>' ... Response:
+    {...}"), so its status is read from the text. A 429 for a per-day token cap
+    ("Token limit exceeded ... tokens per day") is not a rate limit: it lasts
+    until the cap resets.
     """
     status = getattr(exc, "status_code", None)
     text = str(exc)
-    if (status == 429 or "RESOURCE_EXHAUSTED" in text or "RateLimit" in type(exc).__name__
-            or "rate limit" in text.lower()):
+    if status is None and (m := _HTTP_STATUS.search(text)):
+        status = int(m.group(1))
+    limited = (status == 429 or "RESOURCE_EXHAUSTED" in text
+               or "RateLimit" in type(exc).__name__ or "rate limit" in text.lower())
+    if limited and _DAILY_CAP.search(text):
+        return "daily limit"
+    if limited:
         return "rate limited"
     if isinstance(status, int) and 400 <= status < 500 and status != 408:
         return "client error"
     return "timed out" if "timeout" in type(exc).__name__.lower() else "failed"
+
+
+_HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+_DAILY_CAP = re.compile(r"per day|daily", re.I)
 
 
 def _rate_limit_delay(exc: Exception, attempt: int) -> float:

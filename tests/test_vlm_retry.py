@@ -95,3 +95,42 @@ def test_the_log_names_the_real_error(sleeps, caplog):
     with caplog.at_level(logging.WARNING, logger="app.converters.vlm"):
         conv.transcribe_page("img")
     assert "rate limited" in caplog.text and "Resource exhausted" in caplog.text
+
+
+# The proxy lane's error: a plain RuntimeError carrying the status in its text.
+_PROXY = ("vertex_proxy vision failed: HTTP {code} for 'https://ai-connector-platform-630744526491"
+          ".me-west1.run.app/api/connectors/c1/v1/models/gemini-3.8-flash:generateContent'. "
+          "Response: {body}")
+
+
+def test_a_proxy_429_is_a_rate_limit(sleeps):
+    err = RuntimeError(_PROXY.format(code=429, body='{"error":"Too many requests"}'))
+    conv = _converter([err, err, err, "page"])
+    assert conv.transcribe_page("img") == "page"
+    assert len(sleeps) == 3 and sleeps[0] >= vlm._RATE_LIMIT_BASE_DELAY_S * 0.5
+
+
+def test_a_daily_token_cap_fails_at_once_and_says_so(sleeps):
+    """Seen on the sandbox 2026-10-28: the connector's 100M tokens/day were used up."""
+    err = RuntimeError(_PROXY.format(code=429, body=(
+        '{"error":"Token limit exceeded. Current usage: 100,061,259 tokens. '
+        'Limit: 100,000,000 tokens per day."}')))
+    conv = _converter([err, "never"])
+    with pytest.raises(RuntimeError, match="daily token limit reached"):
+        conv.transcribe_page("img")
+    assert sleeps == []
+
+
+def test_a_proxy_400_is_not_retried(sleeps):
+    conv = _converter([RuntimeError(_PROXY.format(code=400, body='{"error":"bad"}')), "never"])
+    with pytest.raises(RuntimeError):
+        conv.transcribe_page("img")
+    assert sleeps == []
+
+
+def test_digits_in_the_url_are_not_a_status(sleeps):
+    # the connector host carries a 12-digit number; only "HTTP nnn" is a status
+    err = RuntimeError(_PROXY.format(code=503, body='{"error":"unavailable"}'))
+    conv = _converter([err, "page"])
+    assert conv.transcribe_page("img") == "page"
+    assert sleeps == [1.0]

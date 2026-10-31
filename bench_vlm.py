@@ -51,8 +51,10 @@ def main() -> None:
 
     from app.converters.vlm import VLMConverter
 
-    conv = VLMConverter(backend="factory")
-    print(f"VLM model: {conv._model}  (backend=factory)")
+    from app.converters import vlm_lane
+
+    conv = VLMConverter()
+    print(f"VLM model: {vlm_lane.model()}")
 
     t = time.perf_counter()
     md = conv.convert(sub_path)

@@ -114,7 +114,7 @@ RUN uv pip uninstall --python $VENV rapidocr rapidocr-onnxruntime 2>/dev/null; \
 # Nothing here needs it: no module imports it, and every requirement on it is
 # guarded by an extra (transformers' torch/serving/dev, docling's all/
 # models-local/models-vlm-inline), none of which this image installs. It is for
-# multi-device dispatch of locally-loaded weights; VLM_BACKEND=factory sends
+# multi-device dispatch of locally-loaded weights; the VLM converters send
 # that work to the LLM factory instead, and docling's layout/table models run
 # through onnxruntime.
 #
@@ -272,7 +272,7 @@ COPY --chown=1001:0 ./app /home/appuser/app
 
 # Platform shared libs — only shared.llm_factory + shared.utils and their import-time
 # dependencies (async_utils, connector_credentials, request_context, secret_box).
-# Needed by app/converters/vlm.py (VLM_BACKEND=factory) and app/workers/worker.py.
+# Needed by app/converters/vlm.py (vision via the LLM factory) and app/workers/worker.py.
 # shared/db is deliberately not vendored: connector_credentials reaches it through a
 # guarded lazy import that falls back to the global connector credentials.
 #

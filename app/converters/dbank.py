@@ -17,7 +17,7 @@ critical 224-page Bank Hapoalim report (duah_hapoalim.pdf):
 3. TABLE / IMAGE / SCANNED pages -> VLM. docling reverses Hebrew word order
    inside table cells and can't read figures, so these go to the VLM, which
    keeps correct RTL structure. VLM calls are network-bound, so they are run
-   CONCURRENTLY (see DBANK_VLM_CONCURRENCY) — the difference between ~16 min
+   CONCURRENTLY (LLM_MAX_CONCURRENCY at once) — the difference between ~16 min
    serial and ~2 min on this doc.
 4. PROSE pages -> docling (complete + correct Hebrew reading order), with a
    COMPLETENESS GUARD: if docling captured < ``completeness_min`` of the page's
@@ -30,8 +30,8 @@ critical 224-page Bank Hapoalim report (duah_hapoalim.pdf):
    layer, the page goes to the VLM.
 5. NUMBER CHECK on VLM pages that have a text layer: every number >= 1000 the
    VLM writes must be on the page (see number_check.py). A page that fails is
-   transcribed once more — by VLM_ESCALATION_MODEL (gemini-3.8-flash) on the same
-   lane when the pod runs a weaker model; if the better attempt still fails it is kept, logged,
+   transcribed once more by the same model (a stronger escalation model was removed in
+   1.4.8.5); if the better attempt still fails it is kept, logged,
    and tagged with an HTML comment listing the numbers, so the flag travels with
    the page into chunks. The same pass runs the TABLE CHECK (table_check.py):
    each number in a markdown table must sit in its row and column on the page,
@@ -52,6 +52,7 @@ import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 import pymupdf as fitz  # `fitz` is the deprecated alias for the same module
 
@@ -75,12 +76,7 @@ _IMAGE_MIN_AREA_FRAC = 0.10  # a page image covering >= this fraction routes to 
 # Text layers from a broken font encoding are mostly C0 control characters (measured
 # 0.82-0.95 on such pages, <= 0.04 on every readable page of the sample set).
 _UNREADABLE_CTRL_RATIO = 0.20
-_VLM_CONCURRENCY = int(os.getenv("DBANK_VLM_CONCURRENCY", "8"))  # parallel VLM page calls
-# A page that fails the number or table check is asked again of this model, on the
-# same lane. A weaker model asked twice is a coin flip: gemini-3.5-flash-lite put a
-# year header over the wrong column on retry as often as not, while gemini-3.8-flash
-# had no misplaced cell on the 20-page table bench. Empty = retry the same model.
-_ESCALATION_MODEL = os.getenv("VLM_ESCALATION_MODEL", "gemini-3.8-flash").strip()
+
 _PAGE_SEP = "\n\n---\n\n"
 # Each kept page starts with its ORIGINAL 1-based page number. Skipped (blank)
 # pages leave gaps, so counting separators cannot recover page numbers; templates use
@@ -142,15 +138,15 @@ class DbankConverter(PDFConverter):
         completeness_min: float = _COMPLETENESS_MIN,
         precision_min: float = _PRECISION_MIN,
         scanned_max_chars: int = _SCANNED_MAX_CHARS,
-        vlm_concurrency: int = _VLM_CONCURRENCY,
+        vlm_concurrency: Optional[int] = None,
     ) -> None:
         self._completeness_min = completeness_min
         self._precision_min = precision_min
         self._scanned_max_chars = scanned_max_chars
-        self._vlm_concurrency = max(1, vlm_concurrency)
+        # None = LLM_MAX_CONCURRENCY: every page call takes one of its slots anyway.
+        self._vlm_concurrency = vlm_concurrency
         self._docling = None
         self._vlm = None
-        self._strong = None  # the escalation model, when it differs from the VLM's
 
     # -- lazily-built, reused engines --------------------------------------
 
@@ -192,27 +188,10 @@ class DbankConverter(PDFConverter):
     def _ensure_vlm(self) -> None:
         if self._vlm is None:
             from .vlm import VLMConverter
-            # Temperature from VLM_TEMPERATURE (unset = model default). It was pinned
-            # to 0.0 for the financial numbers; on Gemini 3 that only drew a warning
-            # per call: an A/B on Hebrew bank-report table pages found the model
-            # default as exact on digits (recall 0.998-1.0, no invented numbers)
-            # and faster.
-            self._vlm = VLMConverter(backend="factory")  # the job's lane (vlm_lane)
-            if _ESCALATION_MODEL:
-                # Same lane, stronger model. The lane differs per job (space or pod), so
-                # whether it is really another model is only known at call time.
-                self._strong = VLMConverter(backend="factory", model_name=_ESCALATION_MODEL)
-
-    def _escalates(self) -> bool:
-        """Whether a retry goes to the escalation model: not when this job's lane (the
-        space's or the pod's) already runs it. An unknown lane escalates as configured."""
-        if self._strong is None:
-            return False
-        from . import vlm_lane
-        try:
-            return vlm_lane.model() != vlm_lane.model(_ESCALATION_MODEL)
-        except Exception:  # noqa: BLE001 - no lane configured; the call itself will say
-            return True
+            # Generation settings are the shared layer's (LLM_TEMPERATURE 1.0): an A/B
+            # on Hebrew bank-report table pages found Gemini 3's default as exact on
+            # digits as 0.0 (recall 0.998-1.0, no invented numbers) and faster.
+            self._vlm = VLMConverter()  # the job's lane (vlm_lane)
 
     @staticmethod
     def _render(page) -> str:
@@ -266,14 +245,12 @@ class DbankConverter(PDFConverter):
         bad, cells = check(md)
         if not bad and not cells:
             return md
-        strong = self._strong if self._escalates() else None
-        retry = (strong or self._vlm).transcribe_page(img_b64)
+        retry = self._vlm.transcribe_page(img_b64)
         retry_bad, retry_cells = check(retry)
         if len(retry_bad) + len(retry_cells) < len(bad) + len(cells):
             md, bad, cells = retry, retry_bad, retry_cells
         if not bad and not cells:
-            logger.info("dbank: page %d number/table check passed on retry%s", page_index,
-                        f" ({_ESCALATION_MODEL})" if strong else "")
+            logger.info("dbank: page %d number/table check passed on retry", page_index)
             return md
         notes = []
         if bad:
@@ -368,13 +345,21 @@ class DbankConverter(PDFConverter):
             vlm_slots = [k for k, s in enumerate(slots) if s[0] == "vlm"]
             if vlm_slots:
                 self._ensure_vlm()
-                workers = min(self._vlm_concurrency, len(vlm_slots))
+                from shared.llm_factory.core.resilience import max_concurrency
+                workers = min(self._vlm_concurrency or max_concurrency(), len(vlm_slots))
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = {ex.submit(self._transcribe_checked, *slots[k][1:4]): k
                             for k in vlm_slots}
                     for fut in as_completed(futs):
                         k = futs[fut]
-                        md, page_i, docling_md = fut.result(), slots[k][3], slots[k][4]
+                        try:
+                            md = fut.result()
+                        except BaseException:
+                            # One failed page fails the document: drop the queued pages
+                            # rather than let each wait out a busy model (180 s) first.
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            raise
+                        page_i, docling_md = slots[k][3], slots[k][4]
                         if not md.strip():
                             logger.warning(
                                 "dbank: VLM returned nothing for page %d — %s", page_i,
@@ -385,7 +370,7 @@ class DbankConverter(PDFConverter):
 
         logger.info(
             "dbank %s: %d pages -> %d docling, %d vlm (x%d), %d blank skipped%s",
-            pdf_path.name, total, n_docling, len(vlm_slots), self._vlm_concurrency,
+            pdf_path.name, total, n_docling, len(vlm_slots), workers if vlm_slots else 0,
             len(blank), f" {blank[:30]}" if blank else "",
         )
         return _PAGE_SEP.join(f"{_PAGE_MARK.format(s[2] + 1)}\n\n{s[1]}" for s in slots)

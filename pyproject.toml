@@ -26,7 +26,7 @@ dependencies = [
     "pillow>=12.3.0",
     "python-frontmatter>=1.0.0",
     "python-multipart>=0.0.31",
-    # VLM_BACKEND=factory routes vision through shared.llm_factory -> litellm ->
+    # The VLM converters route vision through shared.llm_factory -> litellm ->
     # Vertex. Needed by the dbank Hebrew pipeline and docling's VLM fallback;
     # without them `import shared.llm_factory` fails and both converters are
     # unavailable. Pin matches evaluator/requirements.txt so the platform runs

@@ -31,10 +31,10 @@ work unchanged (one slide ≈ one chunk).
 from __future__ import annotations
 
 import logging
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Optional
 
 import pymupdf as fitz
 
@@ -50,7 +50,6 @@ _ASPECT_TOL = 0.01            # relative tolerance on the 16:9 rule
 _VISUAL_MIN_IMAGE_FRAC = 0.40  # "visual" page: largest image covers >= this
 _VISUAL_MAX_WORDS = 40         # ... and the text layer has fewer words than this
 _IMAGE_MIN_AREA_FRAC = 0.10    # number check is skipped on slides with a figure (as dbank)
-_VLM_CONCURRENCY = int(os.getenv("DBANK_VLM_CONCURRENCY", "8"))
 _PAGE_SEP = "\n\n---\n\n"
 _PAGE_MARK = "<!-- page {} -->"
 
@@ -119,14 +118,15 @@ def is_slide_deck(pdf_path: Path | str) -> str | None:
     ),
 )
 class SlidesConverter(PDFConverter):
-    def __init__(self, vlm_concurrency: int = _VLM_CONCURRENCY) -> None:
-        self._vlm_concurrency = max(1, vlm_concurrency)
+    def __init__(self, vlm_concurrency: Optional[int] = None) -> None:
+        # None = LLM_MAX_CONCURRENCY: every slide call takes one of its slots anyway.
+        self._vlm_concurrency = vlm_concurrency
         self._vlm = None
 
     def _ensure_vlm(self) -> None:
         if self._vlm is None:
             from .vlm import VLMConverter
-            self._vlm = VLMConverter(backend="factory", user_prompt=_SLIDE_PROMPT)
+            self._vlm = VLMConverter(user_prompt=_SLIDE_PROMPT)
 
     @staticmethod
     def _render(page) -> str:
@@ -157,8 +157,17 @@ class SlidesConverter(PDFConverter):
                 jobs.append((self._render(page), ref, i))
 
         self._ensure_vlm()
-        with ThreadPoolExecutor(max_workers=min(self._vlm_concurrency, max(1, len(jobs)))) as ex:
-            parts = list(ex.map(lambda j: self._transcribe(*j), jobs))
+        from shared.llm_factory.core.resilience import max_concurrency
+        workers = min(self._vlm_concurrency or max_concurrency(), max(1, len(jobs)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(self._transcribe, *j) for j in jobs]
+            try:
+                parts = [f.result() for f in futs]
+            except BaseException:
+                # One failed slide fails the deck: drop the queued ones rather than let
+                # each wait out a busy model (180 s) first.
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise
 
-        logger.info("slides %s: %d slides -> vlm (x%d)", pdf_path.name, len(jobs), self._vlm_concurrency)
+        logger.info("slides %s: %d slides -> vlm (x%d)", pdf_path.name, len(jobs), workers)
         return _PAGE_SEP.join(f"{_PAGE_MARK.format(i + 1)}\n\n{md}" for md, (_, _, i) in zip(parts, jobs))

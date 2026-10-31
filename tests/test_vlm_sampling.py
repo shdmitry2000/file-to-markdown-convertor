@@ -1,11 +1,14 @@
-"""VLM temperature comes from VLM_TEMPERATURE; unset means it is not sent at all.
+"""The converter sends no generation settings of its own (1.4.8.5).
 
-Every page call used to send temperature=0.0. On Gemini 3 litellm then logged a
-"temperature < 1.0 can cause infinite loops" warning and a DeprecationWarning per
-call, and each LiteLLM line came out twice (its own handler + the root one).
+Temperature, max tokens and thinking are the shared layer's (shared/llm_factory:
+LLM_TEMPERATURE, LLM_MAX_TOKENS, thinking off), the same for every module. Every
+page call used to send temperature=0.0, then VLM_TEMPERATURE; on Gemini 3 litellm
+logged a "temperature < 1.0 can cause infinite loops" warning per call, and each
+LiteLLM line came out twice (its own handler + the root one).
 """
 
 import importlib
+import inspect
 import logging
 
 from unittest.mock import patch
@@ -15,33 +18,7 @@ import pytest
 import app.converters.vlm as vlm
 
 
-@pytest.fixture
-def reload_vlm(monkeypatch):
-    def load(value):
-        if value is None:
-            monkeypatch.delenv("VLM_TEMPERATURE", raising=False)
-        else:
-            monkeypatch.setenv("VLM_TEMPERATURE", value)
-        return importlib.reload(vlm)
-
-    yield load
-    monkeypatch.delenv("VLM_TEMPERATURE", raising=False)
-    importlib.reload(vlm)
-
-
-@pytest.mark.parametrize("value, expected", [(None, None), ("", None), ("0", 0.0), ("0.4", 0.4)])
-def test_env_sets_the_default(reload_vlm, value, expected):
-    assert reload_vlm(value)._DEFAULT_TEMPERATURE == expected
-
-
-def _converter(backend, temperature):
-    conv = object.__new__(vlm.VLMConverter)
-    conv._backend, conv._temperature = backend, temperature
-    conv._max_tokens, conv._reasoning_effort, conv._user_prompt = 100, None, None
-    return conv
-
-
-def test_factory_call_omits_temperature_when_unset():
+def test_page_call_passes_no_generation_settings():
     seen = {}
 
     class Client:
@@ -49,39 +26,25 @@ def test_factory_call_omits_temperature_when_unset():
             seen.update(kw)
             return "page"
 
-    conv = _converter("factory", None)
     with patch("app.converters.vlm_lane.client", return_value=Client()):
-        assert conv._transcribe_page("img") == "page"
-    assert seen["temperature"] is None  # vision_sync sends nothing for None
+        assert vlm.VLMConverter()._transcribe_page("img") == "page"
+    assert seen == {}
 
 
-@pytest.mark.parametrize("temperature, sent", [(None, {}), (0.0, {"temperature": 0.0})])
-def test_openai_call_sends_temperature_only_when_set(temperature, sent):
-    seen = {}
-
-    def create(**kw):
-        seen.update(kw)
-        msg = type("M", (), {"content": "page"})()
-        return type("R", (), {"choices": [type("C", (), {"message": msg})()]})()
-
-    conv = _converter("openai", temperature)
-    conv._model = "m"
-    conv._client = type("O", (), {"chat": type("Ch", (), {"completions": type("Co", (), {"create": staticmethod(create)})()})()})()
-    assert conv._transcribe_page("img") == "page"
-    assert {k: v for k, v in seen.items() if k == "temperature"} == sent
+def test_the_converter_has_no_settings_of_its_own():
+    params = set(inspect.signature(vlm.VLMConverter.__init__).parameters)
+    assert params == {"self", "user_prompt", "on_progress"}
+    assert "openai" not in inspect.getsource(vlm)
 
 
 @pytest.mark.parametrize("module, cls", [("app.converters.dbank", "DbankConverter"),
                                          ("app.converters.slides", "SlidesConverter")])
-def test_dbank_and_slides_follow_the_env(monkeypatch, module, cls):
+def test_dbank_and_slides_build_the_vlm_plainly(monkeypatch, module, cls):
     made = []
     monkeypatch.setattr(vlm, "VLMConverter", lambda **kw: made.append(kw))
-    # dbank reads the pod model to decide on an escalation VLM; without one set
-    # that read raises before the VLM under test is built.
-    monkeypatch.setenv("VLM_MODEL", "vertex_ai/gemini-3.8-flash")
     conv = getattr(importlib.import_module(module), cls)()
     conv._ensure_vlm()
-    assert "temperature" not in made[0]
+    assert set(made[0]) <= {"user_prompt"}
 
 
 def test_litellm_logs_once_at_warning(monkeypatch):

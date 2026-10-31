@@ -217,6 +217,11 @@ def _letter_count(text: str) -> int:
     return sum(1 for c in text if unicodedata.category(c).startswith("L"))
 
 
+# A letter ratio below this marks docling output unusable (a setting until 1.4.8.5,
+# never set to anything else).
+_VLM_FALLBACK_MIN_LETTER_RATIO = 0.10
+
+
 def _docling_output_unusable(markdown: str) -> bool:
     """Detect text-layer garbage — e.g. an embedded font with no ToUnicode CMap,
     where extractors emit glyph/symbol codes with almost no real letters. Such
@@ -226,12 +231,7 @@ def _docling_output_unusable(markdown: str) -> bool:
     letters = _letter_count(markdown)
     if letters == 0:
         return True
-    min_ratio = float(os.getenv("VLM_FALLBACK_MIN_LETTER_RATIO", "0.10"))
-    return len(markdown) >= 200 and (letters / len(markdown)) < min_ratio
-
-
-def _vlm_fallback_enabled() -> bool:
-    return os.getenv("VLM_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
+    return len(markdown) >= 200 and (letters / len(markdown)) < _VLM_FALLBACK_MIN_LETTER_RATIO
 
 
 def _vlm_fallback_wanted(file_path: str, markdown: str) -> bool:
@@ -242,7 +242,7 @@ def _vlm_fallback_wanted(file_path: str, markdown: str) -> bool:
     letter ratio, and sending it to the VLM failed the whole file. Other formats
     keep docling's output, unless there is none at all.
     """
-    if not (_vlm_fallback_enabled() and _docling_output_unusable(markdown)):
+    if not _docling_output_unusable(markdown):
         return False
     if Path(file_path).suffix.lower() == ".pdf":
         return True
@@ -309,7 +309,7 @@ def _convert_job(file_path: str, converter_type: str, do_ocr: bool, result_queue
                 )
                 from app.converters.vlm import VLMConverter
 
-                vlm_markdown = VLMConverter(backend="factory").convert(Path(file_path))
+                vlm_markdown = VLMConverter().convert(Path(file_path))
                 if _docling_output_unusable(vlm_markdown):
                     raise Exception(
                         "Unreadable document: both docling and VLM produced no usable "
@@ -605,7 +605,7 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
                 # Same broken-text-layer → VLM fallback as the cold path.
                 if _vlm_fallback_wanted(file_path, markdown):
                     from app.converters.vlm import VLMConverter
-                    vlm_markdown = VLMConverter(backend="factory").convert(Path(file_path))
+                    vlm_markdown = VLMConverter().convert(Path(file_path))
                     if _docling_output_unusable(vlm_markdown):
                         raise Exception(
                             "Unreadable document: both docling and VLM produced no usable "

@@ -10,8 +10,8 @@ A /convert caller may send ``llm`` (or, before 1.4.9, ``llm_connector``)::
 - **space**: the space's own connector, for every call in the job. Nothing comes from
   this pod's env; a connector without the fields its type needs fails the job before
   any page work, naming what is missing.
-- **params** (also: no ``llm`` at all): this pod's lane — ``VLM_MODEL``, else the
-  ``LLM_*`` env — with any field the request sends taking precedence. A request that
+- **params** (also: no ``llm`` at all): this pod's lane — the ``LLM_*`` env — with
+  any field the request sends taking precedence. A request that
   sends a token brings its whole identity; otherwise the pod's own is used.
 - **no mode** (``llm_connector`` from a 1.4.7.8–1.4.8.x template): the caller's type
   with the pod's Gemini model, its identity when it sent a token, else the pod's lane.
@@ -29,7 +29,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any, Optional
 
@@ -74,12 +73,10 @@ def job(connector: Optional[dict]):
 
 
 def pod_model() -> str:
-    """The pod's VLM model spec: VLM_MODEL, else the factory's provider."""
-    pod = os.getenv("VLM_MODEL", "").strip()
-    if not pod:
-        from shared.llm_factory.core import config
-        pod = config.required_provider()
-    return pod
+    """The pod's model spec: LLM_CONNECTOR_TYPE + LLM_TYPE (a per-pod LLM_TYPE in Helm
+    gives the converter its own model)."""
+    from shared.llm_factory.core import config
+    return config.required_provider()
 
 
 def vlm_spec(connector_model: str, name: Optional[str] = None) -> str:
@@ -188,7 +185,7 @@ def client(name: Optional[str] = None):
         if not hasattr(built, "vision_sync"):
             raise LaneError(
                 f"VLM needs a litellm/vertex provider with vision (got {type(built).__name__} "
-                f"for {model(name)}); set VLM_MODEL / LLM_CONNECTOR_TYPE to a Gemini lane."
+                f"for {model(name)}); set LLM_CONNECTOR_TYPE / LLM_TYPE to a Gemini lane."
             )
         _clients[key] = built
     return _clients[key]

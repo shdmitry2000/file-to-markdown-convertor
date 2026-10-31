@@ -22,13 +22,12 @@ TYPE_ONLY = {"model": "vertex_proxy/gemini-3.5-flash"}  # a 1.4.7.8-1.4.7.9 temp
 
 @pytest.fixture(autouse=True)
 def ocp_markdown_pod(monkeypatch):
-    for k in ("PROXY_AUTH_TOKEN", "VLM_MODEL", "LLM_FACTORY_PROVIDER"):
+    for k in ("PROXY_AUTH_TOKEN",):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("LLM_CONNECTOR_TYPE", "vertex_proxy")
     monkeypatch.setenv("LLM_TYPE", "gemini-3.8-flash")
     monkeypatch.setenv("PROXY_BASE_URL", "https://proxy.invalid")
     monkeypatch.setenv("PROXY_CONNECTOR_ID", "c-1")
-    monkeypatch.setenv("VLM_FALLBACK_ENABLED", "true")
     from app.converters import vlm_lane
     vlm_lane._clients.clear()
 

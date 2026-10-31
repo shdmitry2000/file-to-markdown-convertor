@@ -1,6 +1,6 @@
 """Generate real dbank markdown for a table-heavy slice, to compare chunkers on."""
 import os, tempfile
-os.environ["DBANK_VLM_CONCURRENCY"] = "8"
+os.environ["LLM_MAX_CONCURRENCY"] = "8"
 from pathlib import Path
 import fitz
 from app.converters.dbank import DbankConverter

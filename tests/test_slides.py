@@ -109,6 +109,22 @@ def _convert(pdf: Path, outputs: list[str]):
         return conv.convert(pdf), vlm
 
 
+def test_a_daily_cap_on_one_slide_cancels_the_queued_slides(tmp_path):
+    """One failed slide fails the deck; the queued slides must not each wait out a
+    busy model first."""
+    from shared.llm_factory.core.resilience import LLMDailyLimitError
+
+    p = _pdf(tmp_path / "a.pdf", (960, 540), 20, words_per_page=20, creator="Keynote")
+    conv = SlidesConverter(vlm_concurrency=1)
+    vlm = MagicMock()
+    vlm.transcribe_page.side_effect = LLMDailyLimitError("daily token limit reached")
+    with patch.object(SlidesConverter, "_render", return_value="IMG"), \
+         patch.object(conv, "_ensure_vlm", side_effect=lambda: setattr(conv, "_vlm", vlm)), \
+         pytest.raises(LLMDailyLimitError):
+        conv.convert(p)
+    assert vlm.transcribe_page.call_count < 5, vlm.transcribe_page.call_count
+
+
 def test_every_slide_goes_to_the_vlm_in_order(tmp_path):
     p = _pdf(tmp_path / "a.pdf", (960, 540), 3, words_per_page=20, creator="Keynote")
     out, vlm = _convert(p, ["## one", "## two", "## three"])

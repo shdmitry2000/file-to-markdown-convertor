@@ -269,15 +269,15 @@ def test_vlm_page_keeps_its_page_number():
     assert out.index("<!-- page 1 -->") < out.index("<!-- page 2 -->")
 
 
-def test_a_failed_page_goes_to_the_stronger_model():
-    """The second attempt is the escalation model, not the same weak model again."""
+def test_a_failed_page_is_asked_once_more():
+    """A page that fails the table check is transcribed once more by the same model
+    (the stronger escalation model was removed in 1.4.8.5); the better attempt wins."""
     conv = DbankConverter()
-    weak, strong = MagicMock(), MagicMock()
-    weak.transcribe_page.return_value = GRID_SWAPPED
-    strong.transcribe_page.return_value = GRID_OK
+    vlm = MagicMock()
+    vlm.transcribe_page.side_effect = [GRID_SWAPPED, GRID_OK]
 
     def ensure():
-        conv._vlm, conv._strong = weak, strong
+        conv._vlm = vlm
 
     with patch("app.converters.dbank.fitz.open", return_value=_fake_doc([_page(HEB, rawdict=GRID)])), \
          patch.object(DbankConverter, "validate_path", return_value=None), \
@@ -286,33 +286,25 @@ def test_a_failed_page_goes_to_the_stronger_model():
          patch.object(conv, "_docling_convert", return_value=(HEB, 1)), \
          patch.object(conv, "_ensure_vlm", side_effect=ensure):
         out = conv.convert(Path("/tmp/whatever.pdf"))
-    assert weak.transcribe_page.call_count == 1 and strong.transcribe_page.call_count == 1
+    assert vlm.transcribe_page.call_count == 2
     assert GRID_OK in out and "dbank:" not in out
 
 
-@pytest.mark.parametrize("pod, escalates", [
-    ("vertex_ai/gemini-3.5-flash-lite", True),
-    ("vertex_ai/gemini-3.8-flash", False),  # already the strong model: plain retry
-])
-def test_escalation_only_when_the_pod_runs_a_weaker_model(monkeypatch, pod, escalates):
-    monkeypatch.setenv("VLM_MODEL", pod)
-    with patch("app.converters.vlm.VLMConverter.__init__", lambda self, **kw: None):
-        conv = DbankConverter()
-        conv._ensure_vlm()
-    assert conv._escalates() == escalates
+def test_a_daily_cap_on_one_page_cancels_the_queued_pages():
+    """One failed page fails the document; the queued pages must not each wait out a
+    busy model first (a 200-page document used to run ~75 min before failing)."""
+    from shared.llm_factory.core.resilience import LLMDailyLimitError
 
-
-@pytest.mark.parametrize("space_model, escalates", [
-    ("vertex_proxy/gemini-3.5-flash-lite", True),
-    ("vertex_proxy/gemini-3.8-flash", False),
-])
-def test_escalation_follows_the_spaces_model_not_the_pods(monkeypatch, space_model, escalates):
-    from app.converters import vlm_lane
-    monkeypatch.setenv("VLM_MODEL", "vertex_ai/gemini-3.5-flash-lite")
-    space = {"mode": "space", "model": space_model, "base_url": "https://p",
-             "connector_id": "c", "auth_token": "t"}
-    with patch("app.converters.vlm.VLMConverter.__init__", lambda self, **kw: None):
-        conv = DbankConverter()
-        conv._ensure_vlm()
-    with vlm_lane.job(space):
-        assert conv._escalates() == escalates
+    conv = DbankConverter(vlm_concurrency=1)
+    vlm = MagicMock()
+    vlm.transcribe_page.side_effect = LLMDailyLimitError("daily token limit reached")
+    pages = [_page("", image=True) for _ in range(20)]
+    with patch("app.converters.dbank.fitz.open", return_value=_fake_doc(pages)), \
+         patch.object(DbankConverter, "validate_path", return_value=None), \
+         patch.object(DbankConverter, "_write_page", return_value=Path("/tmp/_x.pdf")), \
+         patch.object(DbankConverter, "_render", return_value="IMG_B64"), \
+         patch.object(conv, "_docling_convert", return_value=("", 0)), \
+         patch.object(conv, "_ensure_vlm", side_effect=lambda: setattr(conv, "_vlm", vlm)), \
+         pytest.raises(LLMDailyLimitError):
+        conv.convert(Path("/tmp/whatever.pdf"))
+    assert vlm.transcribe_page.call_count < 5, vlm.transcribe_page.call_count

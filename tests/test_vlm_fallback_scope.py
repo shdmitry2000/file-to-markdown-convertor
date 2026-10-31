@@ -13,11 +13,6 @@ from app.workers import worker
 TABLE_FORM = "| שם | |\n|---|---|\n" + "| | |\n" * 100  # letters/len < 0.10
 
 
-@pytest.fixture(autouse=True)
-def fallback_on(monkeypatch):
-    monkeypatch.setenv("VLM_FALLBACK_ENABLED", "true")
-
-
 def test_a_table_heavy_form_reads_as_unusable():
     assert worker._docling_output_unusable(TABLE_FORM)
 
@@ -34,9 +29,10 @@ def test_usable_output_never_goes_to_the_vlm():
     assert worker._vlm_fallback_wanted("/x/a.pdf", "plain readable text " * 20) is False
 
 
-def test_disabled_fallback_never_goes_to_the_vlm(monkeypatch):
+def test_the_fallback_cannot_be_turned_off(monkeypatch):
+    """VLM_FALLBACK_ENABLED was removed in 1.4.8.5 (never set to anything but on)."""
     monkeypatch.setenv("VLM_FALLBACK_ENABLED", "false")
-    assert worker._vlm_fallback_wanted("/x/scan.pdf", TABLE_FORM) is False
+    assert worker._vlm_fallback_wanted("/x/scan.pdf", TABLE_FORM) is True
 
 
 def test_an_empty_non_pdf_still_fails_loudly():

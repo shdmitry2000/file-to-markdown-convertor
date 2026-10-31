@@ -124,7 +124,7 @@ def test_many_pictures_are_not_cut_by_the_stall_watch(tmp_path, monkeypatch):
     d.save(str(path))
 
     monkeypatch.setenv("DOCLING_STALL_SECONDS", "4")
-    monkeypatch.setenv("DOCLING_PICTURE_CONCURRENCY", "4")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "4")
     monkeypatch.setattr(worker_mod, "_warm_docling_loop", targets.slow_vlm_docling_loop)
     w = worker_mod._WarmDoclingWorker()
     try:

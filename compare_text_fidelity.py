@@ -46,7 +46,7 @@ def run_vlm(path: str) -> str:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from app.converters.vlm import VLMConverter
-    return VLMConverter(backend="factory").convert(Path(path))
+    return VLMConverter().convert(Path(path))
 
 
 def main() -> None:

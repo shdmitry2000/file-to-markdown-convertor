@@ -19,7 +19,8 @@ PROXY = {"model": "vertex_proxy/gemini-3.5-flash", "base_url": "https://proxy",
 
 @pytest.fixture(autouse=True)
 def pod_model(monkeypatch):
-    monkeypatch.setenv("VLM_MODEL", "vertex_ai/gemini-3.8-flash")
+    monkeypatch.setenv("LLM_CONNECTOR_TYPE", "vertex_ai")
+    monkeypatch.setenv("LLM_TYPE", "gemini-3.8-flash")
     vlm_lane._clients.clear()
 
 
@@ -58,7 +59,7 @@ def test_vlm_calls_go_through_the_jobs_lane():
     env.vision_sync.return_value = "env"
     lane.vision_sync.return_value = "proxy"
     from app.converters.vlm import VLMConverter
-    vlm = VLMConverter(backend="factory")
+    vlm = VLMConverter()
     with patch("shared.space_llm.pinned_client", return_value=lane), \
          patch("shared.llm_factory.LLMFactory.build", return_value=env):
         assert vlm.transcribe_page("aW1n") == "env"
@@ -149,7 +150,7 @@ def test_vlm_calls_on_a_lane_without_credentials_use_the_pods_lane(no_proxy_env)
     env = MagicMock()
     env.vision_sync.return_value = "env"
     from app.converters.vlm import VLMConverter
-    vlm = VLMConverter(backend="factory")
+    vlm = VLMConverter()
     with patch("shared.llm_factory.LLMFactory.build", return_value=env), \
          vlm_lane.job({"model": "vertex_proxy/gemini-3.5-flash"}):
         assert vlm.transcribe_page("aW1n") == "env"

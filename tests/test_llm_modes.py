@@ -2,7 +2,7 @@
 
 space  — the space's connector only; the pod's env is never read, and a connector
          missing what its type needs fails the job before any work, naming the field.
-params — this pod's lane (VLM_MODEL / LLM_*), with request fields on top.
+params — this pod's lane (LLM_*), with request fields on top.
 
 The pod here is OCP's markdown pod: proxy lane configured, no PROXY_AUTH_TOKEN.
 Real files go through the real worker (cold and warm); the LLM itself is a stub.
@@ -28,7 +28,7 @@ SPACE = {"mode": "space", "model": "vertex_proxy/gemini-3.5-flash",
 
 @pytest.fixture(autouse=True)
 def ocp_markdown_pod(monkeypatch):
-    for k in ("PROXY_AUTH_TOKEN", "VLM_MODEL", "LLM_FACTORY_PROVIDER"):
+    for k in ("PROXY_AUTH_TOKEN",):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("LLM_CONNECTOR_TYPE", "vertex_proxy")
     monkeypatch.setenv("LLM_TYPE", "gemini-3.8-flash")
@@ -104,7 +104,8 @@ def test_params_mode_with_no_fields_is_the_pods_lane():
 
 
 def test_params_mode_request_model_overrides_the_pods(monkeypatch):
-    monkeypatch.setenv("VLM_MODEL", "vertex_ai/gemini-3.5-flash-lite")
+    monkeypatch.setenv("LLM_CONNECTOR_TYPE", "vertex_ai")
+    monkeypatch.setenv("LLM_TYPE", "gemini-3.5-flash-lite")
     with patch("shared.llm_factory.LLMFactory.build", return_value=_vision("x")) as build, \
          vlm_lane.job({"mode": "params", "model": "vertex_ai/gemini-3.8-flash"}):
         vlm_lane.client()
@@ -271,7 +272,7 @@ def test_a_lane_that_cannot_be_built_fails_at_once_without_retries(monkeypatch):
     from app.converters.vlm import VLMConverter
 
     sleeps = []
-    monkeypatch.setattr("app.converters.vlm.time.sleep", sleeps.append)
+    monkeypatch.setattr("shared.llm_factory.core.resilience.time.sleep", sleeps.append)
     with pytest.raises(ValueError, match="PROXY_AUTH_TOKEN"):
-        VLMConverter(backend="factory").transcribe_page("aW1n")
+        VLMConverter().transcribe_page("aW1n")
     assert sleeps == []

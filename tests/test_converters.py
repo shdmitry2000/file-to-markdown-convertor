@@ -31,29 +31,21 @@ def test_pymupdf_converter_success(sample_pdf):
         mock_to_markdown.assert_called_once_with(str(sample_pdf))
 
 def test_vlm_converter_success(sample_pdf):
-    with patch('openai.OpenAI') as mock_openai_cls:
+    """Each page goes to the job's client (vision_sync); a markdown fence is stripped."""
+    client = MagicMock()
+    client.vision_sync.return_value = "```markdown\n# Test Document\n\nConverted using VLM\n```"
+    with patch("app.converters.vlm_lane.client", return_value=client):
         with patch('fitz.open') as mock_fitz_open:
             mock_pdf = MagicMock()
             mock_fitz_open.return_value.__enter__.return_value = mock_pdf
             mock_pdf.page_count = 1
             mock_page = MagicMock()
             mock_pdf.__getitem__.return_value = mock_page
-            
-            # mock get_pixmap
+
             mock_pixmap = MagicMock()
             mock_pixmap.tobytes.return_value = b"pngdata"
             mock_page.get_pixmap.return_value = mock_pixmap
-            
-            mock_client = MagicMock()
-            mock_openai_cls.return_value = mock_client
-            
-            mock_response = MagicMock()
-            mock_response.choices[0].message.content = "```markdown\n# Test Document\n\nConverted using VLM\n```"
-            mock_client.chat.completions.create.return_value = mock_response
-            
-            # Pin the OpenAI backend: the default is env-driven (VLM_BACKEND),
-            # and this test exercises the OpenAI-compatible path specifically.
-            converter = VLMConverter(backend="openai")
-            result = converter.convert(sample_pdf)
 
-            assert "Converted using VLM" in result
+            result = VLMConverter().convert(sample_pdf)
+
+            assert result == "# Test Document\n\nConverted using VLM"

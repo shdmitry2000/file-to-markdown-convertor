@@ -78,7 +78,7 @@ def run_vlm(p: Path) -> str:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # shared
     sys.path.insert(0, str(Path(__file__).resolve().parent))      # app
     from app.converters.vlm import VLMConverter
-    return VLMConverter(backend="factory").convert(p)
+    return VLMConverter().convert(p)
 
 
 # engine name -> (text adapter, table adapter). docling FIRST.

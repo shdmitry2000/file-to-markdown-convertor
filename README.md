@@ -211,19 +211,21 @@ works:
 | Variable | Example | Purpose |
 |---|---|---|
 | `LLM_CONNECTOR_TYPE` | `vertex_proxy`, `vertex_ai`, `openai` | Connection type |
-| `LLM_TYPE` | `gemini-3.8-flash` | Model name, without the type |
-| `VLM_MODEL` | `vertex_ai/gemini-3.5-flash-lite` | Optional: another model for images, as `<type>/<model>` |
+| `LLM_TYPE` | `gemini-3.8-flash` | Model name, without the type. The converter's own model is this pod's `LLM_TYPE` |
 | `PROXY_BASE_URL`, `PROXY_CONNECTOR_ID`, `PROXY_AUTH_TOKEN` | | `vertex_proxy`: address, connector id, token (a secret) |
 | `GOOGLE_CLOUD_PROJECT_ID`, `VERTEX_LOCATION` | | `vertex_ai`: project and region |
 | `OPENAI_API_KEY` | | `openai` |
 
-Page calls to the LLM are limited and retried:
+Every page call uses the platform's shared LLM settings, the same names as every module:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DBANK_VLM_CONCURRENCY` | `8` | Page calls in flight per file (dbank, slides) |
-| `LLM_MAX_CONCURRENCY` | `8` | Model calls in flight in the whole pod, shared with every other LLM call in it (the shared LLM client's cap) |
-| `VLM_RATE_LIMIT_ATTEMPTS` / `VLM_RATE_LIMIT_BASE_SECONDS` / `VLM_RATE_LIMIT_MAX_SECONDS` | `8` / `10` / `120` | A rate-limited page call (429 / RESOURCE_EXHAUSTED) waits and retries, doubling from the base to the cap; Retry-After wins. A daily token cap ("tokens per day") stops at once. Timeouts and 5xx get 3 short retries |
+| `LLM_MAX_TOKENS` | `8192` (set `32000` here) | Longest page the model may write |
+| `LLM_TEMPERATURE` | `1.0` | Sent on every call; Gemini 3 is never below 1.0 |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | `300` (set `120` here) | One page call. At 120: 3 tries × 120 s + 3 s + the 180 s busy wait = 543 s, under the 600 s stall cut |
+| `LLM_MAX_CONCURRENCY` | `8` | Page calls in flight per worker process; dbank, slides and picture descriptions size their thread pools by it |
+
+The shared client retries: a rate-limited call (429 / RESOURCE_EXHAUSTED, 503) waits, doubling from 5 s to 30 s, 180 s in all (Retry-After wins); a timeout or 5xx is retried twice (1 s, 2 s); a daily token cap ("tokens per day") stops the conversion at once, and dbank / slides cancel the pages still queued. `POST /llm/test` makes one try, with no busy-model wait. Thinking is off. (`VLM_*`, `DBANK_VLM_CONCURRENCY` and the escalation model were removed in 1.4.8.5.)
 
 See what is in use, and try it:
 
@@ -232,24 +234,8 @@ curl http://localhost:8000/llm        # type/model, address, project … and whe
 curl -X POST http://localhost:8000/llm/test   # one small call: {"ok": true, "model": …, "latency_ms": …} or the reason it failed
 ```
 
-### Changing it without a restart
-
-With `LLM_RUNTIME_CHANGE=true`, the converter LLM can be replaced through the API:
-
-```bash
-curl -X PUT http://localhost:8000/llm -H "Content-Type: application/json" -d '{
-  "model": "vertex_proxy/gemini-3.8-flash",
-  "base_url": "https://proxy.example", "connector_id": "my-connector", "auth_token": "…"}'
-curl -X DELETE http://localhost:8000/llm      # back to the environment
-```
-
-A change lasts until the service restarts; then the environment applies again. The
-fields a type needs are checked first (a `vertex_proxy` needs `base_url`,
-`connector_id` and `auth_token`; a `vertex_ai` needs `project`), and a request
-missing one is refused with the field named. Without `LLM_RUNTIME_CHANGE`, `PUT` and
-`DELETE` answer 403. The service has no login of its own: turn this on only where
-nobody but its callers can reach it. Inside the RAG platform it is off — the
-converter LLM comes from Helm, and each space sends its own.
+The converter LLM is the environment's; changing it at runtime (`PUT` / `DELETE /llm`,
+`LLM_RUNTIME_CHANGE`) was removed in 1.4.8.5.
 
 ### Sending an LLM with a conversion
 

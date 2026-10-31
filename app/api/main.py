@@ -739,16 +739,6 @@ async def get_converted_file(file_path: str):
 
 # ==================== DEBUG ENDPOINTS ====================
 
-class ConverterLLM(BaseModel):
-    """The converter LLM, as the fields a space connector has."""
-    model: str  # "<connection type>/<model>", e.g. vertex_proxy/gemini-3.8-flash
-    base_url: Optional[str] = None
-    connector_id: Optional[str] = None
-    auth_token: Optional[str] = None
-    project: Optional[str] = None
-    location: Optional[str] = None
-
-
 # A 1x1 PNG: the smallest image a vision call accepts.
 _PROBE_PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
               "hKmMIQAAAABJRU5ErkJggg==")
@@ -756,7 +746,7 @@ _PROBE_PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQD
 
 @app.get("/llm")
 async def get_converter_llm():
-    """The converter LLM in use (runtime or env) — never the token itself."""
+    """The converter LLM in use (the env) — never the token itself."""
     return llm_settings.describe()
 
 
@@ -769,7 +759,14 @@ async def test_converter_llm():
         started = time.time()
         with vlm_lane.job(llm_settings.job_lane(None)):
             spec = vlm_lane.model()
-            vlm_lane.client().vision_sync("Reply with the word OK.", [_PROBE_PNG], max_tokens=16)
+            client = vlm_lane.client()
+            # One try, no busy-model wait (up to 180 s): the probe reports what the
+            # lane says now. __wrapped__ is vision_sync without the shared retry.
+            send = getattr(getattr(type(client), "vision_sync", None), "__wrapped__", None)
+            if send is not None:
+                send(client, "Reply with the word OK.", [_PROBE_PNG], max_tokens=16)
+            else:
+                client.vision_sync("Reply with the word OK.", [_PROBE_PNG], max_tokens=16)
         return spec, round((time.time() - started) * 1000)
 
     try:
@@ -778,45 +775,6 @@ async def test_converter_llm():
         # Whole message on one line: the factory puts the missing setting on line two.
         return {"ok": False, "error": f"{type(exc).__name__}: {' '.join(str(exc).split())[:500]}"}
     return {"ok": True, "model": spec, "latency_ms": ms}
-
-
-def _require_runtime_change() -> None:
-    if not llm_settings.runtime_change_enabled():
-        raise HTTPException(
-            status_code=403,
-            detail="the converter LLM is set by this deployment (env/Helm); "
-                   "LLM_RUNTIME_CHANGE=true enables changing it here")
-
-
-@app.put("/llm")
-async def put_converter_llm(body: ConverterLLM):
-    """Replace the converter LLM until restart (LLM_RUNTIME_CHANGE only)."""
-    from app.converters import vlm_lane
-
-    _require_runtime_change()
-    value = {k: v for k, v in body.model_dump().items() if v}
-    if "/" not in value["model"]:
-        raise HTTPException(status_code=400,
-                            detail="model is '<connection type>/<model>', e.g. vertex_proxy/gemini-3.8-flash")
-    missing = vlm_lane._missing(value, value["model"])
-    if missing:
-        raise HTTPException(status_code=400,
-                            detail=f"{value['model']} needs {', '.join(missing)}")
-    try:
-        llm_settings.store().set(value)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    logger.info("Converter LLM set at runtime: %s", value["model"])
-    return llm_settings.describe()
-
-
-@app.delete("/llm")
-async def delete_converter_llm():
-    """Back to the env default (LLM_RUNTIME_CHANGE only)."""
-    _require_runtime_change()
-    llm_settings.store().clear()
-    logger.info("Converter LLM back to the env default")
-    return llm_settings.describe()
 
 
 @app.post("/debug/convert")
@@ -1091,7 +1049,7 @@ async def get_capabilities():
             {
               "name": "vlm",
               "label": "VLM (Vision-Language Model)",
-              "description": "Rasterises each page and sends it to an OpenAI-compatible VLM. Best quality for scanned PDFs. Requires a running model endpoint."
+              "description": "Rasterises each page and sends it to the platform LLM. Best quality for scanned PDFs."
             },
             {
               "name": "docling",

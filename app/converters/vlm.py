@@ -1,22 +1,20 @@
 """
-PDF-to-Markdown converter using any OpenAI-compatible Vision-Language Model.
+PDF-to-Markdown converter: each page image is transcribed by the platform's LLM.
 
-Defaults to Ollama running locally (qwen3-vl), but can be pointed at
-any provider that exposes an OpenAI-compatible chat completions endpoint.
+The lane (type, model, identity) is the job's — the space's connector or this pod's
+LLM_CONNECTOR_TYPE + LLM_TYPE (see vlm_lane). Temperature, max tokens, thinking and
+the retry of a busy or failed call are the shared LLM layer's (shared/llm_factory:
+LLM_TEMPERATURE, LLM_MAX_TOKENS — 32000 on the markdown pod — thinking off, the one
+retry). This module reads no LLM setting itself.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
-import os
-import random
 import re
-import time
 from pathlib import Path
 from typing import Callable, Optional
-
-import httpx
 
 from app.registry import register_converter
 from .base import PDFConverter
@@ -41,128 +39,28 @@ Output raw markdown only. No preamble, no commentary, no wrapping code block."""
 _RENDER_DPI = 300
 _DPI_SCALE = _RENDER_DPI / 72  # fitz uses 72 DPI as its baseline
 
-_DEFAULT_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-
-# Hard cap on tokens generated per page. A single page of markdown is well under
-# this; the cap exists to stop the degenerate repetition loops some VLMs fall
-# into on dense tables (observed: 1M+ chars of garbage on a Hebrew/English table).
-_DEFAULT_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "32000"))
-
-# Page transcription is a mechanical OCR-style task, not a reasoning task, so
-# thinking is disabled by default — it only adds latency (dense financial tables
-# were ~55s/page with thinking on). Empty string = leave the model default.
-# On gemini-3.x "disable" maps to the lowest thinking level (thinkingLevel=low,
-# no thought output); on 2.5-class models it drops the thinking budget to 0.
-_DEFAULT_REASONING_EFFORT = os.getenv("VLM_REASONING_EFFORT", "disable")
-
-# Sampling temperature per page call. Unset/empty = not sent: the model's own
-# default (1.0 on Gemini 3, which Google recommends keeping — lower values there
-# risk repetition loops, and litellm warns on every call). Set a number (e.g. 0)
-# to pin it, for a model that is deterministic at 0 such as a local Ollama VLM.
-_TEMPERATURE_ENV = os.getenv("VLM_TEMPERATURE", "").strip()
-_DEFAULT_TEMPERATURE: Optional[float] = float(_TEMPERATURE_ENV) if _TEMPERATURE_ENV else None
-
-# Retry settings for timed-out (or 5xx) VLM calls.
-_MAX_RETRY_ATTEMPTS = 3
-_RETRY_BASE_DELAY_S = 1.0  # seconds; doubles each attempt (1 s, 2 s, 4 s)
-
-# A rate limit (429 / RESOURCE_EXHAUSTED) is waited out instead: retrying after 1 s and
-# 2 s only adds to the load, and dbank runs several page calls at once, so a throttled
-# minute used to abort whole documents. Doubles from the base, with jitter so parallel
-# page calls do not come back together, capped; Retry-After wins when the provider sends it.
-_RATE_LIMIT_ATTEMPTS = int(os.getenv("VLM_RATE_LIMIT_ATTEMPTS", "8"))
-_RATE_LIMIT_BASE_DELAY_S = float(os.getenv("VLM_RATE_LIMIT_BASE_SECONDS", "10"))
-_RATE_LIMIT_MAX_DELAY_S = float(os.getenv("VLM_RATE_LIMIT_MAX_SECONDS", "120"))
-
 
 @register_converter(
     name="vlm",
     label="VLM (Vision-Language Model)",
     description=(
         "Uses Vision-Language Model for full page-by-page image analysis. "
-        "Best for scanned PDFs, images, and complex visual content. Requires VLM endpoint."
+        "Best for scanned PDFs, images, and complex visual content. Uses the platform LLM."
     ),
 )
 class VLMConverter(PDFConverter):
-    """PDF-to-Markdown converter using any OpenAI-compatible VLM.
-
-    Each page is rasterised at :data:`_RENDER_DPI` DPI and sent to the model
-    as a base64-encoded PNG embedded in a ``data:`` URI.
-
-    The ``http_client`` parameter accepts a shared ``httpx.Client`` so all
-    conversions reuse the same connection pool instead of creating a new one
-    per request.  Pass ``app.state.http_client_sync`` from the router.
-
-    Provider examples::
-
-        # Ollama (default) — no API key required
-        converter = VLMConverter(http_client=shared_client)
-
-        # OpenAI
-        converter = VLMConverter(
-            model="gpt-4o",
-            base_url="https://api.openai.com/v1",
-            api_key="sk-...",
-            http_client=shared_client,
-        )
-    """
-
-    _model_name: Optional[str] = None  # another model on the same lane (see __init__)
-    _backend: Optional[str] = None  # set by __init__; None = no lane to build
+    """PDF-to-Markdown converter: each page is rasterised at :data:`_RENDER_DPI`
+    DPI and transcribed by the job's LLM lane (``vision_sync``)."""
 
     def __init__(
         self,
-        model: str = "qwen3-vl:4b-instruct-q4_K_M",
-        base_url: str = _DEFAULT_BASE_URL,
-        api_key: str = "ollama",
-        temperature: Optional[float] = _DEFAULT_TEMPERATURE,
         user_prompt: Optional[str] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
-        http_client: Optional[httpx.Client] = None,
-        backend: Optional[str] = None,
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
-        model_name: Optional[str] = None,
     ) -> None:
-        self._temperature = temperature
-        self._max_tokens = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
-        # None => use the env-derived default ("disable"); "" => leave model default.
-        self._reasoning_effort = (
-            reasoning_effort if reasoning_effort is not None else _DEFAULT_REASONING_EFFORT
-        )
         self._user_prompt = user_prompt
         self._on_progress = on_progress
-        # backend: "factory" (default — route vision through the shared LLMFactory
-        # -> litellm -> Gemini/Vertex, the same provider + credentials the rest of
-        # the platform uses: template -> markdown -> LLM) or "openai" (an
-        # OpenAI-compatible endpoint such as a local Ollama, opt-in via VLM_BACKEND).
-        # The default was "openai", so an image on a platform lane went to an
-        # endpoint that does not exist there and failed with a connection error.
-        self._backend = (backend or os.getenv("VLM_BACKEND", "factory")).lower()
-
-        if self._backend == "factory":
-            # The lane (type, model, identity) is picked per job by vlm_lane — the
-            # space's connector or this pod's env — and built on the first call, so a
-            # converter that never calls the LLM never needs its credentials.
-            # model_name: another model on the same lane (dbank's escalation).
-            self._model_name = model_name
-            self._model = "factory"
-            return
-
-        from openai import OpenAI
-
-        self._model = model
-        # If a shared client is supplied its timeout settings apply.
-        # Otherwise use a conservative per-request timeout.
-        client_kwargs: dict = dict(base_url=base_url, api_key=api_key)
-        if http_client is not None:
-            client_kwargs["http_client"] = http_client
-        else:
-            client_kwargs["timeout"] = httpx.Timeout(
-                connect=10.0, read=120.0, write=10.0, pool=5.0
-            )
-
-        self._client = OpenAI(**client_kwargs)
+        # The lane is picked per job by vlm_lane and built on the first call, so a
+        # converter that never calls the LLM never needs its credentials.
 
     # ------------------------------------------------------------------
     # PDFConverter interface
@@ -191,7 +89,7 @@ class VLMConverter(PDFConverter):
             for page_num in range(total):
                 page = pdf_document[page_num]
                 img_b64 = self._render_page_as_b64(page)
-                markdown = self._transcribe_page_with_retry(img_b64)
+                markdown = self._transcribe_page(img_b64)
                 pages.append(markdown)
 
                 if self._on_progress:
@@ -212,47 +110,14 @@ class VLMConverter(PDFConverter):
         pix = page.get_pixmap(matrix=matrix)
         return base64.b64encode(pix.tobytes("png")).decode("utf-8")
 
-    def _transcribe_page_factory(self, img_b64: str, prompt_text: str) -> str:
-        """Transcribe one page through the shared LLMFactory client's vision_sync
-        (the factory owns model + region + provider auth; the thinking-disable
-        fallback for models that reject it lives there too). A job that brought its
-        caller's connector goes through that instead (see vlm_lane)."""
+    def _transcribe_page(self, img_b64: str) -> str:
+        """Transcribe one page through the job's client's vision_sync. The shared
+        layer owns model, region, auth, generation settings and the retry; a job
+        that brought its caller's connector goes through that instead (vlm_lane)."""
         from . import vlm_lane
 
-        content = vlm_lane.client(self._model_name).vision_sync(
-            prompt_text, [img_b64],
-            max_tokens=self._max_tokens,
-            temperature=self._temperature,
-            reasoning_effort=self._reasoning_effort or None,
-        ).strip()
-        content = re.sub(r"^```(?:markdown)?\n?", "", content)
-        content = re.sub(r"\n?```$", "", content)
-        return content.strip()
-
-    def _transcribe_page(self, img_b64: str) -> str:
-        """Send a base64 page image to the VLM and return the Markdown text."""
         prompt_text = self._user_prompt if self._user_prompt else _PROMPT
-        if self._backend == "factory":
-            return self._transcribe_page_factory(img_b64, prompt_text)
-        sampling = {} if self._temperature is None else {"temperature": self._temperature}
-        response = self._client.chat.completions.create(
-            model=self._model,
-            **sampling,
-            max_tokens=self._max_tokens,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": f"data:image/png;base64,{img_b64}",
-                        },
-                        {"type": "text", "text": prompt_text},
-                    ],
-                },
-            ],
-        )
-        content = (response.choices[0].message.content or "").strip()
+        content = vlm_lane.client().vision_sync(prompt_text, [img_b64]).strip()
         content = re.sub(r"^```(?:markdown)?\n?", "", content)
         content = re.sub(r"\n?```$", "", content)
         return content.strip()
@@ -266,89 +131,11 @@ class VLMConverter(PDFConverter):
         instance (and its factory/client config) is shared read-only.
         """
         self._build_lane()
-        return self._transcribe_page_with_retry(img_b64)
+        return self._transcribe_page(img_b64)
 
     def _build_lane(self) -> None:
-        """Build this job's client before the retry loop (cached after the first call):
-        a lane that cannot be built is a configuration error, and retrying it only
-        delays the message that says which setting is missing."""
-        if self._backend == "factory":
-            from . import vlm_lane
-            vlm_lane.client(self._model_name)
-
-    def _transcribe_page_with_retry(self, img_b64: str) -> str:
-        """Call ``_transcribe_page``, retrying what another attempt can fix.
-
-        A rate limit waits (long, see ``_RATE_LIMIT_*``); a timeout, a 5xx or an error
-        with no status retries briefly (``_MAX_RETRY_ATTEMPTS``); a 4xx other than 429
-        fails at once. The last error is re-raised so the caller can decide whether to
-        mark the page as failed or abort the entire conversion.
-        """
-        attempt = 0
-        while True:
-            try:
-                return self._transcribe_page(img_b64)
-            except Exception as exc:  # noqa: BLE001 - classified below
-                kind = _classify(exc)
-                if kind == "client error":
-                    raise
-                if kind == "daily limit":
-                    # Waiting minutes cannot help a per-day cap: stop now and say so.
-                    detail = str(exc)[:300]
-                    logger.error("VLM lane hit its daily token limit — aborting (%s)", detail)
-                    raise RuntimeError(
-                        "LLM daily token limit reached on this lane; conversions that need "
-                        f"the VLM work again once it resets ({detail})") from exc
-                attempt += 1
-                budget = _RATE_LIMIT_ATTEMPTS if kind == "rate limited" else _MAX_RETRY_ATTEMPTS
-                detail = f"{type(exc).__name__}: {str(exc)[:200]}"
-                if attempt >= budget:
-                    logger.error("VLM page call %s after %d attempts — aborting conversion (%s)",
-                                 kind, attempt, detail)
-                    raise
-                delay = (_rate_limit_delay(exc, attempt) if kind == "rate limited"
-                         else _RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
-                logger.warning("VLM page call %s (attempt %d/%d), retrying in %.0fs (%s)",
-                               kind, attempt, budget, delay, detail)
-                time.sleep(delay)
-
-
-def _classify(exc: Exception) -> str:
-    """"rate limited", "daily limit" or "client error" (no retry), or "failed" (a
-    timeout, a 5xx, unknown).
-
-    By status code and name, so openai's and litellm's exception classes both fit.
-    The proxy lane raises a plain RuntimeError ("HTTP 429 for '<url>' ... Response:
-    {...}"), so its status is read from the text. A 429 for a per-day token cap
-    ("Token limit exceeded ... tokens per day") is not a rate limit: it lasts
-    until the cap resets.
-    """
-    status = getattr(exc, "status_code", None)
-    text = str(exc)
-    if status is None and (m := _HTTP_STATUS.search(text)):
-        status = int(m.group(1))
-    limited = (status == 429 or "RESOURCE_EXHAUSTED" in text
-               or "RateLimit" in type(exc).__name__ or "rate limit" in text.lower())
-    if limited and _DAILY_CAP.search(text):
-        return "daily limit"
-    if limited:
-        return "rate limited"
-    if isinstance(status, int) and 400 <= status < 500 and status != 408:
-        return "client error"
-    return "timed out" if "timeout" in type(exc).__name__.lower() else "failed"
-
-
-_HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
-_DAILY_CAP = re.compile(r"per day|daily", re.I)
-
-
-def _rate_limit_delay(exc: Exception, attempt: int) -> float:
-    """Retry-After when the provider sends one, else doubling from the base with jitter."""
-    headers = getattr(getattr(exc, "response", None), "headers", None) or {}
-    try:
-        after = float(headers.get("retry-after") or headers.get("Retry-After") or "")
-        return min(after, _RATE_LIMIT_MAX_DELAY_S)
-    except (TypeError, ValueError):
-        pass
-    delay = min(_RATE_LIMIT_BASE_DELAY_S * (2 ** (attempt - 1)), _RATE_LIMIT_MAX_DELAY_S)
-    return delay * random.uniform(0.5, 1.0)
+        """Build this job's client before the first call (cached after it): a lane
+        that cannot be built is a configuration error, and retrying it only delays
+        the message that says which setting is missing."""
+        from . import vlm_lane
+        vlm_lane.client()

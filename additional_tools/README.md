@@ -17,5 +17,4 @@ env PYTHONPATH=<repo_root> LLM_FACTORY_PROVIDER=vertex_ai/gemini-3.5-flash \
 | `eval_retrieval.py` | golden-question retrieval eval (hit@k/MRR) — hierarchical vs hybrid, per doc (`duah`/`368`) |
 | `gen_dbank_slice.py` | generate dbank markdown for a page slice (fixtures for the evals) |
 | `validate_dbank.py` | dbank routing counts + serial-vs-parallel VLM timing |
-| `probe_thinking.py` | VLM latency: thinking on vs off, per model |
 | `run_dbank_full.py` | full-document dbank conversion timing (GPU vs 1-CPU) |

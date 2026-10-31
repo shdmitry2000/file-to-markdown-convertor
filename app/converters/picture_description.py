@@ -6,8 +6,9 @@ search. docling has a picture-description stage for exactly this, run by its
 simple pipeline (docx, pptx) after the backend; its built-in "api" engine needs
 an OpenAI-compatible URL, which the platform lanes do not expose. So this module
 registers our own engine (kind ``ragp_vlm``) that sends each picture through
-``VLMConverter.transcribe_page`` — the same LLMFactory client, model (VLM_MODEL)
-and retry/rate-limit handling as the dbank and slides lanes. No OCR anywhere.
+``VLMConverter.transcribe_page`` — the same LLMFactory client, model (the job's
+lane, LLM_TYPE) and retry/rate-limit handling as the dbank and slides lanes. No OCR
+anywhere.
 
 docling prints the description right after the placeholder, also inside table
 cells, so it is collapsed to one line. A picture that fails to describe gets no
@@ -30,6 +31,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable, ClassVar, Iterable, Literal
 
 from docling.datamodel.pipeline_options import PictureDescriptionBaseOptions
+from pydantic import Field
 from docling.models.picture_description_base_model import PictureDescriptionBaseModel
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,11 @@ on_progress: Callable[[], None] | None = None
 _BEAT_SECONDS = 2.0
 
 
+def _max_concurrency() -> int:
+    from shared.llm_factory.core.resilience import max_concurrency
+    return max_concurrency()
+
+
 def _picture_timeout() -> float:
     """DOCLING_PICTURE_TIMEOUT_SECONDS (default 600): one picture's wall clock, retries
     included. Above a busy picture's worst case (resilience.py: 543 s at a 120 s request)."""
@@ -67,7 +74,8 @@ def enabled() -> bool:
 
 class VlmPictureDescriptionOptions(PictureDescriptionBaseOptions):
     kind: ClassVar[Literal["ragp_vlm"]] = KIND
-    concurrency: int = int(os.getenv("DOCLING_PICTURE_CONCURRENCY", "4"))
+    # LLM_MAX_CONCURRENCY: every picture call takes one of its slots anyway.
+    concurrency: int = Field(default_factory=lambda: _max_concurrency())
 
 
 class VlmPictureDescriptionModel(PictureDescriptionBaseModel):
@@ -86,7 +94,7 @@ class VlmPictureDescriptionModel(PictureDescriptionBaseModel):
         try:
             if self._vlm is None:
                 from app.converters.vlm import VLMConverter
-                self._vlm = VLMConverter(backend="factory", user_prompt=_PROMPT)
+                self._vlm = VLMConverter(user_prompt=_PROMPT)
             buf = io.BytesIO()
             image.save(buf, format="PNG")
             text = self._vlm.transcribe_page(base64.b64encode(buf.getvalue()).decode())

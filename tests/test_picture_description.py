@@ -132,3 +132,83 @@ def test_many_pictures_are_not_cut_by_the_stall_watch(tmp_path, monkeypatch):
     finally:
         w._kill()
     assert result["markdown"].count("תיאור") == 20
+
+
+def _annotate(describe, n: int, concurrency: int) -> tuple[list[str], float]:
+    """Run the engine's picture step over n stand-in pictures with `describe`."""
+    import time
+    from types import SimpleNamespace
+
+    fake = SimpleNamespace(options=SimpleNamespace(concurrency=concurrency), _describe=describe)
+    t0 = time.monotonic()
+    out = list(pd.VlmPictureDescriptionModel._annotate_images(fake, list(range(n))))
+    return out, time.monotonic() - t0
+
+
+def test_a_hung_picture_is_left_undescribed_and_the_document_goes_on(monkeypatch):
+    """A VLM request that never returns must not hold the conversion: the beat keeps
+    the stall watch quiet, so the picture step needs its own deadline."""
+    import threading
+
+    monkeypatch.setenv("DOCLING_PICTURE_TIMEOUT_SECONDS", "2")
+    hang = threading.Event()
+
+    def describe(i):
+        if i == 1:
+            hang.wait(30)
+        return f"pic {i}"
+
+    try:
+        out, secs = _annotate(describe, 4, concurrency=2)
+    finally:
+        hang.set()
+    assert out == ["pic 0", "", "pic 2", "pic 3"]
+    assert secs < 10
+
+
+def test_pictures_queued_behind_hung_threads_are_not_waited_for(monkeypatch):
+    """Every thread held by a hung picture: the rest can never start, so they are
+    left undescribed rather than waited on forever."""
+    import threading
+
+    monkeypatch.setenv("DOCLING_PICTURE_TIMEOUT_SECONDS", "1")
+    hang = threading.Event()
+
+    def describe(i):
+        hang.wait(30)
+        return f"pic {i}"
+
+    try:
+        out, secs = _annotate(describe, 5, concurrency=2)
+    finally:
+        hang.set()
+    assert out == [""] * 5
+    assert secs < 10
+
+
+def test_a_hung_vlm_fallback_is_cut_by_the_stall_watch(tmp_path, monkeypatch):
+    """A PDF whose text layer sends it to the VLM, and a VLM request that never
+    returns: the warm worker must be cut as stalled, not held for the 2 h ceiling
+    (2026-10-31 local soak: h2504.pdf held a worker for 31 min)."""
+    import time
+
+    import fitz
+
+    from app.workers import worker as worker_mod
+    from tests import _warm_targets as targets
+
+    path = tmp_path / "scan.pdf"
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "hello")
+    doc.save(str(path))
+
+    monkeypatch.setenv("DOCLING_STALL_SECONDS", "5")
+    monkeypatch.setattr(worker_mod, "_warm_docling_loop", targets.hung_vlm_fallback_loop)
+    w = worker_mod._WarmDoclingWorker()
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="stalled"):
+            w.convert(str(path), "c1", False, False, 120)
+    finally:
+        w._kill()
+    assert time.monotonic() - t0 < 60

@@ -60,3 +60,19 @@ def slow_vlm_docling_loop(in_q, out_q, *args):
     with patch("app.converters.vlm.VLMConverter.__init__", return_value=None), \
          patch("app.converters.vlm.VLMConverter.transcribe_page", slow):
         _warm_docling_loop(in_q, out_q, *args)
+
+
+def hung_vlm_fallback_loop(in_q, out_q, *args):
+    """The real warm docling loop, where the broken-text-layer VLM fallback never
+    returns: a VLM request stuck on the network. The stall watch must cut it."""
+    from unittest.mock import patch
+
+    from app.workers.worker import _warm_docling_loop
+
+    def hang(self, path):
+        time.sleep(300)
+
+    with patch("app.workers.worker._vlm_fallback_wanted", return_value=True), \
+         patch("app.converters.vlm.VLMConverter.__init__", return_value=None), \
+         patch("app.converters.vlm.VLMConverter.convert", hang):
+        _warm_docling_loop(in_q, out_q, *args)

@@ -644,6 +644,8 @@ def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = N
     Returns ``(item, reason)`` where reason is None (got a result), 'timeout',
     'stalled', 'died', or 'cancelled'."""
     watch = _ProgressWatch(getattr(proc, "pid", None), timeout_seconds, progress=progress)
+    started = time.monotonic()
+    next_note = started + 120
     while True:
         try:
             return out_q.get(timeout=watch.slice()), None
@@ -655,6 +657,13 @@ def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = N
             cut = watch.check()
             if cut:
                 return None, cut
+            now = time.monotonic()
+            if now >= next_note:  # a long conversion says, once a minute, whether it moves
+                next_note = now + 60
+                logger.info("[%s] still converting after %.0fs: progress %s, last moved %.0fs ago",
+                            conversion_id, now - started,
+                            progress.value if progress is not None else "cpu",
+                            now - watch._last_progress)
 
 
 def _await_warm_ready(out_q, proc, name: str):

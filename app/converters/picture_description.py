@@ -13,7 +13,8 @@ docling prints the description right after the placeholder, also inside table
 cells, so it is collapsed to one line. A picture that fails to describe gets no
 description and never fails the document.
 
-DOCLING_DESCRIBE_PICTURES=false turns it off (default on).
+DOCLING_DESCRIBE_PICTURES=false turns it off (default on). A picture still waiting
+after DOCLING_PICTURE_TIMEOUT_SECONDS (default 600) is left undescribed.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ import logging
 import os
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable, ClassVar, Iterable, Literal
 
 from docling.datamodel.pipeline_options import PictureDescriptionBaseOptions
@@ -51,6 +53,12 @@ _MIN_SIDE_PX = 48
 #: pictures are being described, so the stall watch sees the work moving.
 on_progress: Callable[[], None] | None = None
 _BEAT_SECONDS = 2.0
+
+
+def _picture_timeout() -> float:
+    """DOCLING_PICTURE_TIMEOUT_SECONDS (default 600): one picture's wall clock, retries
+    included. Above a busy picture's worst case (resilience.py: 543 s at a 120 s request)."""
+    return float(os.getenv("DOCLING_PICTURE_TIMEOUT_SECONDS", "600"))
 
 
 def enabled() -> bool:
@@ -90,8 +98,13 @@ class VlmPictureDescriptionModel(PictureDescriptionBaseModel):
     def _annotate_images(self, images: Iterable) -> Iterable[str]:
         # The worker's stall watch counts docling's PDF page handoffs, and a docx
         # has none: without a beat, pictures waiting on the VLM read as a stuck
-        # conversion. A VLM call is bounded by its own retry budget, and the
-        # whole job by DOCLING_TIMEOUT_SECONDS.
+        # conversion. The beat also hides a VLM request that never returns, so each
+        # picture has its own deadline: past it the picture goes undescribed and the
+        # document carries on (2026-10-31 local soak: two hung requests held both
+        # docling workers for 20 min while the beat kept the stall watch quiet).
+        images = list(images)
+        timeout = _picture_timeout()
+        started: dict[int, float] = {}
         done = threading.Event()
 
         def beat():
@@ -99,13 +112,36 @@ class VlmPictureDescriptionModel(PictureDescriptionBaseModel):
                 if on_progress is not None:
                     on_progress()
 
+        def describe(i: int, image) -> str:
+            started[i] = time.monotonic()
+            return self._describe(image)
+
         threading.Thread(target=beat, daemon=True).start()
+        # Not a `with` block: leaving it would join a hung thread.
+        ex = ThreadPoolExecutor(max_workers=self.options.concurrency)
+        futures = [ex.submit(describe, i, im) for i, im in enumerate(images)]
+        late: set[int] = set()
         try:
-            with ThreadPoolExecutor(max_workers=self.options.concurrency) as ex:
-                results = list(ex.map(self._describe, images))
+            pending = set(range(len(futures)))
+            while pending:
+                wait([futures[i] for i in pending], timeout=1.0, return_when=FIRST_COMPLETED)
+                now = time.monotonic()
+                pending = {i for i in pending if not futures[i].done()}
+                for i in sorted(pending):
+                    if i in started and now - started[i] > timeout:
+                        late.add(i)
+                pending -= late
+                # Every thread held by a late picture: the rest would never start.
+                if pending and sum(not futures[i].done() for i in late) >= self.options.concurrency:
+                    late |= pending
+                    pending = set()
         finally:
             done.set()
-        yield from results
+            ex.shutdown(wait=False, cancel_futures=True)
+        if late:
+            logger.warning("picture description: %d of %d pictures past %.0fs, left undescribed",
+                           len(late), len(images), timeout)
+        yield from ("" if i in late else f.result() for i, f in enumerate(futures))
 
 
 def register() -> None:

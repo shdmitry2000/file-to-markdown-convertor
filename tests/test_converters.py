@@ -28,7 +28,8 @@ def test_pymupdf_converter_success(sample_pdf):
         result = converter.convert(sample_pdf)
         
         assert result == "# Test Document\n\nConverted using pymupdf4llm"
-        mock_to_markdown.assert_called_once_with(str(sample_pdf))
+        # 1.4.8.6: PyMuPDF 2.0 would OCR pages it judges scanned; the converter turns it off.
+        mock_to_markdown.assert_called_once_with(str(sample_pdf), use_ocr=False)
 
 def test_vlm_converter_success(sample_pdf):
     """Each page goes to the job's client (vision_sync); a markdown fence is stripped."""

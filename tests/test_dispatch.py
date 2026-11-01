@@ -187,3 +187,40 @@ def test_a_busy_worker_on_a_long_task_still_counts_as_a_worker(rig):
     pump(d)
     assert failed == []
     assert d.state("next")["state"] == "queued"
+
+
+def test_a_finished_job_whose_result_never_arrives_fails_instead_of_hanging(rig):
+    """The worker says "finished a" on this socket; its result travels on the other
+    one. When that result never comes, the dispatcher used to have already
+    forgotten "a" — nothing failed it, the status stayed `processing`, and the
+    template polled until its timeout (2026-11-01, OCP: "markdown done, the space
+    never hears")."""
+    d, clock, failed, worker = rig
+    w = worker()
+    d.submit(task("a"))
+    ready(w, "w1")
+    pump(d)
+    assert received(w) == "a"
+
+    ready(w, "w1", finished="a")   # done in the worker...
+    pump(d)
+    clock.t += 61                  # ...and its result never reached the API
+    pump(d)
+
+    assert [jid for jid, _ in failed] == ["a"], failed
+    assert "result never arrived" in failed[0][1]
+
+
+def test_a_result_that_arrives_is_not_failed(rig):
+    d, clock, failed, worker = rig
+    w = worker()
+    d.submit(task("a"))
+    ready(w, "w1")
+    pump(d)
+    received(w)
+    ready(w, "w1", finished="a")
+    pump(d)
+    d.note_done("a")               # the API got the result
+    clock.t += 61
+    pump(d)
+    assert failed == []

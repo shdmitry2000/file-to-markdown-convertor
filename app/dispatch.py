@@ -76,6 +76,9 @@ class Dispatcher:
     _queue: Deque[_Queued] = field(default_factory=collections.deque, init=False)
     _workers: Dict[str, _Worker] = field(default_factory=dict, init=False)
     _assigned: Dict[str, _Assignment] = field(default_factory=dict, init=False)
+    #: Jobs a worker reported finished whose result has not reached the API yet:
+    #: job_id -> (task, finished_at). Cleared by note_done.
+    _awaiting_result: Dict[str, tuple] = field(default_factory=dict, init=False)
     _last_worker_seen: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
@@ -111,6 +114,7 @@ class Dispatcher:
     def note_done(self, job_id: str) -> None:
         with self._lock:
             self._assigned.pop(job_id, None)
+            self._awaiting_result.pop(job_id, None)
 
     def state(self, job_id: str) -> Optional[dict]:
         """Where *job_id* is, for the status endpoint; None once it is not tracked."""
@@ -184,8 +188,10 @@ class Dispatcher:
             mine = [j for j, a in self._assigned.items() if a.worker_id == worker_id]
             if finished in mine:
                 # Its result travels on the other socket and may arrive after
-                # this; the worker saying it is done is enough to free it.
-                del self._assigned[finished]
+                # this; the worker saying it is done is enough to free it. The
+                # job is still watched until that result arrives (note_done):
+                # forgotten here, a lost result left it `processing` for ever.
+                self._awaiting_result[finished] = (self._assigned.pop(finished).task, now)
                 mine.remove(finished)
             # A periodic idle ping that crossed a task on the wire must not make
             # the worker look free while it is busy with that task.
@@ -238,6 +244,12 @@ class Dispatcher:
                 else:
                     failed.append((a.task, "conversion worker stopped responding "
                                    f"({a.attempts} attempts)"))
+
+            for jid, (task, finished_at) in list(self._awaiting_result.items()):
+                if now - finished_at > self.job_silence_s:
+                    del self._awaiting_result[jid]
+                    failed.append((task, "the worker finished but its result never arrived "
+                                   f"within {self.job_silence_s:.0f}s; convert again"))
 
             if not self._workers and now - self._last_worker_seen > self.no_worker_s:
                 while self._queue:

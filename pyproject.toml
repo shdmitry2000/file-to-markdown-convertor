@@ -14,7 +14,7 @@ dependencies = [
     "docling-core>=2.104.0",
     "transformers>=4.40.0",
     "huggingface-hub>=1.3.0",
-    "pymupdf4llm>=0.0.0",
+    "pymupdf>=2.0",
     "markitdown[all]>=0.0.0",
     # Direct dependency of the formula-aware excel converter. It also arrives
     # transitively via markitdown[all], but that is not a contract we control.

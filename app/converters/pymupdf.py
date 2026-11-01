@@ -25,4 +25,7 @@ class PyMuPDFConverter(PDFConverter):
 
     def convert(self, pdf_path: Path) -> str:
         self.validate_path(pdf_path)
-        return pymupdf4llm.to_markdown(str(pdf_path))
+        # PyMuPDF 2.0 OCRs pages it judges scanned, with tesseract and English by
+        # default: the image ships no tesseract and the documents are Hebrew. The
+        # text layer is what this converter reads; scanned pages go to dbank / VLM.
+        return pymupdf4llm.to_markdown(str(pdf_path), use_ocr=False)

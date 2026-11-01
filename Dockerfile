@@ -34,7 +34,7 @@
 # Hat's patch cadence. UBI is still glibc, so torch's manylinux_2_28 wheels
 # (which have no musl build and no sdist) resolve exactly as before — that is
 # why an Alpine base was never an option for this image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:3ad9a8b075fe314f59db0737aa6d14528aa0beecc0bd121c7dd5a798c070a91d AS builder
+FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:033fff36c6452df9df576039755fb27558cee0fc7f39c44ad9a9505e8491a181 AS builder
 
 USER 0
 WORKDIR /app
@@ -183,7 +183,7 @@ RUN mkdir -p /export/root-cache && \
 
 # ---- Final Stage ----
 # This stage creates the final, small, production-ready image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:3ad9a8b075fe314f59db0737aa6d14528aa0beecc0bd121c7dd5a798c070a91d
+FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:033fff36c6452df9df576039755fb27558cee0fc7f39c44ad9a9505e8491a181
 
 USER 0
 

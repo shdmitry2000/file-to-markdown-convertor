@@ -50,4 +50,5 @@ class DoclingConverter(PDFConverter):
         
         result = converter.convert(str(pdf_path))
         from .image_ids import annotate_images
-        return annotate_images(result.document.export_to_markdown(), result.document)
+        from .table_compact import compact_tables
+        return compact_tables(annotate_images(result.document.export_to_markdown(), result.document))

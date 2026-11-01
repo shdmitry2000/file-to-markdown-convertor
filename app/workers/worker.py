@@ -1,6 +1,7 @@
 import zmq
 import socket
 from app.converters.image_ids import annotate_images
+from app.converters.table_compact import compact_tables
 import json
 import os
 import time
@@ -292,7 +293,8 @@ def _convert_job(file_path: str, converter_type: str, do_ocr: bool, result_queue
                 }
             )
             result = converter.convert(file_path)
-            markdown = annotate_images(result.document.export_to_markdown(), result.document)
+            markdown = compact_tables(annotate_images(result.document.export_to_markdown(),
+                                                          result.document))
             num_pages = result.document.num_pages()
             doc_name = repr(result.document.name)
             doc_origin = repr(result.document.origin)
@@ -597,7 +599,8 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
         try:
             with vlm_lane.job(llm_connector):
                 result = converter.convert(file_path)
-                markdown = annotate_images(result.document.export_to_markdown(), result.document)
+                markdown = compact_tables(annotate_images(result.document.export_to_markdown(),
+                                                          result.document))
                 num_pages = result.document.num_pages()
                 doc_name = repr(result.document.name)
                 doc_origin = repr(result.document.origin)
@@ -719,6 +722,7 @@ class _WarmDoclingWorker:
                 proc.join()
 
     def _start(self, do_ocr: bool, do_table_structure: bool) -> None:
+        t0 = time.monotonic()
         self._in = self._ctx.Queue()
         self._out = self._ctx.Queue()
         self.stage_events = self._ctx.Value("q", 0)
@@ -742,7 +746,8 @@ class _WarmDoclingWorker:
             detail = status[1] if len(status) > 1 else status
             self._kill()
             raise Exception(f"Warm docling worker init failed: {detail}")
-        logger.info("Warm docling worker ready (ocr=%s, tables=%s)", do_ocr, do_table_structure)
+        logger.info("[timing] Warm docling worker ready (ocr=%s, tables=%s, cold start %.1fs)",
+                    do_ocr, do_table_structure, time.monotonic() - t0)
 
     def _ensure(self, do_ocr: bool, do_table_structure: bool) -> None:
         if (self._proc is None or not self._proc.is_alive()
@@ -811,7 +816,7 @@ class _WarmDoclingWorker:
             if self._proc is None or not self._proc.is_alive():
                 self._kill()  # worker died producing this result → clean respawn next time
             if item[0] == "error":
-                raise Exception(item[1])
+                raise Exception(_job_error(conversion_id, file_path, item))
             return item[1]
 
 
@@ -890,6 +895,7 @@ class _WarmDbankWorker:
                 proc.join()
 
     def _start(self) -> None:
+        t0 = time.monotonic()
         self._in = self._ctx.Queue()
         self._out = self._ctx.Queue()
         self._proc = self._ctx.Process(target=_warm_dbank_loop, args=(self._in, self._out), daemon=True)
@@ -903,7 +909,9 @@ class _WarmDbankWorker:
             detail = status[1] if len(status) > 1 else status
             self._kill()
             raise Exception(f"Warm dbank worker init failed: {detail}")
-        logger.info("Warm dbank worker ready")
+        # Timed: a cold start is paid by the job that triggered it, so a slow file
+        # right after this line was waiting on the start, not converting.
+        logger.info("[timing] Warm dbank worker ready (cold start %.1fs)", time.monotonic() - t0)
 
     def _ensure(self) -> None:
         if self._proc is None or not self._proc.is_alive():
@@ -954,7 +962,7 @@ class _WarmDbankWorker:
             if self._proc is None or not self._proc.is_alive():
                 self._kill()
             if item[0] == "error":
-                raise Exception(item[1])
+                raise Exception(_job_error(conversion_id, file_path, item))
             return item[1]
 
 
@@ -1132,11 +1140,26 @@ def _run_converter_with_timeout(
             process.join()
 
     if item[0] == "error":
-        error_msg = item[1]
-        traceback_info = item[2] if len(item) > 2 else ""
-        logger.error(f"[{conversion_id}] Subprocess error:\n{error_msg}\n{traceback_info}")
-        raise Exception(error_msg)
+        raise Exception(_job_error(conversion_id, file_path, item))
     return item[1]
+
+
+def _job_error(conversion_id: str, file_path: str, item: tuple) -> str:
+    """Log a child's ("error", message, traceback) in full and return the message,
+    with the real cause added when docling only said it could not open the file.
+
+    The warm workers used to raise the bare message and drop the traceback, and
+    docling's message names no cause — a failed Word file left nothing to act on."""
+    from app.converters.office_diagnose import is_load_failure, load_failure_cause
+
+    error_msg = item[1]
+    traceback_info = item[2] if len(item) > 2 else ""
+    if is_load_failure(error_msg):
+        cause = load_failure_cause(file_path)
+        if cause:
+            error_msg = f"{error_msg} — cause: {cause}"
+    logger.error(f"[{conversion_id}] Subprocess error:\n{error_msg}\n{traceback_info}")
+    return error_msg
 
 
 def _output_identity(file_path: str, converter_type: str) -> tuple[str, str]:

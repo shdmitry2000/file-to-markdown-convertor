@@ -112,6 +112,7 @@ class VlmPictureDescriptionModel(PictureDescriptionBaseModel):
         # docling workers for 20 min while the beat kept the stall watch quiet).
         images = list(images)
         timeout = _picture_timeout()
+        t0 = time.monotonic()
         started: dict[int, float] = {}
         done = threading.Event()
 
@@ -149,7 +150,11 @@ class VlmPictureDescriptionModel(PictureDescriptionBaseModel):
         if late:
             logger.warning("picture description: %d of %d pictures past %.0fs, left undescribed",
                            len(late), len(images), timeout)
-        yield from ("" if i in late else f.result() for i, f in enumerate(futures))
+        texts = ["" if i in late else f.result() for i, f in enumerate(futures)]
+        # One line per document: how much of the conversion the VLM took.
+        logger.info("[timing] picture description: %d pictures, %d described, %d late in %.1fs",
+                    len(images), sum(bool(t) for t in texts), len(late), time.monotonic() - t0)
+        yield from texts
 
 
 def register() -> None:

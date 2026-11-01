@@ -348,6 +348,20 @@ def _apply_result(result: dict) -> None:
             # volume with no one to clean it up.
             clear_cancel(conversion_id)
 
+            # One line per conversion with where its time went: waiting in the
+            # queue vs converting. Without it "slow" could not be told from "queued".
+            meta = active_conversions_db.get(conversion_id) or pending_conversions_db.get(conversion_id) or {}
+            now = time.time()
+            queued_at, started_at = meta.get("queued_at"), meta.get("started_at")
+            logger.info(
+                "[timing] conversion %s %s: file=%s converter=%s queued=%s convert=%s total=%s%s",
+                conversion_id, status, meta.get("filename"), meta.get("converter"),
+                f"{started_at - queued_at:.1f}s" if queued_at and started_at else "-",
+                f"{now - started_at:.1f}s" if started_at else "-",
+                f"{now - queued_at:.1f}s" if queued_at else "-",
+                f" error={str(result.get('error'))[:300]}" if result.get("error") else "",
+            )
+
             # Move from active to completed
             if conversion_id in active_conversions_db:
                 del active_conversions_db[conversion_id]
@@ -494,6 +508,7 @@ async def convert_file(request: ConversionRequest):
     pending_conversions_db[conversion_id] = {
         "filename": display_name,
         "queued_at": time.time(),
+        "converter": request.converter_type or "auto",
     }
     latest_conversion_by_name[display_name] = conversion_id
     _prune_converted_outputs()
@@ -844,7 +859,8 @@ async def debug_convert_file(
     }
     pending_conversions_db[conversion_id] = {
         "filename": file.filename,
-        "queued_at": start_time
+        "queued_at": start_time,
+        "converter": selected_converter,
     }
     if not wait:
         return {

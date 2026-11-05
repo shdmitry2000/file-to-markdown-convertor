@@ -53,7 +53,7 @@ constraint-dependencies = [
     "python-multipart>=0.0.31",
     "urllib3>=2.8.0",
     "pyjwt>=2.15.0",
-    "soupsieve>=2.8.4",
+    "soupsieve>=4.0.1",
     "lxml>=6.1.0",
     "idna>=3.15",
     "requests>=2.33.0",
@@ -69,11 +69,24 @@ constraint-dependencies = [
     "anyio>=4.14.2",
     # Repository advisories (2026-10-27..30), in no public feed yet: the gate's
     # advisories check blocks them.
-    "grpcio>=1.84.1",
+    "grpcio>=1.84.2",
     "mail-parser>=4.6.3",
     # The Dockerfile swaps in opencv-python-headless at this exact version. 4.14 bundles
     # ffmpeg 8.1.2; 5.0.0.93 bundles the older 8.1.1 (see .grype.yaml in rag_bank).
     "opencv-python>=4.14.0.94,<5",
+    # >>> runtime pins: config/runtime-pins.txt (scripts/sync_runtime_pins.py writes this block)
+    "openai==2.54.0",
+    "litellm==1.105.7",
+    "fastapi==0.143.5",
+    "starlette==1.8.0",
+    "pydantic==2.14.2",
+    "uvicorn==0.54.0",
+    "httpx==0.28.1",
+    "google-genai==2.29.0",
+    "tiktoken==0.14.0",
+    "oracledb==26.0.1",
+    "langchain-core==1.7.4",
+    # <<< runtime pins
 ]
 index-url = "https://pypi.org/simple"
 index-strategy = "unsafe-best-match"

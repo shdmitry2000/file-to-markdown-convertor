@@ -1,3 +1,3 @@
 # Package marker for app module
 
-__version__ = "1.4.9.9"
+__version__ = "1.5.0"

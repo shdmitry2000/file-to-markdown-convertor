@@ -85,7 +85,7 @@ constraint-dependencies = [
     "google-genai==2.29.0",
     "tiktoken==0.14.0",
     "oracledb==26.0.1",
-    "langchain-core==1.7.4",
+    "langchain-core==1.7.6",
     # <<< runtime pins
 ]
 index-url = "https://pypi.org/simple"

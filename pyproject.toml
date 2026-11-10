@@ -53,7 +53,7 @@ constraint-dependencies = [
     "python-multipart>=0.0.31",
     "urllib3>=2.8.0",
     "pyjwt>=2.15.0",
-    "soupsieve>=4.0.1",
+    "soupsieve>=4.1",
     "lxml>=6.1.0",
     "idna>=3.15",
     "requests>=2.33.0",
@@ -85,7 +85,7 @@ constraint-dependencies = [
     "google-genai==2.29.0",
     "tiktoken==0.14.0",
     "oracledb==26.0.1",
-    "langchain-core==1.7.6",
+    "langchain-core==1.7.7",
     # <<< runtime pins
 ]
 index-url = "https://pypi.org/simple"

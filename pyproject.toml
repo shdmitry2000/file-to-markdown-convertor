@@ -76,7 +76,7 @@ constraint-dependencies = [
     "opencv-python>=4.14.0.94,<5",
     # >>> runtime pins: config/runtime-pins.txt (scripts/sync_runtime_pins.py writes this block)
     "openai==2.54.0",
-    "litellm==1.105.7",
+    "litellm==1.106.9",
     "fastapi==0.143.5",
     "starlette==1.8.0",
     "pydantic==2.14.3",

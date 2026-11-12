@@ -123,10 +123,10 @@ class _ProgressWatch:
             return "stalled"
         return None
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# One JSON line per record on stdout, like every pod: Splunk alerts on it.
+# LOG_LEVEL / LOG_FORMAT / SERVICE_NAME override.
+from shared.logging_setup import configure_logging
+configure_logging("markdown-worker")
 logger = logging.getLogger(__name__)
 configure_litellm_logging()
 

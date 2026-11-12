@@ -16,10 +16,10 @@ from contextlib import asynccontextmanager
 
 from app import __version__, embedded_workers, llm_settings, storage
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# One JSON line per record on stdout, like every pod: Splunk alerts on it.
+# LOG_LEVEL / LOG_FORMAT / SERVICE_NAME override.
+from shared.logging_setup import configure_logging
+configure_logging("markdown-api")
 logger = logging.getLogger(__name__)
 
 # Import configuration and registry

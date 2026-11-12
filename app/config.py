@@ -227,7 +227,7 @@ def configure_litellm_logging() -> None:
     LiteLLM writes through its own handler AND propagates to the root handler, so
     every line came out twice — and at INFO that was ~4 lines per VLM page call.
     The level goes on the logger (LiteLLM itself only sets it on its handler, which
-    the root copy ignores). Call after logging.basicConfig.
+    the root copy ignores). Call after configure_logging.
     """
     import logging
 

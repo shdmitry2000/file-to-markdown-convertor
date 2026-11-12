@@ -47,16 +47,16 @@ from pathlib import Path
 import zmq
 
 from app.config import configure_litellm_logging, get_settings
+from shared.logging_setup import configure_logging
 
 # Import chunkers to trigger @register_chunker decorators.
 import app.chunkers  # noqa: F401
 from app.registry import registry
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# One JSON line per record on stdout, like every pod: Splunk alerts on it.
+# LOG_LEVEL / LOG_FORMAT / SERVICE_NAME override.
+configure_logging("markdown-chunk-server")
 configure_litellm_logging()
 
 

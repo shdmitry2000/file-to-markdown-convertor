@@ -11,3 +11,23 @@ bench_out/
 # Local runtime data and the graphify knowledge graph — never source.
 data/
 graphify-out/
+
+*.pyc
+*.pyo
+.factory/consumer.json
+.factory/backup/
+.factory/STOP
+.factory/PAUSE
+.factory/schedule.log
+.factory/schedule-task.xml
+.factory/trigger.json
+.factory/gate.json
+.factory/*.lock
+harness/.results/
+.factory/holdout/.results/
+.env
+.env.*
+!.env.example
+*.pem
+secrets.json
+credentials.json

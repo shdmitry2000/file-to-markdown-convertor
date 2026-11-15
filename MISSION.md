@@ -2,7 +2,6 @@
 
 <!--
   Owner: humans only. This file is on the protected list; the factory cannot edit it.
-  DRAFT for review: strike or edit anything that is wrong, especially "Out of scope".
 -->
 
 **Derived from:** `README.md`, `docs/`, and the code as of v1.6.4

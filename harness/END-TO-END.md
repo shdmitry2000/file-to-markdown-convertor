@@ -1,11 +1,16 @@
 # Runtime scenarios
 
-Observable journeys for the converter, as it works today. DRAFT for review.
+Observable journeys for the converter, as it works today.
 Shared runtime verification owns execution and evidence.
+
+**How to submit a file (all journeys):** copy it under `PROJECTS_BASE_PATH`, then
+`POST /convert` with JSON `{"file_path": "<absolute path under PROJECTS_BASE_PATH>"}`.
+The response is `{"conversion_id": "..."}`. The first Docling conversion after a cold
+start can take ~5 minutes while models download; allow 10 minutes.
 
 ## A PDF becomes Markdown
 
-1. `POST /convert` with `files_to_convert/simple.pdf`.
+1. Submit `files_to_convert/simple.pdf`.
 2. Poll `GET /convert/{conversion_id}` until the status is `completed`.
 3. `GET /convert/{conversion_id}/content`.
 

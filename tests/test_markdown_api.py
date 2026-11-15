@@ -46,6 +46,20 @@ def test_health_endpoint(client):
     assert data["service"] == "markdown-api"
 
 
+def test_build_id_reports_candidate_exactly_when_set(client, monkeypatch):
+    monkeypatch.setenv("FACTORY_RUNTIME_CANDIDATE", "cand-123")
+    response = client.get("/build-id")
+    assert response.status_code == 200
+    assert response.text == "cand-123"
+
+
+def test_build_id_falls_back_to_commit(client, monkeypatch):
+    monkeypatch.delenv("FACTORY_RUNTIME_CANDIDATE", raising=False)
+    response = client.get("/build-id")
+    assert response.status_code == 200
+    assert response.text.strip() and response.text != "cand-123"
+
+
 def test_convert_endpoint_success(client, test_file):
     """Test /convert endpoint with valid file."""
     response = client.post(

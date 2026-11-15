@@ -1292,6 +1292,31 @@ def _models_status() -> dict:
     }
 
 
+def _git_commit() -> str:
+    """The checkout's commit, or GIT_COMMIT for an image built without .git."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                             timeout=5, cwd=Path(__file__).resolve().parents[2])
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.environ.get("GIT_COMMIT") or "unknown"
+
+
+_BUILD_COMMIT = _git_commit()
+
+
+@app.get("/build-id")
+async def build_id():
+    """Which build is answering. The software factory's runtime check reads this to
+    prove it is testing the candidate it built: FACTORY_RUNTIME_CANDIDATE exactly when
+    set, otherwise the Git commit."""
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(os.environ.get("FACTORY_RUNTIME_CANDIDATE") or _BUILD_COMMIT)
+
+
 @app.get("/health")
 async def health_check(response: Response):
     """Health check endpoint for monitoring with diagnostic information."""

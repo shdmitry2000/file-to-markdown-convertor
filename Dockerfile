@@ -34,7 +34,7 @@
 # Hat's patch cadence. UBI is still glibc, so torch's manylinux_2_28 wheels
 # (which have no musl build and no sdist) resolve exactly as before — that is
 # why an Alpine base was never an option for this image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:033fff36c6452df9df576039755fb27558cee0fc7f39c44ad9a9505e8491a181 AS builder
+FROM registry.access.redhat.com/ubi10/python-312-minimal@sha256:4f06014b257723c97ee6f4cc2b422b24a60c986c360b38756d0853bac1bb7e5d AS builder
 
 USER 0
 WORKDIR /app
@@ -183,32 +183,39 @@ RUN mkdir -p /export/root-cache && \
 
 # ---- Final Stage ----
 # This stage creates the final, small, production-ready image.
-FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:033fff36c6452df9df576039755fb27558cee0fc7f39c44ad9a9505e8491a181
+# Runtime root: ubi-micro plus only what the app needs at runtime, installed from the
+# UBI 10 repositories into a copy of ubi-micro's own root. The running image has no
+# package manager, no rpm and no pip — about half the OS packages of python-312-minimal,
+# so half the scanner rows, and nothing a shell in the container could install with.
+# Every build installs the newest errata (no cached update layer); OS_UPDATE_DATE
+# (build-and-push.sh passes the date) forces the layer to rebuild daily.
+# python3-pip-wheel only feeds ensurepip and bundles pip/urllib3/requests that Xray flags.
+FROM registry.access.redhat.com/ubi10/ubi-micro@sha256:2ad0f98cb13160c4773c945ef93f88b25831c7f27cd3780d72a7e78b210ea72b AS micro
+FROM registry.access.redhat.com/ubi10/ubi@sha256:73ea54bfbfb586075bd3d45df6483a7f68875233c8cc7cebcf9b2bb42306c308 AS rootfs
+COPY --from=micro / /mnt/rootfs
+ARG OS_UPDATE_DATE=
+RUN dnf -y --installroot /mnt/rootfs --releasever 10 --nodocs \
+      --setopt install_weak_deps=false --setopt reposdir=/etc/yum.repos.d \
+      install python3 libstdc++ libgomp glib2 \
+ && dnf -y --installroot /mnt/rootfs --releasever 10 --setopt reposdir=/etc/yum.repos.d upgrade \
+ && rpm --root /mnt/rootfs -e --nodeps python3-pip-wheel \
+ && dnf --installroot /mnt/rootfs clean all \
+ && rm -rf /mnt/rootfs/var/cache/dnf /mnt/rootfs/var/cache/libdnf5 /mnt/rootfs/var/log/dnf* \
+ && cd /mnt/rootfs/opt && mkdir -p app-root/bin app-root/lib/python3.12/site-packages app-root/src \
+ && ln -s lib app-root/lib64 \
+ && ln -s /usr/bin/python3.12 app-root/bin/python3.12 \
+ && ln -s python3.12 app-root/bin/python3 && ln -s python3.12 app-root/bin/python \
+ && printf 'home = /usr/bin\ninclude-system-site-packages = false\n' > app-root/pyvenv.cfg \
+ && chown -R 1001:0 app-root && chmod -R g=u app-root
+
+FROM micro
+COPY --from=rootfs /mnt/rootfs/ /
+ENV PATH=/opt/app-root/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin \
+    HOME=/opt/app-root/src \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=UTF-8
 
 USER 0
-
-# libgomp is torch's OpenMP runtime. The GL/X11 libraries opencv used to link
-# against are gone with the switch to opencv-python-headless (see the builder).
-#
-# curl is not carried over either — nothing in the image shells out to it.
-RUN microdnf install -y \
-    libgomp \
-    glib2 \
- && microdnf clean all
-
-# Red Hat errata published after this base image was built. The digest pin does
-# not pick those up on its own, and that is exactly how the September Xray export
-# came to carry openssl CVE-2026-14456 (High) along with the expat, coreutils and
-# glib2 advisories — every one of them fixed by Red Hat weeks earlier, none of
-# them in the pinned layer. So this is a blanket update now, not a named list: a
-# named list only ever covers the errata somebody remembered to add to it, which
-# is a gate that fails quietly. The digest still pins what the build starts from.
-# Changes daily (build-and-push.sh passes the date) so this layer is rebuilt and new
-# errata land: a cached update layer kept pcre2 10.40-6 (three Highs) weeks after
-# Red Hat fixed it. Unset (enterprise CI) it is empty and nothing changes.
-ARG OS_UPDATE_DATE=
-RUN microdnf update -y \
- && microdnf clean all
 
 # Copy the installed packages from the builder stage. This is the key to a small image.
 COPY --from=builder /opt/app-root/lib/python3.12/site-packages /opt/app-root/lib/python3.12/site-packages
@@ -258,11 +265,6 @@ ENV TORCHDYNAMO_DISABLE=1
 # not enable OCR — it makes docling raise on the first convert.
 ENV DOCLING_DO_OCR=false
 
-# python3.12-pip-wheel only feeds ensurepip (python -m venv with pip). Nothing in
-# this runtime stage creates a venv or runs pip (deps are installed in the builder
-# with uv), and the wheel bundles pip/urllib3/requests/msgpack/idna that Xray flags
-# High with no RHEL fix. --nodeps: python3.12-libs lists it only for ensurepip.
-RUN rpm -e --nodeps python3.12-pip-wheel
 
 USER 1001
 WORKDIR /home/appuser/app

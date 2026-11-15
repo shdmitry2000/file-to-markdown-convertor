@@ -163,6 +163,30 @@ _embedded_workers: Optional[embedded_workers.EmbeddedWorkers] = None
 
 app = FastAPI(version=__version__, lifespan=lifespan)
 
+
+@app.middleware("http")
+async def _internal_only(request, call_next):
+    """Only the platform calls this service. With INTERNAL_SERVICE_TOKEN set (same
+    value as gateway, frontend and templates), every path except the probes needs
+    the matching X-Internal-Auth header. Unset: no check, as before."""
+    import hmac
+    from fastapi.responses import JSONResponse
+
+    expected = (os.getenv("INTERNAL_SERVICE_TOKEN") or "").strip()
+    path = request.url.path
+    public = path in ("/health", "/build-id", "/metrics") or path.startswith(("/health/", "/metrics/"))
+    if expected and not public:
+        presented = (request.headers.get("x-internal-auth") or "").strip()
+        if not (presented and hmac.compare_digest(presented, expected)):
+            return JSONResponse(status_code=403,
+                                content={"detail": "Internal service authentication failed"})
+    return await call_next(request)
+
+
+if not (os.getenv("INTERNAL_SERVICE_TOKEN") or "").strip():
+    logger.warning("[markdown-api] INTERNAL_SERVICE_TOKEN is not set — the "
+                   "service-to-service check is OFF.")
+
 # Guarded like every other shared/ import in this service (see vlm.py,
 # worker.py): the platform libs are vendored only when the image is built from
 # the enterprise repo, and are absent in a standalone submodule build. An
@@ -481,6 +505,14 @@ async def convert_file(request: ConversionRequest):
         display_name = os.path.basename(file_key)
     else:
         file_path = request.file_path
+        # A legacy path must sit under the projects root: this service opened
+        # whatever it was handed, so any file of the pod could be converted and read.
+        root = os.getenv("PROJECTS_BASE_PATH")
+        if root:
+            from shared.file_storage import local_projects_root
+            root = local_projects_root(root).resolve()
+        if root and not Path(file_path).resolve().is_relative_to(root):
+            raise HTTPException(status_code=400, detail="file_path must be under the projects root")
         if not os.path.exists(file_path):
             logger.warning(f"File not found at path: {file_path}")
             raise HTTPException(status_code=404, detail=f"File not found at path {file_path!r}")
@@ -736,12 +768,13 @@ async def get_converted_file(file_path: str):
         return content
     # Pre-id outputs were <stem>.md for EVERY source type (the old extension list
     # left out .pptx, .csv, images, so those always 404'd here).
-    base, ext = os.path.splitext(file_path)
-    if ext and ext.lower() != ".md":
-        lookup_path = os.path.join(converted_dir, os.path.basename(base) + ".md")
-    else:
-        lookup_path = os.path.join(converted_dir, file_path)
-    if not os.path.exists(lookup_path):
+    # By name only, inside the converted dir: the raw path once joined as given,
+    # so an absolute or ../ path read any file of the pod (e.g. /proc/self/environ).
+    stem, ext = os.path.splitext(name)
+    lookup_name = name if ext.lower() in ("", ".md") else stem + ".md"
+    lookup_path = os.path.join(converted_dir, lookup_name)
+    if (not name or not Path(lookup_path).resolve().is_relative_to(Path(converted_dir).resolve())
+            or not os.path.exists(lookup_path)):
         logger.warning(f"Converted file not found: {lookup_path}")
         raise HTTPException(status_code=404, detail="Converted file not found")
     converted_file_path = lookup_path

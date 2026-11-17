@@ -76,3 +76,20 @@ def hung_vlm_fallback_loop(in_q, out_q, *args):
          patch("app.converters.vlm.VLMConverter.__init__", return_value=None), \
          patch("app.converters.vlm.VLMConverter.convert", hang):
         _warm_docling_loop(in_q, out_q, *args)
+
+
+def slow_page_vlm_fallback_loop(in_q, out_q, *args):
+    """The real warm docling loop, where the broken-text-layer VLM fallback takes 2 s
+    a page: steady work, which the stall watch must not cut."""
+    from unittest.mock import patch
+
+    from app.workers.worker import _warm_docling_loop
+
+    def page(self, img_b64):
+        time.sleep(2)
+        return "עמוד שתורגם על ידי המודל עם מספיק אותיות כדי להיחשב טקסט שמיש " * 3
+
+    with patch("app.workers.worker._vlm_fallback_wanted", return_value=True), \
+         patch("app.converters.vlm.VLMConverter._build_lane", lambda self: None), \
+         patch("app.converters.vlm.VLMConverter._transcribe_page", page):
+        _warm_docling_loop(in_q, out_q, *args)

@@ -160,23 +160,11 @@ class DbankConverter(PDFConverter):
         """
         if self._docling is None:
             from docling.document_converter import DocumentConverter, PdfFormatOption
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
             from docling.datamodel.base_models import InputFormat
+            from .docling_options import pdf_pipeline_options
 
-            opts = PdfPipelineOptions()
-            opts.do_ocr = False
-            opts.do_table_structure = False
-            # On CPU-constrained deployments (e.g. 1-vCPU Docker), pin docling's
-            # inference threads so torch doesn't oversubscribe the single core.
-            # Set DOCLING_CPU_THREADS=1 there; unset = docling's default (auto).
-            threads = os.getenv("DOCLING_CPU_THREADS")
-            if threads:
-                from docling.datamodel.pipeline_options import (
-                    AcceleratorOptions, AcceleratorDevice,
-                )
-                opts.accelerator_options = AcceleratorOptions(
-                    num_threads=int(threads), device=AcceleratorDevice.CPU,
-                )
+            # Threads follow the container's CPU limit (DOCLING_CPU_THREADS overrides).
+            opts = pdf_pipeline_options(do_ocr=False, do_table_structure=False)
             self._docling = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
             )

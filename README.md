@@ -388,6 +388,20 @@ not count):
 | `MARKDOWN_CONVERSION_TIMEOUT_SECONDS` (callers) | `0` | `0` = wait while the job is reported queued or converting. |
 | `INGEST_CONVERT_TIMEOUT_SECONDS` (templates) | `0` | No outer clock unless the client cap above is set. |
 
+### Memory
+
+A 164-page report once OOM-killed the whole pod (5.3 GB, 1.4 CPU) and every job in it.
+Four settings keep a conversion inside the container's memory limit:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DOCLING_QUEUE_MAX_SIZE` | `10` | Pages each docling pipeline stage may hold. docling's own 100 let pages pile up in front of the slow table stage: 4.3 GB at peak on that report, against 3.3 GB at 10, for 12% more time. |
+| `DOCLING_CPU_THREADS` | the container's CPU limit ÷ embedded workers, at least 1 | Torch threads per docling model. docling's own 4 threads on 1.4 CPUs fight for the quota (+76% time). Unset with no CPU limit, or with `DOCLING_NUM_THREADS` / `OMP_NUM_THREADS` set, docling chooses. |
+| `MEMORY_GUARD_PERCENT` | `90` | A conversion that takes the container past this share of its memory limit is stopped and fails as "document too large", without retries, before the kernel kills the pod. With several embedded workers only the worker holding most of the memory is stopped. `0` = off; no limit (a laptop) = off. |
+| `WARM_MEMORY_BUDGET_MB` | 70% of the limit ÷ embedded workers | Between jobs, the warm docling and dbank children together stay under this. Before a job, the other idle warm child is stopped; `vlm`, `slides` and `pymupdf` stop both. |
+
+In the rag repo, `./loadtests/run.sh markdown` measures this per converter (docs/development/LOAD_TESTING.md).
+
 `GET /convert/{id}` reports `elapsed_seconds` and, for docling, `pages_done`.
 `POST /debug/convert` returns the id at once (`wait=false` is the default) — callers poll,
 because a single held request is cut by proxies (an OpenShift Route at 30 s, Node

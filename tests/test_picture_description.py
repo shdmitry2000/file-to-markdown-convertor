@@ -212,3 +212,28 @@ def test_a_hung_vlm_fallback_is_cut_by_the_stall_watch(tmp_path, monkeypatch):
     finally:
         w._kill()
     assert time.monotonic() - t0 < 60
+
+
+def test_a_long_vlm_fallback_that_keeps_moving_is_not_cut(tmp_path, monkeypatch):
+    """Each fallback page beats the stall watch: 6 pages at 2 s run past a 5 s stall
+    limit and still finish (review 2026-11-17: the fallback gave no beat, so any
+    broken-text-layer PDF over ~60 pages was cut as stalled at 600 s)."""
+    import fitz
+
+    from app.workers import worker as worker_mod
+    from tests import _warm_targets as targets
+
+    path = tmp_path / "scan.pdf"
+    doc = fitz.open()
+    for _ in range(6):
+        doc.new_page().insert_text((72, 72), "hello")
+    doc.save(str(path))
+
+    monkeypatch.setenv("DOCLING_STALL_SECONDS", "5")
+    monkeypatch.setattr(worker_mod, "_warm_docling_loop", targets.slow_page_vlm_fallback_loop)
+    w = worker_mod._WarmDoclingWorker()
+    try:
+        out = w.convert(str(path), "c1", False, False, 120)
+    finally:
+        w._kill()
+    assert out["converter_used"] == "docling+vlm"

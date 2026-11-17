@@ -32,15 +32,14 @@ class DoclingConverter(PDFConverter):
 
     def convert(self, pdf_path: Path) -> str:
         from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.datamodel.base_models import InputFormat
+        from .docling_options import pdf_pipeline_options
         
         self.validate_path(pdf_path)
         
         # Configure PDF pipeline with OCR explicitly disabled
         # We use VLM for image/picture conversion instead
-        pdf_options = PdfPipelineOptions()
-        pdf_options.do_ocr = False  # No OCR - text extraction only
+        pdf_options = pdf_pipeline_options(do_ocr=False, do_table_structure=True)  # No OCR - text extraction only
         
         converter = DocumentConverter(
             format_options={

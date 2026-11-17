@@ -279,13 +279,11 @@ def _convert_job(file_path: str, converter_type: str, do_ocr: bool, result_queue
         converter_used = converter_type or "docling"
         if converter_type == "docling" or not converter_type:
             from docling.document_converter import DocumentConverter, PdfFormatOption
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
             from docling.datamodel.base_models import InputFormat
+            from app.converters.docling_options import pdf_pipeline_options
             from app.converters.picture_description import office_format_options
 
-            pdf_options = PdfPipelineOptions()
-            pdf_options.do_ocr = do_ocr
-            pdf_options.do_table_structure = do_table_structure
+            pdf_options = pdf_pipeline_options(do_ocr=do_ocr, do_table_structure=do_table_structure)
             converter = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
@@ -431,12 +429,23 @@ def _warm_memory_budget_mb():
     """RSS the warm children may hold between jobs, or None for no budget.
 
     WARM_MEMORY_BUDGET_MB sets it (0 = off); by default it is 70% of the
-    container's memory limit, and off where there is no limit (a laptop)."""
+    container's memory limit (shared by the workers in the pod), and off where
+    there is no limit (a laptop)."""
     raw = os.getenv("WARM_MEMORY_BUDGET_MB", "").strip()
     if raw:
         return float(raw) or None
     limit = _cgroup_memory_limit_mb()
-    return limit * 0.7 if limit else None
+    # N embedded workers share one pod: each gets its share, not 70% of it all.
+    return limit * 0.7 / _workers_in_pod() if limit else None
+
+
+def _workers_in_pod() -> int:
+    """Worker processes sharing this container: MARKDOWN_EMBEDDED_WORKERS when the
+    workers run inside the API pod (each inherits it), else 1 (a worker pod)."""
+    try:
+        return max(1, int(os.getenv("MARKDOWN_EMBEDDED_WORKERS", "1") or 1))
+    except ValueError:
+        return 1
 
 
 def _rss_mb(proc) -> float:
@@ -476,6 +485,94 @@ def _enforce_warm_budget(current) -> None:
             total -= rss
     except Exception as e:  # noqa: BLE001 — a failed check must never fail the job
         logger.warning("Warm memory budget check failed: %s", e)
+
+
+def _cgroup_anon_mb():
+    """Anonymous memory of the whole container (cgroup v2 memory.stat), or None.
+
+    Not memory.current: that counts the page cache too, which the kernel takes back
+    before it OOM-kills; anon is what it cannot."""
+    try:
+        for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines():
+            if line.startswith("anon "):
+                return int(line.split()[1]) / 1048576
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _memory_guard_mb():
+    """Container memory a conversion may push the pod to before it is stopped, or None.
+
+    MEMORY_GUARD_PERCENT of the container limit (default 90; 0 = off). With no limit
+    (a laptop) there is no guard."""
+    try:
+        percent = float(os.getenv("MEMORY_GUARD_PERCENT", "90"))
+    except ValueError:
+        percent = 90.0
+    limit = _cgroup_memory_limit_mb()
+    return limit * percent / 100 if (limit and percent > 0) else None
+
+
+def _over_memory_guard(proc=None):
+    """``(anon_mb, guard_mb)`` when the pod is over the guard, else None. Never raises.
+
+    With several workers in the pod, only a job whose process holds at least its
+    share of the pod's memory is the one to stop (``proc``, the job's process): a
+    small job beside a big one is left to finish."""
+    try:
+        guard = _memory_guard_mb()
+        if not guard:
+            return None
+        anon = _cgroup_anon_mb()
+        if anon is None or anon <= guard:
+            return None
+        n = _workers_in_pod()
+        if n > 1 and proc is not None and _rss_mb(proc) * n < anon:
+            return None
+        return anon, guard
+    except Exception:  # noqa: BLE001 — a failed check must never fail the job
+        return None
+
+
+def _memory_cut_error(conversion_id, name: str, over) -> Exception:
+    """The job's error when the guard stopped it: the document, not the service, is the
+    problem, so it is not marked retryable — sending it again would do the same."""
+    anon, guard = over
+    logger.error("[%s] %s conversion stopped: the pod reached %.0f MB of memory (guard "
+                 "%.0f MB, MEMORY_GUARD_PERCENT of the limit); stopping the child before "
+                 "the kernel OOM-kills the pod", conversion_id, name, anon, guard)
+    return MemoryError(
+        f"Document too large for this converter's memory: the pod reached {anon:.0f} MB "
+        f"(limit guard {guard:.0f} MB) and the conversion was stopped before an OOM kill. "
+        "Raise the markdown-api memory limit or convert the document in parts.")
+
+
+def _stop_other_warm(current) -> None:
+    """Before a warm job, stop the other warm child if it is loaded (``current`` None:
+    both, before a heavy job in a fresh subprocess).
+
+    The budget check above runs only between jobs, but a job is when memory grows:
+    on gke-dev (5.3 GB) the two idle children held ~2.4 GB and a 164-page PDF needed
+    ~3 GB more in docling, so the pod was OOM-killed mid-job. With one child loaded
+    at a time there is room; the stopped one restarts on its next job (~20 s, only
+    when the converter changes). Off where the budget is off (no memory limit, or
+    WARM_MEMORY_BUDGET_MB=0). Never raises."""
+    if not _warm_memory_budget_mb():
+        return
+    try:
+        for other in (_WARM_DOCLING, _WARM_DBANK):
+            if other is current or other._proc is None:
+                continue
+            with other._lock:
+                if other._proc is None:
+                    continue
+                logger.info("Stopping the idle warm %s child (%.0f MB) before a %s job — "
+                            "it restarts on its next job", other.name, _rss_mb(other._proc),
+                            current.name if current else "subprocess")
+                other._kill()
+    except Exception as e:  # noqa: BLE001 — a failed stop must never fail the job
+        logger.warning("Stopping the other warm child failed: %s", e)
 
 
 def _release_freed_memory() -> None:
@@ -561,23 +658,41 @@ def _install_page_progress(stage_events, pages_done) -> None:
     picture_description.on_progress = _beat
 
 
+def _die_with_parent() -> None:
+    """Linux: have the kernel kill this warm child when its worker process dies.
+
+    A warm child blocks in ``in_q.get()`` and never notices its parent is gone. When
+    a worker is killed (an OOM kill of the worker, a SIGKILL) the embedded-workers
+    supervisor starts a new one with new children, and the old ones (~1 GB each)
+    stay behind until the pod runs out of memory. No-op off Linux. Never raises."""
+    try:
+        import ctypes
+        import signal
+
+        parent = os.getppid()
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+        if os.getppid() != parent:  # the parent died before the call took effect
+            os._exit(0)
+    except Exception:  # noqa: BLE001 — not Linux, or no libc: nothing to arm
+        pass
+
+
 def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
                        stage_events=None, pages_done=None) -> None:
     """Persistent docling worker target: build the converter ONCE, then serve
     file paths from `in_q`, putting result tuples on `out_q`. `None` = shutdown."""
     import traceback
+    _die_with_parent()
     if stage_events is not None and pages_done is not None:
         _install_page_progress(stage_events, pages_done)
     try:
         from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.datamodel.base_models import InputFormat
 
+        from app.converters.docling_options import pdf_pipeline_options
         from app.converters.picture_description import office_format_options
 
-        pdf_options = PdfPipelineOptions()
-        pdf_options.do_ocr = do_ocr
-        pdf_options.do_table_structure = do_table_structure
+        pdf_options = pdf_pipeline_options(do_ocr=do_ocr, do_table_structure=do_table_structure)
         converter = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
                             **office_format_options()}
@@ -608,7 +723,16 @@ def _warm_docling_loop(in_q, out_q, do_ocr: bool, do_table_structure: bool,
                 # Same broken-text-layer → VLM fallback as the cold path.
                 if _vlm_fallback_wanted(file_path, markdown):
                     from app.converters.vlm import VLMConverter
-                    vlm_markdown = VLMConverter().convert(Path(file_path))
+
+                    def page_done(done, total):
+                        # The stall watch reads stage_events; without a beat per
+                        # page a long fallback (~10 s a page) was cut as stalled
+                        # at 600 s after docling's work was already paid for.
+                        if stage_events is not None:
+                            with stage_events.get_lock():
+                                stage_events.value += 1
+
+                    vlm_markdown = VLMConverter(on_progress=page_done).convert(Path(file_path))
                     if _docling_output_unusable(vlm_markdown):
                         raise Exception(
                             "Unreadable document: both docling and VLM produced no usable "
@@ -645,7 +769,8 @@ def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = N
     a stage stuck in a blocking call is simply abandoned.
 
     Returns ``(item, reason)`` where reason is None (got a result), 'timeout',
-    'stalled', 'died', or 'cancelled'."""
+    'stalled', 'died', 'cancelled', or 'memory' (the pod passed the memory guard;
+    item is then the ``(anon_mb, guard_mb)`` reading)."""
     watch = _ProgressWatch(getattr(proc, "pid", None), timeout_seconds, progress=progress)
     started = time.monotonic()
     next_note = started + 120
@@ -660,6 +785,9 @@ def _await_warm_result(out_q, proc, timeout_seconds: int, conversion_id: str = N
             cut = watch.check()
             if cut:
                 return None, cut
+            over = _over_memory_guard(proc)
+            if over:
+                return over, "memory"
             now = time.monotonic()
             if now >= next_note:  # a long conversion says, once a minute, whether it moves
                 next_note = now + 60
@@ -782,6 +910,9 @@ class _WarmDoclingWorker:
                             conversion_id)
                 self._kill()
                 raise ConversionCancelled(f"conversion {conversion_id} was cancelled")
+            if reason == "memory":
+                self._kill()
+                raise _memory_cut_error(conversion_id, self.name, item)
             if reason == "stalled":
                 logger.warning("[%s] Conversion stalled: no CPU activity for %ss; "
                                "restarting worker", conversion_id,
@@ -837,6 +968,7 @@ def _warm_dbank_loop(in_q, out_q) -> None:
     """Persistent dbank worker target: build ONE DbankConverter, then serve file
     paths from `in_q`, putting result tuples on `out_q`. `None` = shutdown."""
     import traceback
+    _die_with_parent()
     try:
         from app.converters.dbank import DbankConverter
         converter = DbankConverter()  # docling + VLM built lazily on first job, then reused
@@ -930,6 +1062,9 @@ class _WarmDbankWorker:
                             conversion_id)
                 self._kill()
                 raise ConversionCancelled(f"conversion {conversion_id} was cancelled")
+            if reason == "memory":
+                self._kill()
+                raise _memory_cut_error(conversion_id, self.name, item)
             if reason == "stalled":
                 logger.warning("[%s] Conversion stalled: no CPU activity for %ss; "
                                "restarting worker", conversion_id,
@@ -1052,6 +1187,7 @@ def _run_converter_with_timeout(
     # the models per job (turns a ~14s/job cold start into ~1s). Skipped when a
     # test injects `_target`, or when explicitly disabled via DOCLING_WARM_WORKER.
     if _target is None and _warm_enabled() and (converter_type == "docling" or not converter_type):
+        _stop_other_warm(_WARM_DOCLING)
         try:
             return _WARM_DOCLING.convert(
                 file_path, conversion_id, do_ocr, do_table_structure, timeout_seconds,
@@ -1062,10 +1198,19 @@ def _run_converter_with_timeout(
     # dbank keeps its own long-lived worker so its docling (~8s) + VLM client are
     # built once and reused across documents, not per job.
     if _target is None and _warm_enabled() and converter_type == "dbank":
+        _stop_other_warm(_WARM_DBANK)
         try:
             return _WARM_DBANK.convert(file_path, conversion_id, timeout_seconds, llm_connector)
         finally:
             _enforce_warm_budget(_WARM_DBANK)
+
+    # vlm and slides render every page at 300 DPI in a fresh subprocess, and pymupdf
+    # reached 1.9 GB on a 164-page PDF; the warm children (docling is pre-warmed,
+    # ~1 GB) would sit idle beside them. The light converters (excel, markitdown)
+    # leave them: unloading docling for a spreadsheet would cost the next PDF a cold
+    # start for nothing.
+    if _target is None and converter_type in ("vlm", "slides", "pymupdf"):
+        _stop_other_warm(None)
 
     target = _target or _convert_in_subprocess
     result_queue = multiprocessing.Queue()
@@ -1106,6 +1251,14 @@ def _run_converter_with_timeout(
             cut = watch.check()
             if cut:
                 break
+            over = _over_memory_guard(process)
+            if over:
+                process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+                raise _memory_cut_error(conversion_id, converter_type or "docling", over)
 
     if item is None:
         if process.is_alive():
@@ -1650,75 +1803,93 @@ def _serve(context, task_receiver_socket, result_sender_socket, result_address,
         finished = task.get("chunk_id") or task.get("conversion_id")
         heartbeat[0] = _Heartbeat(context, result_address, worker_id, finished)
         heartbeat[0].start()
-        task_type = task.get("type", "convert")  # Default: convert
+        try:
+            task_type = task.get("type", "convert")  # Default: convert
         
-        if task_type == "convert":
-            # Existing conversion flow
-            conversion_id = task["conversion_id"]
-            file_path = task.get("file_path")
-            file_key = task.get("file_key")
-            converter_type = task.get("converter_type", "docling")
-            # The caller's LLM connector for VLM calls (see vlm_lane). Holds a token:
-            # passed down, never logged. Only when sent, so a job without one is
-            # called exactly as before.
-            lane = {"llm_connector": task["llm_connector"]} if task.get("llm_connector") else {}
-            # Skip work nobody is waiting for. A cancelled batch of 300 files has
-            # almost all of them still queued, and converting them costs the same
-            # as converting wanted ones — this is where the reclaimed compute is.
-            # Checked HERE, before the converter is touched, so it costs one stat.
-            if is_cancelled(conversion_id):
-                logger.info("[%s] Cancelled before it started; skipping %s",
-                            conversion_id, file_key or file_path)
-                result_sender_socket.send_json(
-                    {"conversion_id": conversion_id, "status": "cancelled"}
-                )
-                continue
-            if file_key:
-                # The converters need a real file on disk — docling and PyMuPDF both
-                # take a path — so an object is staged locally for the duration of
-                # the conversion and removed after. On the pvc backend materialize
-                # yields the mounted file itself, so this costs nothing there.
-                from app import storage
-
-                store = storage.file_store()
-                if store is None:
-                    _fail_conversion(
-                        conversion_id, result_sender_socket,
-                        "storage keys unavailable in this build",
+            if task_type == "convert":
+                # Existing conversion flow
+                conversion_id = task["conversion_id"]
+                file_path = task.get("file_path")
+                file_key = task.get("file_key")
+                converter_type = task.get("converter_type", "docling")
+                # The caller's LLM connector for VLM calls (see vlm_lane). Holds a token:
+                # passed down, never logged. Only when sent, so a job without one is
+                # called exactly as before.
+                lane = {"llm_connector": task["llm_connector"]} if task.get("llm_connector") else {}
+                # Skip work nobody is waiting for. A cancelled batch of 300 files has
+                # almost all of them still queued, and converting them costs the same
+                # as converting wanted ones — this is where the reclaimed compute is.
+                # Checked HERE, before the converter is touched, so it costs one stat.
+                if is_cancelled(conversion_id):
+                    logger.info("[%s] Cancelled before it started; skipping %s",
+                                conversion_id, file_key or file_path)
+                    result_sender_socket.send_json(
+                        {"conversion_id": conversion_id, "status": "cancelled"}
                     )
                     continue
-                try:
-                    with store.materialize(file_key) as local:
-                        convert_file_to_markdown(
-                            str(local), conversion_id, result_sender_socket,
-                            converter_type, source_name=os.path.basename(file_key), **lane,
+                if file_key:
+                    # The converters need a real file on disk — docling and PyMuPDF both
+                    # take a path — so an object is staged locally for the duration of
+                    # the conversion and removed after. On the pvc backend materialize
+                    # yields the mounted file itself, so this costs nothing there.
+                    from app import storage
+
+                    store = storage.file_store()
+                    if store is None:
+                        _fail_conversion(
+                            conversion_id, result_sender_socket,
+                            "storage keys unavailable in this build",
                         )
-                except FileNotFoundError:
-                    _fail_conversion(
-                        conversion_id, result_sender_socket,
-                        f"no object at key {file_key}",
+                        continue
+                    try:
+                        with store.materialize(file_key) as local:
+                            convert_file_to_markdown(
+                                str(local), conversion_id, result_sender_socket,
+                                converter_type, source_name=os.path.basename(file_key), **lane,
+                            )
+                    except FileNotFoundError:
+                        _fail_conversion(
+                            conversion_id, result_sender_socket,
+                            f"no object at key {file_key}",
+                        )
+                else:
+                    convert_file_to_markdown(
+                        file_path, conversion_id, result_sender_socket, converter_type, **lane,
                     )
+            elif task_type == "chunk":
+                # Chunking via HTTP /chunk-async flow. Synchronous REQ/REP ingest
+                # uses chunk_server.py (port 5557) instead.
+                chunk_id = task["chunk_id"]
+                file_path = task["file_path"]
+                chunker_type = task.get("chunker", "docling_hybrid")
+                params = task.get("params", {})
+                chunk_file(file_path, chunk_id, result_sender_socket, chunker_type, params)
             else:
-                convert_file_to_markdown(
-                    file_path, conversion_id, result_sender_socket, converter_type, **lane,
-                )
-        elif task_type == "chunk":
-            # Chunking via HTTP /chunk-async flow. Synchronous REQ/REP ingest
-            # uses chunk_server.py (port 5557) instead.
-            chunk_id = task["chunk_id"]
-            file_path = task["file_path"]
-            chunker_type = task.get("chunker", "docling_hybrid")
-            params = task.get("params", {})
-            chunk_file(file_path, chunk_id, result_sender_socket, chunker_type, params)
-        else:
-            logger.error(f"Unknown task type: {task_type}")
-            # Send error response (need an ID field)
-            task_id = task.get("chunk_id") or task.get("conversion_id") or "unknown"
-            result_sender_socket.send_json({
-                "task_id": task_id,
-                "status": "failed",
-                "error": f"Unknown task type: {task_type}"
-            })
+                logger.error(f"Unknown task type: {task_type}")
+                # Send error response (need an ID field)
+                task_id = task.get("chunk_id") or task.get("conversion_id") or "unknown"
+                result_sender_socket.send_json({
+                    "task_id": task_id,
+                    "status": "failed",
+                    "error": f"Unknown task type: {task_type}"
+                })
+        except Exception as e:  # noqa: BLE001 — one bad task must not end the worker
+            # Anything not handled above (a storage error while staging the file, a
+            # malformed task, a send that failed): fail this task and keep serving.
+            # Leaving the loop ended the worker, the job sat "processing" until the
+            # dispatcher's requeue, and the same error repeated on the next worker.
+            logger.exception("[%s] task failed outside the converter", finished)
+            try:
+                if task.get("type", "convert") == "convert" and task.get("conversion_id"):
+                    _fail_conversion(task["conversion_id"], result_sender_socket,
+                                     f"worker error: {e}")
+                else:
+                    result_sender_socket.send_json({"task_id": finished or "unknown",
+                                                    "chunk_id": task.get("chunk_id"),
+                                                    "status": "failed",
+                                                    "error": f"worker error: {e}"})
+            except Exception:  # noqa: BLE001 — the socket itself is gone; the
+                logger.exception("could not report the failed task")  # watchdog requeues
 
 if __name__ == "__main__":
     # Required for multiprocessing on some platforms

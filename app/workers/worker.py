@@ -19,6 +19,8 @@ import hashlib
 # Import configuration
 from app.cancellation import ConversionCancelled, is_cancelled
 from app.config import configure_litellm_logging, get_converted_files_dir, get_settings
+# Worker processes sharing this container (MARKDOWN_EMBEDDED_WORKERS, else 1).
+from app.converters.docling_options import _workers_in_container as _workers_in_pod
 from app.zmq_keepalive import apply_keepalive
 
 # Import chunkers to trigger @register_chunker decorators
@@ -439,14 +441,6 @@ def _warm_memory_budget_mb():
     return limit * 0.7 / _workers_in_pod() if limit else None
 
 
-def _workers_in_pod() -> int:
-    """Worker processes sharing this container: MARKDOWN_EMBEDDED_WORKERS when the
-    workers run inside the API pod (each inherits it), else 1 (a worker pod)."""
-    try:
-        return max(1, int(os.getenv("MARKDOWN_EMBEDDED_WORKERS", "1") or 1))
-    except ValueError:
-        return 1
-
 
 def _rss_mb(proc) -> float:
     try:
@@ -487,17 +481,23 @@ def _enforce_warm_budget(current) -> None:
         logger.warning("Warm memory budget check failed: %s", e)
 
 
+# (memory.stat, the line with the container's anonymous memory): cgroup v2, then v1.
+_MEMORY_STAT = (("/sys/fs/cgroup/memory.stat", "anon"),
+                ("/sys/fs/cgroup/memory/memory.stat", "total_rss"))
+
+
 def _cgroup_anon_mb():
-    """Anonymous memory of the whole container (cgroup v2 memory.stat), or None.
+    """Anonymous memory of the whole container (cgroup v2, then v1), or None.
 
     Not memory.current: that counts the page cache too, which the kernel takes back
     before it OOM-kills; anon is what it cannot."""
-    try:
-        for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines():
-            if line.startswith("anon "):
-                return int(line.split()[1]) / 1048576
-    except (OSError, ValueError):
-        pass
+    for path, key in _MEMORY_STAT:
+        try:
+            for line in Path(path).read_text().splitlines():
+                if line.startswith(key + " "):
+                    return int(line.split()[1]) / 1048576
+        except (OSError, ValueError):
+            continue
     return None
 
 
@@ -517,9 +517,9 @@ def _memory_guard_mb():
 def _over_memory_guard(proc=None):
     """``(anon_mb, guard_mb)`` when the pod is over the guard, else None. Never raises.
 
-    With several workers in the pod, only a job whose process holds at least its
-    share of the pod's memory is the one to stop (``proc``, the job's process): a
-    small job beside a big one is left to finish."""
+    With several workers in the pod, only the job whose process (``proc``) is the
+    largest in the container is stopped: a small job beside a big one is left to
+    finish, and of two jobs growing together the larger one goes."""
     try:
         guard = _memory_guard_mb()
         if not guard:
@@ -527,12 +527,23 @@ def _over_memory_guard(proc=None):
         anon = _cgroup_anon_mb()
         if anon is None or anon <= guard:
             return None
-        n = _workers_in_pod()
-        if n > 1 and proc is not None and _rss_mb(proc) * n < anon:
+        if _workers_in_pod() > 1 and proc is not None and not _largest_process(proc):
             return None
         return anon, guard
     except Exception:  # noqa: BLE001 — a failed check must never fail the job
         return None
+
+
+def _largest_process(proc) -> bool:
+    """Whether ``proc`` holds the most memory of any process in the container."""
+    import psutil
+
+    mine = _rss_mb(proc)
+    for other in psutil.process_iter(["memory_info"]):
+        info = other.info.get("memory_info")
+        if other.pid != proc.pid and info is not None and info.rss / 1048576 > mine:
+            return False
+    return True
 
 
 def _memory_cut_error(conversion_id, name: str, over) -> Exception:
@@ -669,7 +680,10 @@ def _die_with_parent() -> None:
         import ctypes
         import signal
 
-        parent = os.getppid()
+        # The worker's pid as spawn recorded it: os.getppid() here would already be
+        # the reaper's when the worker died before this child got this far.
+        spawned_by = multiprocessing.parent_process()
+        parent = spawned_by.pid if spawned_by is not None else os.getppid()
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
         if os.getppid() != parent:  # the parent died before the call took effect
             os._exit(0)
@@ -1884,10 +1898,13 @@ def _serve(context, task_receiver_socket, result_sender_socket, result_address,
                     _fail_conversion(task["conversion_id"], result_sender_socket,
                                      f"worker error: {e}")
                 else:
+                    # type=chunk: the API applies a chunk result only with it
+                    # (_apply_result); without it the caller waited for the watchdog.
                     result_sender_socket.send_json({"task_id": finished or "unknown",
                                                     "chunk_id": task.get("chunk_id"),
                                                     "status": "failed",
-                                                    "error": f"worker error: {e}"})
+                                                    "error": f"worker error: {e}",
+                                                    "type": "chunk"})
             except Exception:  # noqa: BLE001 — the socket itself is gone; the
                 logger.exception("could not report the failed task")  # watchdog requeues
 

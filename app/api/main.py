@@ -204,7 +204,7 @@ conversion_status_db: Dict[str, str] = {}
 conversion_details_db: Dict[str, Dict] = {}  # Stores detailed info about conversions
 pending_conversions_db: Dict[str, Dict] = {}  # Pending conversions with metadata
 active_conversions_db: Dict[str, Dict] = {}  # Active conversions with metadata
-# (file_path, converter_type) -> conversion_id, for conversions not yet finished.
+# (file_path, converter_type, lane hash) -> conversion_id, for conversions not yet finished.
 # Ingesting one file to N RAG systems fans out N concurrent /convert calls for the
 # SAME file; without this every one of them queues its own full conversion behind
 # the others. Callers share a conversion_id instead and all poll the same job.
@@ -467,6 +467,14 @@ def _job_lane(llm: Optional[dict], llm_connector: Optional[dict] = None) -> Opti
     return llm_connector or None
 
 
+def _lane_fingerprint(lane: Optional[dict]) -> str:
+    """A short hash of the job's LLM lane ("" = the converter LLM), for the dedup key."""
+    if not lane:
+        return ""
+    import hashlib
+    return hashlib.sha256(json.dumps(lane, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
 @app.post("/convert")
 async def convert_file(request: ConversionRequest):
     logger.info(
@@ -523,13 +531,21 @@ async def convert_file(request: ConversionRequest):
     # Share an already-queued conversion of the same file rather than duplicating
     # it — see inflight_conversions. Both callers poll the same id and get the
     # same result, which the polling client already handles unchanged.
-    inflight_key = (identity, request.converter_type)
+    # The lane is part of the key: a job runs with ONE caller's LLM connector (and its
+    # token), so two spaces with their own connectors must not share it. Hashed: the
+    # key never holds the token itself.
+    inflight_key = (identity, request.converter_type, _lane_fingerprint(lane))
     existing_id = inflight_conversions.get(inflight_key)
     if existing_id and conversion_status_db.get(existing_id) in ("pending", "processing"):
         logger.info(f"Reusing in-flight conversion {existing_id} for {identity}")
         conversion_waiters[existing_id] = conversion_waiters.get(existing_id, 1) + 1
         last_polled_at[existing_id] = time.time()
         return {"conversion_id": existing_id}
+
+    # Before the job is registered: an error here must not leave a "pending" job
+    # behind that the next caller for this file reuses and polls forever.
+    _prune_converted_outputs()
+    _prune_finished_records()
 
     conversion_id = str(uuid.uuid4())
     logger.info(f"Generated conversion ID {conversion_id} for file {identity}")
@@ -543,8 +559,6 @@ async def convert_file(request: ConversionRequest):
         "converter": request.converter_type or "auto",
     }
     latest_conversion_by_name[display_name] = conversion_id
-    _prune_converted_outputs()
-    _prune_finished_records()
 
     task = {
         "conversion_id": conversion_id,
@@ -557,7 +571,7 @@ async def convert_file(request: ConversionRequest):
     logger.info(f"Sending task {conversion_id} to the ZeroMQ queue with converter {request.converter_type}.")
     try:
         enqueue_task(task)
-    except WorkerUnavailable:
+    except Exception as exc:
         # Undo the bookkeeping, or the next request for this file would
         # "reuse" a conversion that was never queued and poll it forever.
         conversion_status_db.pop(conversion_id, None)
@@ -565,8 +579,10 @@ async def convert_file(request: ConversionRequest):
             del inflight_conversions[inflight_key]
         conversion_waiters.pop(conversion_id, None)
         pending_conversions_db.pop(conversion_id, None)
-        logger.error(f"No worker took conversion {conversion_id}; refusing with 503")
-        raise _no_worker_error()
+        if isinstance(exc, WorkerUnavailable):
+            logger.error(f"No worker took conversion {conversion_id}; refusing with 503")
+            raise _no_worker_error()
+        raise
 
     return {"conversion_id": conversion_id}
 
@@ -859,9 +875,11 @@ async def debug_convert_file(
     # get_converted_files_dir() creates the directory: on a fresh PVC (OCP) nothing
     # else has yet, and only the worker used to, so this upload raised FileNotFoundError.
     temp_path = get_converted_files_dir() / f"debug_{file.filename}"
+    # In 1 MB pieces: a whole-file read() held the upload in the API process, which
+    # shares the pod's memory limit with the converters.
     with open(temp_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        while chunk := await file.read(1024 * 1024):
+            f.write(chunk)
     
     file_size = temp_path.stat().st_size
     conversion_id = str(uuid.uuid4())

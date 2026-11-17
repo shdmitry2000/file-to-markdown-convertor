@@ -8,6 +8,7 @@ waited for the restart. The budget check runs after every warm job: the idle oth
 child goes first, then the one that just ran.
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ class _Child:
     def __init__(self, name, rss):
         self.name, self.rss, self.killed = name, rss, False
         self._proc = SimpleNamespace(pid=hash(name) & 0xFFFF)
+        self._lock = threading.Lock()
 
     def _kill(self):
         self.killed, self._proc = True, None
@@ -137,3 +139,53 @@ def test_the_warm_route_checks_the_budget_after_every_job(monkeypatch, tmp_path,
     else:
         assert w._run_converter_with_timeout(str(pdf), "c1", lane, 10) == {"markdown": "# ok"}
     assert seen == [child]
+
+
+# Before a job: one warm child loaded at a time. The budget above runs only between
+# jobs; on gke-dev two idle children (~2.4 GB) plus a 164-page PDF in docling (~3 GB)
+# went past the 5.3 GB limit mid-job.
+
+@pytest.mark.parametrize("which", ["docling", "dbank"])
+def test_the_other_child_is_stopped_before_a_job(children, monkeypatch, which):
+    docling, dbank = children
+    monkeypatch.setenv("WARM_MEMORY_BUDGET_MB", "3000")
+    current, other = (docling, dbank) if which == "docling" else (dbank, docling)
+    w._stop_other_warm(current)
+    assert other.killed and not current.killed
+
+
+def test_nothing_is_stopped_when_the_budget_is_off(children, monkeypatch):
+    docling, dbank = children
+    monkeypatch.setenv("WARM_MEMORY_BUDGET_MB", "0")
+    w._stop_other_warm(docling)
+    assert not dbank.killed
+
+
+def test_a_child_not_loaded_is_left_alone(children, monkeypatch):
+    docling, dbank = children
+    monkeypatch.setenv("WARM_MEMORY_BUDGET_MB", "3000")
+    dbank._proc = None
+    w._stop_other_warm(docling)          # must not raise or touch it
+    assert not dbank.killed and not docling.killed
+
+
+def test_a_failing_stop_never_fails_the_job(children, monkeypatch):
+    docling, dbank = children
+    monkeypatch.setenv("WARM_MEMORY_BUDGET_MB", "3000")
+    monkeypatch.setattr(dbank, "_kill", lambda: 1 / 0)
+    w._stop_other_warm(docling)          # must not raise
+
+
+@pytest.mark.parametrize("lane, attr", [("docling", "_WARM_DOCLING"), ("dbank", "_WARM_DBANK")])
+def test_the_warm_route_stops_the_other_child_before_the_job(monkeypatch, tmp_path, lane, attr):
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-1.4 minimal")
+    order = []
+    monkeypatch.setattr(w, "_stop_other_warm", lambda c: order.append(("stop", c)))
+    monkeypatch.setattr(w, "_enforce_warm_budget", lambda c: order.append(("budget", c)))
+    monkeypatch.setattr(w, "_warm_enabled", lambda: True)
+    monkeypatch.setattr(w, "_slide_deck_reason", lambda path: None)
+    child = getattr(w, attr)
+    monkeypatch.setattr(child, "convert", lambda *a, **k: order.append(("convert", child)) or {"markdown": "# ok"})
+    w._run_converter_with_timeout(str(pdf), "c1", lane, 10)
+    assert order == [("stop", child), ("convert", child), ("budget", child)]

@@ -100,8 +100,12 @@ _NO_DATABASE = frozenset({"markdown-api"})
 _BASE = (
     EnvSpec("INTERNAL_SERVICE_TOKEN", secret=True,
             note="unset disables service-to-service verification"),
+    EnvSpec("TRACING_BACKEND",
+            note="none | otel | dynatrace; unset = otel if OTEL_EXPORTER_OTLP_ENDPOINT set"),
     EnvSpec("OTEL_EXPORTER_OTLP_ENDPOINT",
-            note="unset = tracing off; see /health/telemetry for effective state"),
+            note="otel backend; see /health/telemetry for effective state"),
+    EnvSpec("DYNATRACE_OTLP_ENDPOINT", note="dynatrace backend: collector or OTLP API"),
+    EnvSpec("DYNATRACE_API_TOKEN", secret=True, note="dynatrace backend; optional"),
     EnvSpec("LLM_CONNECTOR_TYPE", note="answer model's connection type"),
     EnvSpec("LLM_TYPE", note="answer model name"),
     EnvSpec("EMBEDDING_TYPE", note="embedding model name, on LLM_CONNECTOR_TYPE"),

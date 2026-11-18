@@ -309,6 +309,28 @@ def _sync_within_deadline(fn, args, kwargs, seconds: float, what: str):
 
 # ── The one retry policy ───────────────────────────────────────────────────────
 
+def _log_give_up(what: str, exc: BaseException, attempts: int, waited: float) -> None:
+    """One `llm.*` event (shared/log_events.py) for a call that failed for good with a
+    cause an operator must act on: provider busy, daily cap, no answer in time, or the
+    lane's credentials refused. Other failures (a bad request) stay with the caller."""
+    try:
+        from shared.log_events import log_event
+    except ImportError:  # a module shipped without shared.log_events
+        return
+    status = _status(exc)
+    line = dict(outcome="failed", actor="system", target_type="llm", target_id=what,
+                status=status, attempts=attempts + 1, waited_seconds=round(waited),
+                error=f"{type(exc).__name__}: {str(exc)[:300]}")
+    if is_daily_cap(exc):
+        log_event("llm.daily_limit_reached", **line)
+    elif is_rate_limited(exc):
+        log_event("llm.rate_limited", **line)
+    elif isinstance(exc, LLMCallTimeout):
+        log_event("llm.timed_out", **line)
+    elif status in (401, 403):
+        log_event("llm.auth_failed", **line)
+
+
 class _Attempts:
     """Waits between attempts of one call, until the total budget is spent."""
 
@@ -336,6 +358,7 @@ class _Attempts:
         return wait
 
     def give_up(self, exc: BaseException) -> BaseException:
+        _log_give_up(self.what, exc, self.n, self.waited)
         if is_daily_cap(exc):
             detail = str(exc)[:300]
             logger.error("[llm] %s: the lane's daily token limit is reached (%s)", self.what, detail)

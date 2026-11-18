@@ -139,6 +139,23 @@ CATALOGUE: dict[str, tuple[str, int]] = {
     "file.downloaded": ("read", I),
     "file.inspected": ("read", I),
     "questions.listed": ("read", I),
+    # I. service health (operations): failures an operator must act on
+    "database.unavailable": ("ops", E),
+    "database.recovered": ("ops", W),
+    "llm.rate_limited": ("ops", E),
+    "llm.daily_limit_reached": ("ops", E),
+    "llm.timed_out": ("ops", E),
+    "llm.auth_failed": ("ops", E),
+    "quota.requests_daily_warning": ("ops", W),
+    "quota.requests_daily_exceeded": ("ops", W),
+    "quota.space_files_warning": ("ops", W),
+    "quota.space_files_exceeded": ("ops", W),
+    "quota.space_db_warning": ("ops", W),
+    "quota.space_db_exceeded": ("ops", W),
+    "storage.volume_warning": ("ops", W),
+    "storage.volume_full": ("ops", E),
+    "storage.leftover_dropped": ("ops", W),
+    "storage.leftover_folder_removed": ("ops", W),
 }
 
 _SECRET_LAST = {"token", "secret", "password", "passwd", "pwd", "credential", "credentials",

@@ -114,3 +114,17 @@ def sample_text_file(files_to_convert_dir):
     txt_path = files_to_convert_dir / "test_document.txt"
     txt_path.write_text("# Test Document\n\nThis is a test file.")
     return txt_path
+
+
+@pytest.fixture(autouse=True)
+def _space_folder_guard_off(request, monkeypatch):
+    """Off unless the test is marked `space_folder_guard`.
+
+    In the app only space create makes `<base>/<space>/` and every other writer stays
+    inside it (shared/space_folder.py). These tests store files into a temp base
+    without that create step.
+    """
+    if request.node.get_closest_marker("space_folder_guard") is None:
+        import shared.space_folder as space_folder
+
+        monkeypatch.setattr(space_folder, "_guarded", lambda: False)

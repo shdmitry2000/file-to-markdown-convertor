@@ -77,7 +77,7 @@ constraint-dependencies = [
     # >>> runtime pins: config/runtime-pins.txt (scripts/sync_runtime_pins.py writes this block)
     "openai==2.54.0",
     "litellm==1.106.10",
-    "fastapi==0.143.5",
+    "fastapi==0.163.2",
     "starlette==1.8.0",
     "pydantic==2.14.3",
     "uvicorn==0.54.0",

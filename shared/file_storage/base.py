@@ -113,7 +113,13 @@ class LocalFileStore(FileStore):
 
     def write_bytes(self, key: str, data: bytes) -> None:
         path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        first = keys.normalize(key).split("/", 1)[0]
+        if first.startswith("."):  # service files in the root (.preflight/…), not a space
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:  # `<space>/…`: only inside an existing space folder
+            from shared.space_folder import ensure_space_dir
+
+            ensure_space_dir(path.parent, first)
         # Same-directory temp + atomic replace: a reader polling for the converted
         # markdown must never observe a half-written file.
         tmp = path.with_name(f".{path.name}.partial")

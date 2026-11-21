@@ -30,6 +30,7 @@ from ...core import config, gemini_response
 from ...core.json_loads import loads_tolerant
 from ...core.protocol import GenerationParams, LLMClient, LLMResult
 from ...core import generation as _generation
+from ...core.deadline import time_left
 from ...core.resilience import resilient, resilient_stream, resilient_sync, within_deadline
 from ._embedding_batch import embed_in_batches
 
@@ -497,9 +498,11 @@ class VertexProxyClient:
             client = self._get_http_client()
             response = await within_deadline(
                 client.post(url, json=payload, headers=headers),
-                _generation.request_timeout(), "VertexProxyClient.embedding")
-            if response.status_code in (429, 504) and attempt < max_retries:
-                wait = retry_delay * (2 ** attempt)
+                _generation.request_timeout_for(None), "VertexProxyClient.embedding")
+            wait = retry_delay * (2 ** attempt)
+            left = time_left()  # a user request's time left; None in background work
+            if (response.status_code in (429, 504) and attempt < max_retries
+                    and (left is None or wait < left)):
                 logger.warning(
                     "vertex_proxy embed: HTTP %d, retry %d/%d in %.1fs",
                     response.status_code,

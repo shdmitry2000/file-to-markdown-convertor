@@ -14,7 +14,7 @@ import re
 from ...core import config
 from ...core import generation as _generation
 from ...core.protocol import GenerationParams, LLMClient, LLMResult
-from ...core.resilience import resilient
+from ...core.resilience import resilient, within_deadline
 from ._embedding_batch import embed_in_batches
 
 
@@ -87,10 +87,10 @@ class GeminiClient:
         inputs = [text] if isinstance(text, str) else list(text)
 
         async def _one(batch: list[str]) -> list[list[float]]:
-            response = await (await self._sdk()).aio.models.embed_content(
+            response = await within_deadline((await self._sdk()).aio.models.embed_content(
                 model="gemini-embedding-001",
                 contents=batch,
-            )
+            ), _generation.request_timeout_for(None), "GeminiClient.embedding")
             return [e.values for e in response.embeddings]
 
         return await embed_in_batches(inputs, _one)

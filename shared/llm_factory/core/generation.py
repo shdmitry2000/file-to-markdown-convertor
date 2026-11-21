@@ -13,6 +13,10 @@ Settings (the same names in every module; a module changes a value, never a name
   300 s deadlines still bound a call; one that also waited out 429s is then reported
   as timed out. markdown-api sets 120: a page call may be retried on a timeout, and
   3 x 120 + 3 + 180 s stays under the converter's 600 s stall cut.
+- ``LLM_QUERY_TIMEOUT_SECONDS`` (default 120): one LLM call made while a user waits
+  (a template's /search or /answer), in all — attempts and busy waits together, and
+  never past the time the request has left (core/deadline.py). Background work
+  (ingest, compile, judge) keeps LLM_REQUEST_TIMEOUT_SECONDS and the busy wait.
 
 Constants, not settings: thinking is OFF unless a call, or a client
 (``enable_thinking``, set from a space's setting), asks for it — both lanes, every
@@ -35,10 +39,13 @@ logger = logging.getLogger(__name__)
 ENV_LLM_TEMPERATURE = "LLM_TEMPERATURE"
 ENV_LLM_MAX_TOKENS = "LLM_MAX_TOKENS"
 ENV_LLM_REQUEST_TIMEOUT_SECONDS = "LLM_REQUEST_TIMEOUT_SECONDS"
+ENV_LLM_QUERY_TIMEOUT_SECONDS = "LLM_QUERY_TIMEOUT_SECONDS"
 
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
+# One LLM call made while a user waits, busy-provider waits included (core/deadline.py).
+DEFAULT_QUERY_TIMEOUT_SECONDS = 120.0
 
 #: Gemini 3+ degrades below this. Google/LiteLLM warn that a lower temperature
 #: "can cause infinite loops, degraded reasoning performance, and failure on
@@ -73,9 +80,17 @@ def request_timeout() -> float:
     return _env_number(ENV_LLM_REQUEST_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT_SECONDS)
 
 
+def query_timeout() -> float:
+    """One LLM call on a user request, in all (attempts and busy waits together)."""
+    return _env_number(ENV_LLM_QUERY_TIMEOUT_SECONDS, DEFAULT_QUERY_TIMEOUT_SECONDS)
+
+
 def request_timeout_for(params: Any = None) -> float:
-    """The call's own request timeout (GenerationParams.timeout), else the lane's."""
-    return getattr(params, "timeout", None) or request_timeout()
+    """One request's timeout: the call's own (GenerationParams.timeout), else the
+    lane's; inside a user request, cut to the time it has left (core/deadline.py)."""
+    from .deadline import cap  # noqa: PLC0415 — deadline imports this module
+
+    return cap(getattr(params, "timeout", None) or request_timeout())
 
 
 def gemini_major_version(model: str) -> Optional[int]:

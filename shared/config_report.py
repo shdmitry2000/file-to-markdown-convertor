@@ -112,6 +112,11 @@ _BASE = (
     EnvSpec("LLM_TEMPERATURE", note="default 1.0; always sent"),
     EnvSpec("LLM_MAX_TOKENS", note="default 8192"),
     EnvSpec("LLM_REQUEST_TIMEOUT_SECONDS", note="default 300"),
+    EnvSpec("LLM_QUERY_TIMEOUT_SECONDS", note="default 120; one LLM call on a user request"),
+    EnvSpec("HOP_DELTA_SECONDS", note="default 10; a caller's margin over its callee"),
+    EnvSpec("HTTP_TIMEOUT_SECONDS", note="default 30; one plain call between services"),
+    EnvSpec("STREAM_KEEPALIVE_SECONDS", note="default 15; keepalive frame on a quiet answer stream"),
+    EnvSpec("DB_TIMEOUT_SECONDS", note="default 15; pool wait, and a statement inside a user request"),
     EnvSpec("LLM_MAX_CONCURRENCY", note="default 8; calls in flight per process"),
     EnvSpec("PROJECTS_BASE_PATH"),
 )

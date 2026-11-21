@@ -20,12 +20,13 @@ from typing import Iterable
 
 from shared.config_report import config_report
 from shared.utils.tls import httpx_verify
+from shared import timeouts
 
 logger = logging.getLogger(__name__)
 
 # Long enough for a loaded pod to answer, short enough that one dead module does
 # not stall the whole panel. The fan-out is concurrent, so this bounds the page.
-FANOUT_TIMEOUT_S = float(os.getenv("CONFIG_REPORT_FANOUT_TIMEOUT_SECONDS", "3.0"))
+FANOUT_TIMEOUT_S = timeouts.probe()
 
 
 def register_config_report(app, module: str, *, logging_route: bool = True) -> None:

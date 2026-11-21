@@ -29,6 +29,8 @@ import hashlib
 from array import array
 from collections import OrderedDict
 
+from .deadline import LLMBudgetSpent
+
 MAX_ENTRIES = 1000
 PER_SPACE_ENTRIES = 200
 NO_SPACE = "-"
@@ -118,8 +120,10 @@ async def _one(spec: str, text: str, embed) -> list[float]:
             if not pending.cancelled():
                 raise
             # The leader's caller went away, not ours: embed it ourselves.
-        except Exception:
-            pass  # the leader's call failed; ours gets its own attempt (and its own error)
+        except (Exception, LLMBudgetSpent):
+            # The leader's call failed, or its request ran out of time (ours may not
+            # have): ours gets its own attempt, and its own error.
+            pass
     fut = asyncio.get_running_loop().create_future()
     _inflight[slot] = fut
     _count(space, "misses")

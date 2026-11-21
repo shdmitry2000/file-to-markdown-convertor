@@ -51,6 +51,11 @@ BASIC_TIMEOUTS: dict[str, float] = {
 #: Missed keepalive frames after which a stream counts as dead.
 STREAM_MISSED_FRAMES = 3
 
+#: The longest a RAG's Timeouts setting may be (seconds). A bound on what a person may
+#: type, not a wait: every proxy holds a connection that long, and past ~24 days a
+#: Node timer overflows and fires at once. Kept equal in frontend/src/lib/timeouts.ts.
+MAX_RAG_TIMEOUT_SECONDS = 3600.0
+
 
 def seconds(name: str) -> float:
     """The current value of one basic timeout (env, else its default)."""

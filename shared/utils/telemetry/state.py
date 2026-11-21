@@ -26,7 +26,7 @@ from typing import Literal, Optional
 Tracing = Literal[
     "uninitialized",         # init_telemetry was never called
     "exporting",             # endpoint set, exporter attached
-    "disabled_no_endpoint",  # deliberate: OTEL_EXPORTER_OTLP_ENDPOINT unset
+    "disabled_no_endpoint",  # deliberate: TRACING_BACKEND none (or unset with no endpoint)
     "sdk_missing",           # opentelemetry-sdk not installed (expected air-gapped)
 ]
 
@@ -36,6 +36,7 @@ _tracing: Tracing = "uninitialized"
 _service_name: Optional[str] = None
 _endpoint: Optional[str] = None
 _protocol: Optional[str] = None
+_backend: Optional[str] = None
 _instrumented: list[str] = []
 _spans_exported = 0
 _spans_dropped = 0
@@ -47,11 +48,13 @@ def record_tracing(
     service_name: Optional[str] = None,
     endpoint: Optional[str] = None,
     protocol: Optional[str] = None,
+    backend: Optional[str] = None,
 ) -> None:
     """Record the outcome of ``init_telemetry``."""
-    global _tracing, _service_name, _endpoint, _protocol
+    global _tracing, _service_name, _endpoint, _protocol, _backend
     with _lock:
         _tracing = tracing
+        _backend = backend
         _service_name = service_name
         _endpoint = endpoint or None
         _protocol = protocol
@@ -74,11 +77,11 @@ def count_spans(*, exported: int = 0, dropped: int = 0) -> None:
 
 def reset() -> None:
     """Drop all recorded state (tests)."""
-    global _tracing, _service_name, _endpoint, _protocol, _instrumented
+    global _tracing, _service_name, _endpoint, _protocol, _backend, _instrumented
     global _spans_exported, _spans_dropped
     with _lock:
         _tracing = "uninitialized"
-        _service_name = _endpoint = _protocol = None
+        _service_name = _endpoint = _protocol = _backend = None
         _instrumented = []
         _spans_exported = _spans_dropped = 0
 
@@ -87,11 +90,12 @@ def telemetry_state() -> dict:
     """The effective telemetry state, safe to expose on a health endpoint.
 
     Contains no secret: the endpoint is an address, and OTLP credentials live in
-    ``OTEL_EXPORTER_OTLP_HEADERS``, which is never read here.
+    ``OTEL_EXPORTER_OTLP_HEADERS`` / ``DYNATRACE_API_TOKEN``, never read here.
     """
     with _lock:
         return {
             "tracing": _tracing,
+            "backend": _backend,
             "service_name": _service_name,
             "endpoint": _endpoint,
             "protocol": _protocol,

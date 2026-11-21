@@ -462,7 +462,7 @@ class LiteLLMClient(LLMClient):
                 model=self._embedding_model,
                 input=batch,
                 **await self._call_kwargs_async(self._embedding_model),
-            ), generation.request_timeout(), f"{type(self).__name__}.embedding")
+            ), generation.request_timeout_for(None), f"{type(self).__name__}.embedding")
             return [item["embedding"] for item in resp.data]
 
         return await embed_in_batches(inputs, _one)

@@ -61,6 +61,12 @@ import threading
 import time
 from contextvars import ContextVar, copy_context
 
+from .deadline import (  # noqa: F401 — LLMCallTimeout is imported from here by callers
+    LLMBudgetSpent, LLMCallTimeout, cap, has_deadline, llm_call_scope, note_progress, spent,
+    time_left,
+)
+from .generation import query_timeout
+
 logger = logging.getLogger(__name__)
 
 MAX_WAIT_SECONDS = 180.0
@@ -213,15 +219,23 @@ class _Limiter:
         self._sem = threading.BoundedSemaphore(limit) if limit > 0 else None
 
     def acquire_sync(self) -> None:
-        if self._sem is not None:
+        if self._sem is None:
+            return
+        left = time_left()
+        if left is None:
             self._sem.acquire()
+        elif left <= 0 or not self._sem.acquire(timeout=left):
+            raise LLMBudgetSpent("waiting for a free LLM slot: request budget spent")
 
     async def acquire_async(self) -> None:
         if self._sem is None:
             return
         pause = 0.01
         while not self._sem.acquire(blocking=False):
-            await asyncio.sleep(pause)
+            left = time_left()
+            if left is not None and left <= 0:
+                raise LLMBudgetSpent("waiting for a free LLM slot: request budget spent")
+            await asyncio.sleep(pause if left is None else min(pause, left))
             pause = min(pause * 2, 0.25)
 
     def release(self) -> None:
@@ -261,9 +275,6 @@ _inside: ContextVar[bool] = ContextVar("llm_call_inside", default=False)
 
 # ── The hard deadline of one attempt ───────────────────────────────────────────
 
-class LLMCallTimeout(TimeoutError):
-    """One attempt had no complete answer within its deadline. A timeout like any
-    other: a page call (call_sync) retries it as transient, a text call does not."""
 
 
 def attempt_seconds(kwargs: dict) -> float:
@@ -271,15 +282,20 @@ def attempt_seconds(kwargs: dict) -> float:
     ``timeout``), else the lane's LLM_REQUEST_TIMEOUT_SECONDS."""
     from .generation import request_timeout_for  # noqa: PLC0415
 
-    return kwargs.get("timeout") or request_timeout_for(kwargs.get("generation"))
+    own = kwargs.get("timeout")
+    return cap(own) if own else request_timeout_for(kwargs.get("generation"))
 
 
 async def within_deadline(aw, seconds: float, what: str):
     """``await aw``, ended at ``seconds`` however the endpoint behaves."""
     try:
-        return await asyncio.wait_for(aw, seconds)
+        result = await asyncio.wait_for(aw, seconds)
     except asyncio.TimeoutError as exc:
+        if spent():  # cut by the request's deadline, not by the call's own timeout
+            raise LLMBudgetSpent(f"{what}: request budget spent") from exc
         raise LLMCallTimeout(f"{what}: no complete answer within {seconds:.0f}s") from exc
+    note_progress()  # an ingest run counts this as progress (core/deadline.py)
+    return result
 
 
 def _sync_within_deadline(fn, args, kwargs, seconds: float, what: str):
@@ -301,9 +317,12 @@ def _sync_within_deadline(fn, args, kwargs, seconds: float, what: str):
     threading.Thread(target=run, name="llm-call", daemon=True).start()
     if not done.wait(seconds):
         logger.warning("[llm] %s: no complete answer within %.0fs; abandoned", what, seconds)
+        if spent():
+            raise LLMBudgetSpent(f"{what}: request budget spent")
         raise LLMCallTimeout(f"{what}: no complete answer within {seconds:.0f}s")
     if "error" in box:
         raise box["error"]
+    note_progress()
     return box["value"]
 
 
@@ -352,6 +371,9 @@ class _Attempts:
         if remaining <= 0:
             return None
         wait = min(wait, remaining)
+        left = time_left()
+        if left is not None and wait >= left:
+            return None  # the request would be out of time before the next attempt
         self.waited += wait
         logger.warning("[llm] %s busy (attempt %d, %.0fs of %.0fs waited), retrying in %.0fs: %s",
                        self.what, self.n, self.waited - wait, self.budget, wait, str(exc)[:200])
@@ -379,6 +401,11 @@ async def call_async(fn, *args, what: str = "llm call", **kwargs):
     """``await fn(*args, **kwargs)`` under the cap, waiting out a busy provider."""
     if _inside.get():
         return await fn(*args, **kwargs)
+    with llm_call_scope():
+        return await _call_async(fn, *args, what=what, **kwargs)
+
+
+async def _call_async(fn, *args, what: str, **kwargs):
     attempts = _Attempts(what)
     lim = limiter()
     while True:
@@ -407,11 +434,28 @@ async def stream_async(open_stream, *args, what: str = "llm stream", **kwargs):
     whole stream."""
     attempts = _Attempts(what)
     lim = limiter()
-    seconds = attempt_seconds(kwargs)
+    # On a user request the whole call (attempts, waits, the stream) gets at most
+    # LLM_QUERY_TIMEOUT_SECONDS. Computed here, not with llm_call_scope(): a context
+    # variable set inside an async generator would leak into the consumer's frames.
+    call_end = time.monotonic() + query_timeout() if has_deadline() else None
     while True:
         await lim.acquire_async()
         started = False
-        pieces = open_stream(*args, **kwargs).__aiter__()
+        try:
+            # attempt_seconds raises LLMBudgetSpent when the request has no time left:
+            # the slot must go back either way, or LLM_MAX_CONCURRENCY such timeouts
+            # leave every later call in the process waiting for a slot forever.
+            seconds = attempt_seconds(kwargs)
+            if call_end is not None:
+                seconds = min(seconds, call_end - time.monotonic())
+                if seconds <= 0:
+                    if spent():
+                        raise LLMBudgetSpent(f"{what}: request budget spent")
+                    raise LLMCallTimeout(f"{what}: no complete answer within the LLM call's time")
+            pieces = open_stream(*args, **kwargs).__aiter__()
+        except BaseException:
+            lim.release()
+            raise
         deadline = time.monotonic() + seconds
         try:
             while True:
@@ -455,6 +499,11 @@ def call_sync(fn, *args, what: str = "llm call", **kwargs):
     docstring. The slot is released while waiting."""
     if _inside.get():
         return fn(*args, **kwargs)
+    with llm_call_scope():
+        return _call_sync(fn, *args, what=what, **kwargs)
+
+
+def _call_sync(fn, *args, what: str, **kwargs):
     attempts = _Attempts(what)
     transient = 0
     lim = limiter()

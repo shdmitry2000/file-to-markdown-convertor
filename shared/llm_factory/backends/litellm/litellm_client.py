@@ -398,13 +398,16 @@ class LiteLLMClient(LLMClient):
             **call_kwargs,
         )
         content = (resp.choices[0].message.content or "")
+        truncated = getattr(resp.choices[0], "finish_reason", None) == "length"
         data = loads_tolerant(
             content,
             model=self._model,
             source=" despite response_format=json_object",
+            truncated=truncated,
         )
         cost = _cost_from_response(resp)
-        return LLMResult(text=content, data=data, cost_usd=cost, model=self._model, raw=resp)
+        return LLMResult(text=content, data=data, cost_usd=cost, model=self._model, raw=resp,
+                         truncated=truncated)
 
     @resilient_sync
     def vision_sync(

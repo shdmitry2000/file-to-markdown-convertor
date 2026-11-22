@@ -401,10 +401,14 @@ class VertexProxyClient:
 
         text = gemini_response.answer_text(resp_data)
 
+        candidates = resp_data.get("candidates") if isinstance(resp_data, dict) else None
+        truncated = (bool(candidates) and isinstance(candidates[0], dict)
+                     and candidates[0].get("finishReason") == "MAX_TOKENS")
         parsed = loads_tolerant(
             text,
             model=self._model,
             source=" despite responseMimeType=application/json",
+            truncated=truncated,
         )
 
         return LLMResult(
@@ -413,6 +417,7 @@ class VertexProxyClient:
             cost_usd=0.0,
             model=self._model,
             raw=resp_data,
+            truncated=truncated,
         )
 
     @resilient_sync

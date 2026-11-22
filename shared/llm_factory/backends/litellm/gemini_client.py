@@ -81,6 +81,9 @@ class GeminiClient:
     ) -> LLMResult:
         result = await self.text(prompt, system, generation=generation)
         result.data = _parse_json(result.text)
+        candidates = getattr(result.raw, "candidates", None) or []
+        reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+        result.truncated = "MAX_TOKENS" in str(reason or "")
         return result
 
     async def embedding(self, text: str | list[str]) -> list[list[float]]:

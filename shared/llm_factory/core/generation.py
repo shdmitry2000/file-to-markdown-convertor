@@ -6,7 +6,8 @@ Settings (the same names in every module; a module changes a value, never a name
   per-call value wins. Gemini 3+ is raised to 1.0 (below it, Google documents
   loops and degraded output) unless the caller marks its value exact — the
   evaluator's judge sends 0.0 on purpose, for repeatable scores.
-- ``LLM_MAX_TOKENS`` (default 8192): max output tokens when a call sets none.
+- ``LLM_MAX_TOKENS`` (default 64000): max output tokens when a call sets none (8192
+  until 2026-11-22: 20 Hebrew test questions with excerpts were cut off mid-reply).
 - ``LLM_REQUEST_TIMEOUT_SECONDS`` (default 300): one HTTP request — what the proxy
   lane always used. Single requests do run past 110 s (wiki compiles with thinking
   on, measured with no busy wait before them), so it is not lower. The callers' own
@@ -42,7 +43,7 @@ ENV_LLM_REQUEST_TIMEOUT_SECONDS = "LLM_REQUEST_TIMEOUT_SECONDS"
 ENV_LLM_QUERY_TIMEOUT_SECONDS = "LLM_QUERY_TIMEOUT_SECONDS"
 
 DEFAULT_TEMPERATURE = 1.0
-DEFAULT_MAX_TOKENS = 8192
+DEFAULT_MAX_TOKENS = 64000
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 # One LLM call made while a user waits, busy-provider waits included (core/deadline.py).
 DEFAULT_QUERY_TIMEOUT_SECONDS = 120.0

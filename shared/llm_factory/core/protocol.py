@@ -20,6 +20,9 @@ class LLMResult:
     - `cost_usd`: billing cost when the provider reports it; 0.0 otherwise.
     - `model` : the model identifier actually used (useful for logging).
     - `raw`   : the provider-native response object, for debugging only.
+    - `truncated`: the reply stopped at the output-token cap (set by the JSON methods).
+      A cut-off JSON reply is repaired and parses, so without it the caller cannot
+      tell a short answer from a cut one.
     """
 
     text: str
@@ -27,6 +30,7 @@ class LLMResult:
     cost_usd: float = 0.0
     model: str = ""
     raw: object | None = None
+    truncated: bool = False
 
 
 @dataclass(frozen=True)

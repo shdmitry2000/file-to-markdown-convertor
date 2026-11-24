@@ -77,7 +77,7 @@ class VLMConverter(PDFConverter):
         Returns:
             Full document as Markdown, pages separated by ``\\n\\n---\\n\\n``.
         """
-        import fitz  # PyMuPDF
+        import pymupdf as fitz  # PyMuPDF
 
         self.validate_path(pdf_path)
         self._build_lane()
@@ -106,7 +106,7 @@ class VLMConverter(PDFConverter):
     @staticmethod
     def _render_page_as_b64(page) -> str:
         """Rasterise a fitz page and return a base64-encoded PNG string."""
-        matrix = __import__("fitz").Matrix(_DPI_SCALE, _DPI_SCALE)
+        matrix = __import__("pymupdf").Matrix(_DPI_SCALE, _DPI_SCALE)
         pix = page.get_pixmap(matrix=matrix)
         return base64.b64encode(pix.tobytes("png")).decode("utf-8")
 

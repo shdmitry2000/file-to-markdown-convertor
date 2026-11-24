@@ -34,6 +34,13 @@ dependencies = [
     "litellm>=1.84.0,<2.0.0",
     "google-auth>=2.56.0",
     "google-cloud-aiplatform>=1.163.0",
+    # Worker spans (convert_file, docling.convert, write_output). Without the SDK
+    # TRACING_BACKEND=log is a no-op and the worker logs "SDK not installed".
+    # gRPC exporter as in the gateway image: with an otel/dynatrace backend set,
+    # a missing exporter is a TelemetryConfigError and the worker refuses to start.
+    "opentelemetry-api>=1.45.2",
+    "opentelemetry-sdk>=1.45.2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.45.2",
 ]
 
 [tool.uv]
@@ -76,7 +83,7 @@ constraint-dependencies = [
     "opencv-python>=4.14.0.94,<5",
     # >>> runtime pins: config/runtime-pins.txt (scripts/sync_runtime_pins.py writes this block)
     "openai==2.54.0",
-    "litellm==1.108.15",
+    "litellm==1.110.3",
     "fastapi==0.163.2",
     "starlette==1.8.0",
     "pydantic==2.14.4",

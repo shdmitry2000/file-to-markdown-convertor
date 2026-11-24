@@ -281,3 +281,43 @@ def test_a_failed_chunk_task_is_reported_as_a_chunk_result(monkeypatch):
         w._serve(None, None, results, "addr", "w1", [None])
     assert results.sent == [{"task_id": "k1", "chunk_id": "k1", "status": "failed",
                              "error": "worker error: 'file_path'", "type": "chunk"}]
+
+
+# ---- pre-warm: free memory is the pod's, not the node's ----------------------------
+
+def _pod(monkeypatch, *, node_gb, limit_mb, anon_mb, workers=1):
+    import psutil
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: type("VM", (), {"available": node_gb * 1073741824})())
+    monkeypatch.setattr(w, "_cgroup_memory_limit_mb", lambda: limit_mb)
+    monkeypatch.setattr(w, "_cgroup_anon_mb", lambda: anon_mb)
+    monkeypatch.setattr(w, "_workers_in_pod", lambda: workers)
+
+
+def test_free_memory_in_a_pod_is_its_limit_minus_its_use(monkeypatch):
+    """A 2 GB markdown-api pod on a 64 GB node: psutil says 60 GB free, the pod has
+    under 1.5 GB. Pre-warming on the node's figure OOM-killed it (OCP UAT)."""
+    _pod(monkeypatch, node_gb=60, limit_mb=2048, anon_mb=512)
+    assert w._available_memory_gb() == pytest.approx(1.5)
+
+
+def test_free_memory_is_shared_by_the_workers_in_the_pod(monkeypatch):
+    _pod(monkeypatch, node_gb=60, limit_mb=8192, anon_mb=0, workers=2)
+    assert w._available_memory_gb() == pytest.approx(4.0)
+
+
+def test_the_node_figure_wins_when_it_is_smaller(monkeypatch):
+    _pod(monkeypatch, node_gb=1, limit_mb=8192, anon_mb=0)
+    assert w._available_memory_gb() == pytest.approx(1.0)
+
+
+def test_without_a_limit_the_node_figure_is_used(monkeypatch):
+    _pod(monkeypatch, node_gb=12, limit_mb=None, anon_mb=None)
+    assert w._available_memory_gb() == pytest.approx(12.0)
+
+
+def test_prewarm_is_skipped_in_a_pod_too_small_for_the_models(monkeypatch):
+    _pod(monkeypatch, node_gb=60, limit_mb=2048, anon_mb=512)
+    called = []
+    w._prewarm_convert(lambda path: called.append(path), "docling")
+    assert called == [], "models must load lazily instead of OOM-killing the pod"

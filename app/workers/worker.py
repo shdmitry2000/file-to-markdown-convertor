@@ -383,7 +383,7 @@ def _write_warmup_pdf() -> str:
     conversion of this PDF during pre-warm forces the load up front."""
     import tempfile
 
-    import fitz  # PyMuPDF — already a dependency of the dbank pipeline.
+    import pymupdf as fitz  # PyMuPDF — already a dependency of the dbank pipeline.
 
     doc = fitz.open()
     page = doc.new_page()
@@ -403,12 +403,23 @@ _PREWARM_MIN_FREE_GB = float(os.getenv("DOCLING_PREWARM_MIN_FREE_GB", "2.5"))
 
 
 def _available_memory_gb():
-    """Available (reclaimable) RAM in GB, or None if it can't be determined."""
+    """RAM this worker may still use in GB, or None if it can't be determined.
+
+    In a pod, the container limit minus what the pod already holds, shared by the
+    workers in it: psutil alone reports the NODE, so a worker embedded in the 2 GB
+    markdown-api pod on a large node always pre-warmed and the pod was OOM-killed
+    (OCP UAT, 2026-11-24). The node's figure still applies when it is smaller."""
+    node = None
     try:
         import psutil
-        return psutil.virtual_memory().available / 1073741824
+        node = psutil.virtual_memory().available / 1073741824
     except Exception:
-        return None
+        pass
+    limit = _cgroup_memory_limit_mb()
+    if not limit:
+        return node
+    pod = max(0.0, limit - (_cgroup_anon_mb() or 0.0)) / 1024 / _workers_in_pod()
+    return pod if node is None else min(node, pod)
 
 
 def _cgroup_memory_limit_mb():

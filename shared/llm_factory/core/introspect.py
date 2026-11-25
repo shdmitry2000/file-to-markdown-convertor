@@ -57,10 +57,30 @@ async def probe_embedding_dimension(force: bool = False) -> int:
     return dim
 
 
-def get_embedding_config_sync() -> Dict[str, Any]:
-    """Sync convenience wrapper. Returns ``{provider, model, dimension, api_type}``."""
+def _embedding_config(label: str) -> Dict[str, Any]:
+    return {
+        "provider": label.split("/", 1)[0] if "/" in label else label,
+        "model": _model_part(label),
+        "dimension": _DIM_CACHE.get(label, 0),
+        "api_type": "llm_factory",
+    }
+
+
+async def get_embedding_config_async() -> Dict[str, Any]:
+    """``{provider, model, dimension, api_type}`` for async code. The first call per
+    provider probes the model; awaiting it keeps the caller's event loop serving.
+    The sync wrapper below, called from a handler, held that loop for the whole probe."""
     label = _provider_label()
-    model = _model_part(label)
+    if label not in _DIM_CACHE:
+        await probe_embedding_dimension()
+    return _embedding_config(label)
+
+
+def get_embedding_config_sync() -> Dict[str, Any]:
+    """Sync convenience wrapper for SYNC code only — from a coroutine it blocks the
+    event loop until the probe returns; use ``get_embedding_config_async`` there.
+    Returns ``{provider, model, dimension, api_type}``."""
+    label = _provider_label()
 
     if label not in _DIM_CACHE:
         # run_async keeps only the loop *detection* inside its try, so a
@@ -71,27 +91,22 @@ def get_embedding_config_sync() -> Dict[str, Any]:
 
         run_async(probe_embedding_dimension())
 
-    return {
-        "provider": label.split("/", 1)[0] if "/" in label else label,
-        "model": model,
-        "dimension": _DIM_CACHE.get(label, 0),
-        "api_type": "llm_factory",
-    }
+    return _embedding_config(label)
 
 
 def pydantic_ai_model_string(provider: Optional[str] = None) -> str:
     """Translate ``LLM_CONNECTOR_TYPE`` + ``LLM_TYPE`` into a pydantic-ai model string.
 
     pydantic-ai accepts shorthand model strings like ``openai:gpt-4o-mini``,
-    ``google-vertex:gemini-2.5-flash``, ``google-gla:gemini-2.5-flash``, etc.
+    ``google-vertex:gemini-3.5-flash``, ``google-gla:gemini-3.5-flash``, etc.
 
     Args:
-        provider: Optional explicit provider string (e.g. ``vertex_ai/gemini-2.5-flash``).
+        provider: Optional explicit provider string (e.g. ``vertex_ai/gemini-3.5-flash``).
             When omitted, reads ``LLM_CONNECTOR_TYPE`` + ``LLM_TYPE``, and raises
             ``LLMProviderNotConfigured`` if that is unset — there is no default.
 
     Returns:
-        A pydantic-ai-compatible model string (e.g. ``google-vertex:gemini-2.5-flash``).
+        A pydantic-ai-compatible model string (e.g. ``google-vertex:gemini-3.5-flash``).
     """
     from . import config as _factory_config
 

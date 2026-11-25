@@ -159,8 +159,13 @@ CATALOGUE: dict[str, tuple[str, int]] = {
 }
 
 _SECRET_LAST = {"token", "secret", "password", "passwd", "pwd", "credential", "credentials",
-                "dsn", "authorization", "cookie", "kek", "apikey", "passphrase"}
+                "dsn", "authorization", "cookie", "kek", "apikey", "passphrase", "bearer",
+                # `session` (the cookie value) only: `session_id` / `sessions` (a count)
+                # end in another word and stay readable.
+                "session"}
 _SECRET_KEY_BEFORE = {"api", "access", "private", "secret", "encryption", "signing", "x"}
+#: Names whose LAST TWO words make them secret (the last word alone is harmless).
+_SECRET_LAST_TWO = {("connection", "string"), ("sas", "url")}
 
 
 def _parts(name: str) -> list[str]:
@@ -175,7 +180,7 @@ def is_secret_key(name: str) -> bool:
     if not parts:
         return False
     last = parts[-1]
-    if last in _SECRET_LAST:
+    if last in _SECRET_LAST or tuple(parts[-2:]) in _SECRET_LAST_TWO:
         return True
     if last == "key":
         return len(parts) == 1 or parts[-2] in _SECRET_KEY_BEFORE

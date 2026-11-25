@@ -135,7 +135,6 @@ class VertexProxyClient:
         self._location = location
         self._model = model
         self._embedding_model = embedding_model
-        self._http_client = None  # Lazy-initialized persistent HTTP client
         # Optional pinned connector creds (set by build_space_clients for out-of-request
         # callers like the evaluator). Used instead of the request contextvar when set.
         self.pinned_creds = None
@@ -170,7 +169,9 @@ class VertexProxyClient:
                 connector = creds.connector_id
                 token = creds.auth_token
         except Exception as e:  # pragma: no cover - defensive
-            logger.debug("vertex_proxy connector resolve failed, using global: %s", e)
+            # WARNING: a space's call then runs (and bills) on the global connector.
+            logger.warning("vertex_proxy: connector resolve failed (%s: %s); using the "
+                           "global connector", type(e).__name__, e)
         return _ResolvedCreds(base, connector, token, project, location)
 
     def _connector_root_url(
@@ -180,43 +181,17 @@ class VertexProxyClient:
             base_url if base_url is not None else self._base_url,
             connector_id if connector_id is not None else self._connector_id,
         )
-    
-    def _get_http_client(self) -> Any:
-        """Get or create persistent HTTP client for connection reuse."""
-        import httpx
-        
-        if self._http_client is None:
-            self._http_client = httpx.AsyncClient(
-                verify=config.tls_verify(), timeout=_generation.request_timeout()
-            )
-            logger.debug("vertex_proxy: created persistent HTTP client for embedding requests")
-        return self._http_client
-    
-    async def close(self):
-        """Close the persistent HTTP client."""
-        if self._http_client is not None:
-            await self._http_client.aclose()
-            self._http_client = None
-            logger.debug("vertex_proxy: closed persistent HTTP client")
 
     def _build_api_url(
-        self,
-        base_url: str | None = None,
-        connector_id: str | None = None,
-        project: str | None = None,
-        location: str | None = None,
+        self, base_url: str | None = None, connector_id: str | None = None
     ) -> str:
         """Build ``:generateContent`` URL via Raw Connector (no project or region: the
-        connector supplies them; ``project``/``location`` are accepted and unused)."""
+        connector supplies them)."""
         root = self._connector_root_url(base_url, connector_id)
         return f"{root}/{config.vertex_proxy_studio_path(self._model, 'generateContent')}"
 
     def _build_embedding_url(
-        self,
-        base_url: str | None = None,
-        connector_id: str | None = None,
-        project: str | None = None,
-        location: str | None = None,
+        self, base_url: str | None = None, connector_id: str | None = None
     ) -> str:
         """Build the ``:predict`` URL for the embedding model."""
         root = self._connector_root_url(base_url, connector_id)
@@ -349,7 +324,7 @@ class VertexProxyClient:
         import httpx
 
         creds = await self._resolve_creds()
-        url = self._build_api_url(creds.base_url, creds.connector_id, creds.project, creds.location)
+        url = self._build_api_url(creds.base_url, creds.connector_id)
         headers = self._build_headers(creds.auth_token)
         payload = self._build_payload(prompt, system, generation=generation, cached=cached)
 
@@ -384,7 +359,7 @@ class VertexProxyClient:
         import httpx
 
         creds = await self._resolve_creds()
-        url = self._build_api_url(creds.base_url, creds.connector_id, creds.project, creds.location)
+        url = self._build_api_url(creds.base_url, creds.connector_id)
         headers = self._build_headers(creds.auth_token)
         payload = self._build_payload(
             prompt,
@@ -440,9 +415,13 @@ class VertexProxyClient:
         empty-answer handling sees the same thing on both lanes.
         """
         import httpx
+        from shared.async_utils import run_async
 
-        creds = asyncio.run(self._resolve_creds())
-        url = self._build_api_url(creds.base_url, creds.connector_id, creds.project, creds.location)
+        # On the one shared loop (shared/async_utils.py), not asyncio.run per page: a
+        # new loop per page, and the connector store's async pool, bound to the loop
+        # that opened it, failed on the next one (then silently used the global creds).
+        creds = run_async(self._resolve_creds())
+        url = self._build_api_url(creds.base_url, creds.connector_id)
         headers = self._build_headers(creds.auth_token)
         payload = self._build_payload(
             prompt, system,
@@ -468,24 +447,34 @@ class VertexProxyClient:
 
         Vertex caps requests at 250 instances, so long inputs are split into
         sub-batches (see ``embed_in_batches``); each sub-batch retries on 429.
+
+        One HTTP client per call, shared by its sub-batches and retries. Not one per
+        client object: the factory caches this object per process, and a pooled
+        connection opened on one event loop fails on the next ("Event loop is closed")
+        — and callers run on several loops (each service's own, the sync callers' shared one).
         """
+        import httpx
+
         inputs = [text] if isinstance(text, str) else list(text)
         # Resolve once for the whole request, then reuse across sub-batches.
         creds = await self._resolve_creds()
 
-        async def _one(batch: list[str]) -> list[list[float]]:
-            return await self._embed_one_batch(batch, creds)
+        async with httpx.AsyncClient(
+            verify=config.tls_verify(), timeout=_generation.request_timeout()
+        ) as http:
+            async def _one(batch: list[str]) -> list[list[float]]:
+                return await self._embed_one_batch(http, batch, creds)
 
-        return await embed_in_batches(inputs, _one)
+            return await embed_in_batches(inputs, _one)
 
     async def _embed_one_batch(
-        self, inputs: list[str], creds: _ResolvedCreds | None = None
+        self, http: Any, inputs: list[str], creds: _ResolvedCreds
     ) -> list[list[float]]:
-        c = creds if creds is not None else await self._resolve_creds()
-        url = self._build_embedding_url(c.base_url, c.connector_id, c.project, c.location)
+        c = creds
+        url = self._build_embedding_url(c.base_url, c.connector_id)
         headers = self._build_headers(c.auth_token)
         data = await self._post_embedding(
-            url, {"instances": [{"content": s} for s in inputs]}, headers)
+            http, url, {"instances": [{"content": s} for s in inputs]}, headers)
         try:
             return [pred["embeddings"]["values"] for pred in data["predictions"]]
         except (KeyError, IndexError, TypeError) as e:
@@ -494,15 +483,14 @@ class VertexProxyClient:
                 f"Body: {data!r}"
             ) from e
 
-    async def _post_embedding(self, url: str, payload: dict, headers: dict) -> dict:
+    async def _post_embedding(self, http: Any, url: str, payload: dict, headers: dict) -> dict:
         """POST one embedding request, retrying 429 (rate limit) and 504 (timed out) with
         exponential backoff — the two statuses the connector guide says to retry."""
         max_retries, retry_delay = _EMBED_MAX_RETRIES, _EMBED_RETRY_DELAY_SECONDS
 
         for attempt in range(max_retries + 1):
-            client = self._get_http_client()
             response = await within_deadline(
-                client.post(url, json=payload, headers=headers),
+                http.post(url, json=payload, headers=headers),
                 _generation.request_timeout_for(None), "VertexProxyClient.embedding")
             wait = retry_delay * (2 ** attempt)
             left = time_left()  # a user request's time left; None in background work

@@ -70,7 +70,7 @@ class LLMClient(Protocol):
     them with `asyncio.to_thread` rather than forcing callers to think about it.
     """
 
-    provider: str  # human-readable provider label (e.g. "gemini/gemini-2.5-flash")
+    provider: str  # human-readable provider label (e.g. "gemini/gemini-3.5-flash")
 
     async def text(self, prompt: str, system: str = "") -> LLMResult:
         """Plain text completion."""

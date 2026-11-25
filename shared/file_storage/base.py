@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import BinaryIO, Iterator, Optional
 
 from shared.file_storage import keys
 
@@ -38,6 +38,10 @@ class ObjectInfo:
     modified: float
 
 
+#: Chunk size for streamed reads and writes.
+CHUNK_SIZE = 1024 * 1024
+
+
 class FileStore(ABC):
     """Durable storage for project files, addressed by key (see `keys`)."""
 
@@ -46,6 +50,16 @@ class FileStore(ABC):
 
     @abstractmethod
     def write_bytes(self, key: str, data: bytes) -> None: ...
+
+    def write_fileobj(self, key: str, fileobj: BinaryIO) -> None:
+        """Write from a readable binary file, without holding it whole in memory where
+        the backend can stream (an upload can be hundreds of MB). Default: read it."""
+        self.write_bytes(key, fileobj.read())
+
+    def iter_chunks(self, key: str, chunk_size: int = CHUNK_SIZE) -> Iterator[bytes]:
+        """The object's bytes in chunks, for a download that must not hold the whole
+        file in memory. Default: one chunk."""
+        yield self.read_bytes(key)
 
     @abstractmethod
     def stat(self, key: str) -> Optional[ObjectInfo]:
@@ -112,6 +126,27 @@ class LocalFileStore(FileStore):
         return self._path(key).read_bytes()
 
     def write_bytes(self, key: str, data: bytes) -> None:
+        path = self._writable_path(key)
+        # Same-directory temp + atomic replace: a reader polling for the converted
+        # markdown must never observe a half-written file.
+        tmp = path.with_name(f".{path.name}.partial")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+
+    def write_fileobj(self, key: str, fileobj: BinaryIO) -> None:
+        path = self._writable_path(key)
+        tmp = path.with_name(f".{path.name}.partial")
+        with open(tmp, "wb") as out:
+            shutil.copyfileobj(fileobj, out, CHUNK_SIZE)
+        tmp.replace(path)
+
+    def iter_chunks(self, key: str, chunk_size: int = CHUNK_SIZE) -> Iterator[bytes]:
+        with open(self._path(key), "rb") as f:
+            while chunk := f.read(chunk_size):
+                yield chunk
+
+    def _writable_path(self, key: str) -> Path:
+        """The key's path, its folder made — only inside an existing space folder."""
         path = self._path(key)
         first = keys.normalize(key).split("/", 1)[0]
         if first.startswith("."):  # service files in the root (.preflight/…), not a space
@@ -120,11 +155,7 @@ class LocalFileStore(FileStore):
             from shared.space_folder import ensure_space_dir
 
             ensure_space_dir(path.parent, first)
-        # Same-directory temp + atomic replace: a reader polling for the converted
-        # markdown must never observe a half-written file.
-        tmp = path.with_name(f".{path.name}.partial")
-        tmp.write_bytes(data)
-        tmp.replace(path)
+        return path
 
     def stat(self, key: str) -> Optional[ObjectInfo]:
         path = self._path(key)
@@ -158,7 +189,9 @@ class LocalFileStore(FileStore):
             return 0
         count = sum(1 for p in root.rglob("*") if p.is_file())
         shutil.rmtree(root, ignore_errors=True)
-        return count
+        # rmtree ignored its errors: count only what is actually gone.
+        left = sum(1 for p in root.rglob("*") if p.is_file()) if root.exists() else 0
+        return count - left
 
     def copy_prefix(self, source: str, destination: str) -> int:
         src, dst = self._path(source), self._path(destination)

@@ -25,7 +25,7 @@ Constants (settings until 1.4.8.4, never set to anything but these):
   "rate limited", not "timed out". At 220, a local wiki compile that waited out
   216 s of 429s then timed out mid-call.
 - ``BASE_SECONDS`` (5): first wait, then 10 s per wait, with jitter; a provider's
-  Retry-After is followed up to the same 10 s. Until 1.4.8.6 one wait could reach
+  Retry-After is followed up to the same 10 s, and never below that backoff. Until 1.4.8.6 one wait could reach
   30 s (37 s with jitter): an ingest that hit 429s spent most of its time asleep.
 
 What is retried: 429 / RESOURCE_EXHAUSTED and 503 / UNAVAILABLE ("model
@@ -203,10 +203,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def max_wait_seconds() -> float:
-    return MAX_WAIT_SECONDS
-
-
 # ── Concurrency cap ────────────────────────────────────────────────────────────
 
 class _Limiter:
@@ -355,7 +351,7 @@ class _Attempts:
 
     def __init__(self, what: str):
         self.what = what
-        self.budget = max_wait_seconds()
+        self.budget = MAX_WAIT_SECONDS
         self.waited = 0.0
         self.n = 0
 
@@ -363,9 +359,14 @@ class _Attempts:
         """Seconds to wait before the next attempt, or None to give up."""
         if not is_rate_limited(exc):
             return None
-        self.n += 1
+        # Counted only once a wait is granted: a give-up reports self.n + 1 attempts.
+        n = self.n + 1
+        backoff = BASE_SECONDS * 2 ** (n - 1) * random.uniform(0.75, 1.25)
         hint = retry_after(exc)
-        wait = hint if hint is not None else BASE_SECONDS * 2 ** (self.n - 1) * random.uniform(0.75, 1.25)
+        # Retry-After is a minimum, never a reason to wait less than our own backoff:
+        # a proxy answering "Retry-After: 0" otherwise made every wait 0 s, so the
+        # budget never drained and a background call retried forever.
+        wait = backoff if hint is None else max(hint, backoff)
         wait = min(wait, _MAX_SINGLE_WAIT_SECONDS)
         remaining = self.budget - self.waited
         if remaining <= 0:
@@ -374,6 +375,7 @@ class _Attempts:
         left = time_left()
         if left is not None and wait >= left:
             return None  # the request would be out of time before the next attempt
+        self.n = n
         self.waited += wait
         logger.warning("[llm] %s busy (attempt %d, %.0fs of %.0fs waited), retrying in %.0fs: %s",
                        self.what, self.n, self.waited - wait, self.budget, wait, str(exc)[:200])

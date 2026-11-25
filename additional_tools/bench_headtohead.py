@@ -6,11 +6,11 @@ Compares text-extraction engines on speed and Hebrew-text fidelity:
   - liteparse     (new candidate; PDFium + Tesseract, Rust core)
   - docling       (current default — the slow one we want to replace)
 
-VLM (Vertex/Gemini) is benchmarked separately in bench_vlm.py because it
+VLM (Vertex/Gemini) is benchmarked separately in additional_tools/bench_vlm.py because it
 needs network + credentials and is priced per page.
 
 Usage:
-  python bench_headtohead.py <pdf> [--pages N] [--full]
+  python additional_tools/bench_headtohead.py <pdf> [--pages N] [--full]
 
   --pages N : page count for the apples-to-apples subset run (default 10)
   --full    : also run the FAST local engines on the entire document

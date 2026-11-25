@@ -78,7 +78,7 @@ class ConnectorCreds:
     # Used by both the vertex_proxy (URL) and vertex_ai (ADC) lanes.
     project: Optional[str] = None
     location: Optional[str] = None
-    # Prefixed provider strings (e.g. ``vertex_proxy/gemini-2.5-flash``). Non-secret;
+    # Prefixed provider strings (e.g. ``vertex_proxy/gemini-3.5-flash``). Non-secret;
     # None → inherit. ``model`` selects the answer-generation provider; ``embedding_model``
     # selects the retrieval-embedding provider (EMBEDDING_TYPE equivalent).
     model: Optional[str] = None
@@ -367,7 +367,8 @@ async def resolve_llm_connector(
 
     Composes the space+global core (:func:`resolve_connector_creds`) with the
     template tier, field-by-field: a field the template sets wins; otherwise it
-    falls through to the space, then global, value. When ``template_cfg`` is None
+    falls through to the space, then global, value. The identity fields are the
+    exception: they move as one unit (see below). When ``template_cfg`` is None
     it is read from the request-bound template config (set by the template routers),
     so the space tier stays optional and the template resolves standalone.
     """
@@ -382,11 +383,25 @@ async def resolve_llm_connector(
     if not template_cfg or not template_cfg.has_any():
         return base
 
+    # The identity (base_url + connector_id + auth_token) is ONE unit, never mixed across
+    # tiers: merged field by field, a template that set only its base_url sent the
+    # space's token to the template's endpoint (review 1.7.1). A template that sets any
+    # identity field supplies all three; what it leaves empty comes from the pod's own
+    # env (the same operator configured both), never from the space.
+    ident = base
+    if template_cfg.has_identity():
+        glob = global_connector_creds()
+        ident = ConnectorCreds(
+            base_url=template_cfg.base_url or glob.base_url,
+            connector_id=template_cfg.connector_id or glob.connector_id,
+            auth_token=template_cfg.auth_token or glob.auth_token,
+            source="template")
+
     return ConnectorCreds(
-        base_url=(template_cfg.base_url or base.base_url).rstrip("/"),
-        connector_id=template_cfg.connector_id or base.connector_id,
-        auth_token=template_cfg.auth_token or base.auth_token,
-        source="template" if template_cfg.has_identity() else base.source,
+        base_url=ident.base_url.rstrip("/"),
+        connector_id=ident.connector_id,
+        auth_token=ident.auth_token,
+        source=ident.source,
         project=template_cfg.project or base.project,
         location=template_cfg.location or base.location,
         model=template_cfg.model or base.model,

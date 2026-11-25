@@ -197,7 +197,7 @@ def model_fits_scheme(scheme: str, model: str) -> bool:
 
     Prefix-based and deliberately permissive: a scheme with no declared prefixes
     accepts anything, so an incomplete table can never block a legitimate model.
-    It exists to catch pairings that are certainly wrong — `openai/gemini-2.5-flash`
+    It exists to catch pairings that are certainly wrong — `openai/gemini-3.5-flash`
     — not to be an allowlist of every model a provider offers.
     """
     profile = PROVIDER_PROFILES.get(scheme)

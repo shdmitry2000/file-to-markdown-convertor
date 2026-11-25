@@ -6,8 +6,8 @@ Groq, Mistral, Cohere, Bedrock, Azure, Ollama, vLLM, LM Studio, etc.
 
 Provider string format is LiteLLM's native model string:
     openai/gpt-4o-mini
-    gemini/gemini-2.5-flash
-    vertex_ai/gemini-2.5-pro
+    gemini/gemini-3.5-flash
+    vertex_ai/gemini-3.5-flash
     anthropic/claude-opus-4-7
     groq/llama-3.3-70b-versatile
     ollama/llama3.1:8b
@@ -18,6 +18,7 @@ See https://docs.litellm.ai/docs/providers for the full list.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Any
 
@@ -32,6 +33,8 @@ from . import _adc_timeout
 # google-auth would otherwise block 120s per refresh, which is how one
 # network blip cost 11 of 30 evaluation questions. See _adc_timeout.
 _adc_timeout.install()
+
+logger = logging.getLogger(__name__)
 
 
 def generation_kwargs(
@@ -141,7 +144,7 @@ class LiteLLMClient(LLMClient):
         """Initialise the client.
 
         Args:
-            model: LiteLLM model string, e.g. "gemini/gemini-2.5-flash".
+            model: LiteLLM model string, e.g. "gemini/gemini-3.5-flash".
             api_base: Override the provider's base URL (useful for compatible
                 endpoints, self-hosted gateways, or the Raw Connector proxy).
             api_key: Override the API key (otherwise read from env by LiteLLM).
@@ -170,17 +173,34 @@ class LiteLLMClient(LLMClient):
         # core/generation.py). The wiki sets it from its per-space switch.
         self.enable_thinking = False
 
-    def _apply_thinking(self, kwargs: dict) -> dict:
+    def _apply_thinking(self, kwargs: dict, generation: GenerationParams | None = None) -> dict:
         """Apply the client-wide thinking-off flag, if set.
 
         A caller that already asked for a thinking setting wins — by ANY of the
         spellings in THINKING_KEYS, not just the one we happen to emit. Adding ours
         on top would either duplicate a keyword at the call site (TypeError) or send
-        litellm a budget and a level together, which it rejects outright.
+        litellm a budget and a level together, which it rejects outright. So does a
+        call whose ``generation`` set thinking (the answer path's space switch): the
+        flag is a client default, not an override of what the call asked for.
         """
+        if generation is not None and generation.thinking is not None:
+            return kwargs
         if self.disable_thinking and not any(k in kwargs for k in THINKING_KEYS):
             return {**kwargs, **thinking_off_kwargs()}
         return kwargs
+
+    async def _acompletion(self, kwargs: dict, **call):
+        """``litellm.acompletion``, retried once without the thinking setting when the
+        model rejects it (gemini-2.5-pro refuses a thinking budget of 0). The one copy
+        of that fallback for text / json / stream; ``vision_sync`` has the sync twin."""
+        import litellm
+
+        try:
+            return await litellm.acompletion(model=self._model, **call, **kwargs)
+        except Exception as exc:
+            if not _rejects_thinking(exc, kwargs):
+                raise
+        return await litellm.acompletion(model=self._model, **call, **_without_thinking(kwargs))
 
     def _call_kwargs(self, model: str | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"timeout": generation.request_timeout()}
@@ -236,8 +256,11 @@ class LiteLLMClient(LLMClient):
             # its region; otherwise honor the resolved location.
             if creds.location and "vertex_location" not in kwargs:
                 kwargs["vertex_location"] = creds.location
-        except Exception:  # pragma: no cover - never break an LLM call
-            pass
+        except Exception as exc:  # never break an LLM call
+            # WARNING: the call then runs (and bills) on the env project / key, not
+            # the space's. Type and message only — never the creds.
+            logger.warning("litellm: space connector resolve failed (%s: %s); using the "
+                           "env-based credentials", type(exc).__name__, str(exc)[:200])
         return kwargs
 
     def set_embedding_spec(self, spec: str) -> None:
@@ -321,15 +344,13 @@ class LiteLLMClient(LLMClient):
         generation: GenerationParams | None = None,
         cached: str | None = None,
     ) -> LLMResult:
-        import litellm
-
-        resp = await litellm.acompletion(
-            model=self._model,
-            messages=_messages(system, prompt),
-            **self._with_cache(self._apply_thinking(
+        resp = await self._acompletion(
+            self._with_cache(self._apply_thinking(
                 {**await self._call_kwargs_async(),
-                 **generation_kwargs(generation, self._model, thinking=self.enable_thinking)}
+                 **generation_kwargs(generation, self._model, thinking=self.enable_thinking)},
+                generation,
             ), cached),
+            messages=_messages(system, prompt),
         )
         content = (resp.choices[0].message.content or "")
         cost = _cost_from_response(resp)
@@ -345,19 +366,13 @@ class LiteLLMClient(LLMClient):
         vertex_proxy. Same model/region/auth kwargs as :meth:`text`; ``extra`` carries
         per-call generation kwargs (max_tokens/temperature/thinking) from the caller.
         """
-        import litellm
-
         # Merge before expanding: `**a, **b` with a shared key (both can carry
         # `thinking`) is a TypeError at the call site, not a last-wins merge.
         call_kwargs = self._apply_thinking(
             {**await self._call_kwargs_async(), **_with_defaults(self._model, extra, self.enable_thinking)}
         )
-        resp = await litellm.acompletion(
-            model=self._model,
-            messages=_messages(system, prompt),
-            stream=True,
-            **call_kwargs,
-        )
+        resp = await self._acompletion(
+            call_kwargs, messages=_messages(system, prompt), stream=True)
         async for chunk in resp:
             try:
                 delta = chunk.choices[0].delta.content
@@ -382,21 +397,17 @@ class LiteLLMClient(LLMClient):
         could take effect — temperature and thinking had nowhere to go, so ingest
         ran at the provider default no matter what the space configured.
         """
-        import litellm
-
         # Merge before expanding: both the caller's params and _apply_thinking can
         # carry `thinking`, and `**a, **b` with a shared key is a TypeError at the
         # call site rather than a last-wins merge.
         call_kwargs = self._with_cache(self._apply_thinking(
             {**await self._call_kwargs_async(),
-                 **generation_kwargs(generation, self._model, thinking=self.enable_thinking)}
+                 **generation_kwargs(generation, self._model, thinking=self.enable_thinking)},
+            generation,
         ), cached)
-        resp = await litellm.acompletion(
-            model=self._model,
-            messages=_messages(system, prompt),
-            response_format={"type": "json_object"},
-            **call_kwargs,
-        )
+        resp = await self._acompletion(
+            call_kwargs, messages=_messages(system, prompt),
+            response_format={"type": "json_object"})
         content = (resp.choices[0].message.content or "")
         truncated = getattr(resp.choices[0], "finish_reason", None) == "length"
         data = loads_tolerant(
@@ -444,15 +455,11 @@ class LiteLLMClient(LLMClient):
         try:
             resp = litellm.completion(model=self._model, messages=messages, **kwargs)
         except Exception as exc:
-            # Not every model can disable thinking (gemini-2.5-pro rejects
-            # thinking_budget=0). Drop the thinking setting and retry once.
-            msg = str(exc).lower()
-            if any(k in kwargs for k in THINKING_KEYS) and ("thinking" in msg or "reasoning" in msg):
-                for key in THINKING_KEYS:
-                    kwargs.pop(key, None)
-                resp = litellm.completion(model=self._model, messages=messages, **kwargs)
-            else:
+            # Same fallback as _acompletion: drop the thinking setting, retry once.
+            if not _rejects_thinking(exc, kwargs):
                 raise
+            resp = litellm.completion(model=self._model, messages=messages,
+                                      **_without_thinking(kwargs))
         return resp.choices[0].message.content or ""
 
     async def embedding(self, text: str | list[str]) -> list[list[float]]:
@@ -499,6 +506,17 @@ def _cache_location(name: str) -> str:
     """``projects/{p}/locations/{loc}/cachedContents/{id}`` → loc."""
     parts = name.split("/")
     return parts[3] if len(parts) > 3 else "global"
+
+
+def _rejects_thinking(exc: Exception, kwargs: dict) -> bool:
+    """The model refused the thinking setting we sent (any spelling in THINKING_KEYS)."""
+    msg = str(exc).lower()
+    return (any(k in kwargs for k in THINKING_KEYS)
+            and any(w in msg for w in ("thinking", "reasoning", "budget")))
+
+
+def _without_thinking(kwargs: dict) -> dict:
+    return {k: v for k, v in kwargs.items() if k not in THINKING_KEYS}
 
 
 def _messages(system: str, prompt: str) -> list[dict]:

@@ -30,10 +30,10 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, BinaryIO, Iterator, Optional
 
 from shared.file_storage import keys
-from shared.file_storage.base import FileStore, ObjectInfo
+from shared.file_storage.base import CHUNK_SIZE, FileStore, ObjectInfo
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,18 @@ class S3FileStore(FileStore):
                 raise FileNotFoundError(f"no object at key {key!r}") from exc
             raise
 
+    def iter_chunks(self, key: str, chunk_size: int = CHUNK_SIZE) -> Iterator[bytes]:
+        try:
+            body = self._client.get_object(Bucket=self._bucket, Key=self._object(key))["Body"]
+        except Exception as exc:  # noqa: BLE001 — normalized below
+            if _is_not_found(exc):
+                raise FileNotFoundError(f"no object at key {key!r}") from exc
+            raise
+        try:
+            yield from body.iter_chunks(chunk_size)
+        finally:
+            body.close()
+
     def stat(self, key: str) -> Optional[ObjectInfo]:
         try:
             head = self._client.head_object(Bucket=self._bucket, Key=self._object(key))
@@ -120,27 +132,43 @@ class S3FileStore(FileStore):
         # temp-then-rename dance: a reader sees the old object or the new one.
         self._client.put_object(Bucket=self._bucket, Key=self._object(key), Body=data)
 
+    def write_fileobj(self, key: str, fileobj: BinaryIO) -> None:
+        # boto3 reads a seekable file body in chunks; it is never held whole.
+        self._client.put_object(Bucket=self._bucket, Key=self._object(key), Body=fileobj)
+
     def delete(self, key: str) -> None:
         # Absent is success — S3 DeleteObject is already idempotent.
         self._client.delete_object(Bucket=self._bucket, Key=self._object(key))
 
     def delete_prefix(self, prefix: str) -> int:
         removed = 0
+        errors: list[dict] = []
         batch: list[dict] = []
         for page in self._pages(self._object_prefix(prefix)):
             for item in page.get("Contents", []):
                 batch.append({"Key": item["Key"]})
                 if len(batch) == _DELETE_BATCH:
-                    removed += self._delete_batch(batch)
+                    removed += self._delete_batch(batch, errors)
                     batch = []
-        removed += self._delete_batch(batch)
+        removed += self._delete_batch(batch, errors)
+        if errors:
+            # A partial delete must not read as a clean one (space delete reports
+            # this count): every batch was still tried, then the failure is raised.
+            first = errors[0]
+            raise RuntimeError(
+                f"{len(errors)} object(s) under {prefix!r} not deleted ({removed} were); "
+                f"first: {first.get('Key')}: {first.get('Code')} {first.get('Message', '')}".rstrip())
         return removed
 
-    def _delete_batch(self, batch: list[dict]) -> int:
+    def _delete_batch(self, batch: list[dict], errors: list[dict]) -> int:
         if not batch:
             return 0
-        self._client.delete_objects(Bucket=self._bucket, Delete={"Objects": batch})
-        return len(batch)
+        # DeleteObjects does not raise for a key it could not delete: it lists it
+        # under Errors, so only what is not there counts as removed.
+        response = self._client.delete_objects(Bucket=self._bucket, Delete={"Objects": batch})
+        failed = (response or {}).get("Errors") or []
+        errors.extend(failed)
+        return len(batch) - len(failed)
 
     def copy_prefix(self, source: str, destination: str) -> int:
         src_prefix = self._object_prefix(source)
@@ -150,10 +178,11 @@ class S3FileStore(FileStore):
             for item in page.get("Contents", []):
                 relative = item["Key"][len(src_prefix):]
                 # Server-side: the bytes never travel through this process, which is
-                # what makes cloning a large space affordable.
-                self._client.copy_object(
-                    Bucket=self._bucket,
+                # what makes cloning a large space affordable. The managed copy, not
+                # one CopyObject: that caps at 5 GB, this goes multipart above it.
+                self._client.copy(
                     CopySource={"Bucket": self._bucket, "Key": item["Key"]},
+                    Bucket=self._bucket,
                     Key=f"{dst_prefix}{relative}",
                 )
                 copied += 1

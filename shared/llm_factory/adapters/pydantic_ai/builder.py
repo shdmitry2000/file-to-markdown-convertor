@@ -52,12 +52,12 @@ def build_pydantic_ai_model(provider: str | None = None, creds: Mapping[str, Any
     model = model.strip() or config.default_gemini_model_id()
     given = {k: v for k, v in (creds or {}).items() if v}
 
-    # Handle vertex_ai specially - use GoogleProvider with ADC
+    # Handle vertex_ai specially - use GoogleCloudProvider with ADC
     if scheme == "vertex_ai":
         try:
             from pydantic_ai.models.google import GoogleModel
-            from pydantic_ai.providers.google import GoogleProvider
-            
+            from pydantic_ai.providers.google_cloud import GoogleCloudProvider
+
             # Get project ID for Vertex AI
             project_id = (
                 given.get("project") or
@@ -74,9 +74,9 @@ def build_pydantic_ai_model(provider: str | None = None, creds: Mapping[str, Any
             # (same logic as LiteLLMClient.vertex_location_for)
             location = _vertex_location_for_model(model, given.get("location"))
             
-            # Create provider with Vertex AI mode and ADC
-            provider_instance = GoogleProvider(
-                vertexai=True,
+            # Google Cloud (Vertex AI) with ADC. GoogleProvider(vertexai=True, ...) is
+            # deprecated in pydantic-ai and goes in v2.0.
+            provider_instance = GoogleCloudProvider(
                 project=project_id,
                 location=location
             )

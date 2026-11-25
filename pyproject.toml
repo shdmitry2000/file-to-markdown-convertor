@@ -1,6 +1,6 @@
 [project]
 name = "file-to-markdown-convertor"
-version = "1.6.7.4"
+version = "1.6.7.5"
 description = "Centralized PDF to Markdown conversion service"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -83,7 +83,7 @@ constraint-dependencies = [
     "opencv-python>=4.14.0.94,<5",
     # >>> runtime pins: config/runtime-pins.txt (scripts/sync_runtime_pins.py writes this block)
     "openai==2.54.0",
-    "litellm==1.110.3",
+    "litellm==1.111.0",
     "fastapi==0.163.2",
     "starlette==1.8.0",
     "pydantic==2.14.4",

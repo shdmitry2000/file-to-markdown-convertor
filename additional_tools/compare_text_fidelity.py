@@ -8,7 +8,7 @@ the actual word-level diffs so real text loss is distinguishable from formatting
 
 Usage (source ../.env first for the VLM lane):
   set -a; source ../.env; set +a
-  python compare_text_fidelity.py <pdf> --pages 0,5,10,15,20
+  python additional_tools/compare_text_fidelity.py <pdf> --pages 0,5,10,15,20
 """
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ def run_kreuzberg(path: str) -> str:
 
 def run_vlm(path: str) -> str:
     import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from app.converters.vlm import VLMConverter
     return VLMConverter().convert(Path(path))
 

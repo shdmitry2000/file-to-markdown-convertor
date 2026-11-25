@@ -220,7 +220,7 @@ Every page call uses the platform's shared LLM settings, the same names as every
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_MAX_TOKENS` | `8192` (set `32000` here) | Longest page the model may write |
+| `LLM_MAX_TOKENS` | `64000` (set `32000` here) | Longest page the model may write |
 | `LLM_TEMPERATURE` | `1.0` | Sent on every call; Gemini 3 is never below 1.0 |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | `300` (set `120` here) | One page call. At 120: 3 tries × 120 s + 3 s + the 180 s busy wait = 543 s, under the 600 s stall cut |
 | `LLM_MAX_CONCURRENCY` | `8` | Page calls in flight per worker process; dbank, slides and picture descriptions size their thread pools by it |

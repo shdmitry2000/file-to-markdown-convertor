@@ -12,7 +12,6 @@ or use string-based providers do not need ``pydantic_ai`` installed.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Dict, List
 
 from ...core.factory import LLMFactory
@@ -47,33 +46,17 @@ def get_embedding_config() -> Dict[str, Any]:
 
 def get_embedding(text: str) -> List[float]:
     """Synchronous wrapper around the async embedding client. Returns a single vector."""
-    async def _embed():
-        vecs = await LLMFactory.embedding_client().embedding(text)
-        return vecs[0]
+    from shared.async_utils import run_async
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(_embed())
-
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, _embed()).result()
+    # run_async: one long-lived loop for every sync caller, not asyncio.run per call.
+    return run_async(LLMFactory.embedding_client().embedding(text))[0]
 
 
 def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """Synchronous wrapper around the async embedding client for batch operations."""
-    async def _embed_batch():
-        return await LLMFactory.embedding_client().embedding(texts)
+    from shared.async_utils import run_async
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(_embed_batch())
-
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, _embed_batch()).result()
+    return run_async(LLMFactory.embedding_client().embedding(texts))
 
 
 def get_embedding_client():

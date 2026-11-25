@@ -740,12 +740,17 @@ def _prune_converted_outputs() -> None:
         logger.debug("prune converted outputs: %s", exc)
 
 
-def _read_converted(path: str) -> Dict[str, str]:
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+async def _read_converted(path: str) -> Dict[str, str]:
     if not os.path.exists(path):
         logger.warning(f"Converted file not found: {path}")
         raise HTTPException(status_code=404, detail="Converted file not found")
-    with open(path, "r", encoding="utf-8") as f:
-        return {"content": f.read()}
+    # Off the event loop: a large markdown read here stalled every other request.
+    return {"content": await asyncio.to_thread(_read_text, path)}
 
 
 def _output_path(conversion_id: Optional[str]) -> Optional[str]:
@@ -765,7 +770,7 @@ async def get_conversion_content(conversion_id: str):
     path = _output_path(conversion_id)
     if path is None:
         raise HTTPException(status_code=404, detail="Converted file not found")
-    content = _read_converted(path)
+    content = await _read_converted(path)
     _release_output(conversion_id)
     return content
 
@@ -779,7 +784,7 @@ async def get_converted_file(file_path: str):
     latest_id = latest_conversion_by_name.get(name)
     latest = _output_path(latest_id)
     if latest and os.path.exists(latest):
-        content = _read_converted(latest)
+        content = await _read_converted(latest)
         _release_output(latest_id)
         return content
     # Pre-id outputs were <stem>.md for EVERY source type (the old extension list
@@ -795,10 +800,7 @@ async def get_converted_file(file_path: str):
         raise HTTPException(status_code=404, detail="Converted file not found")
     converted_file_path = lookup_path
 
-    with open(converted_file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    return {"content": content}
+    return {"content": await asyncio.to_thread(_read_text, converted_file_path)}
 
 
 # ==================== DEBUG ENDPOINTS ====================
@@ -879,7 +881,7 @@ async def debug_convert_file(
     # shares the pod's memory limit with the converters.
     with open(temp_path, "wb") as f:
         while chunk := await file.read(1024 * 1024):
-            f.write(chunk)
+            await asyncio.to_thread(f.write, chunk)
     
     file_size = temp_path.stat().st_size
     conversion_id = str(uuid.uuid4())
@@ -1011,8 +1013,7 @@ async def get_converted_result(conversion_id: str, download: bool = False):
     if not output_path or not Path(output_path).exists():
         raise HTTPException(status_code=404, detail="Converted file not found")
     
-    with open(output_path, "r", encoding="utf-8") as f:
-        content = f.read()
+    content = await asyncio.to_thread(_read_text, output_path)
     
     if download:
         return Response(

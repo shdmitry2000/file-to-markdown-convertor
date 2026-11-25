@@ -69,11 +69,6 @@ def ensure_litellm_vertex_env_from_gcp_env() -> None:
             os.environ[ENV_VERTEXAI_LOCATION] = loc
 
 
-# ── OpenAI route policy (only consulted by the openai_compat adapter) ──
-DEFAULT_OPENAI_ROUTE = "auto"
-"""If the proxy speaks OpenAI natively for the configured provider, use it directly;
-otherwise the adapter translation layer."""
-
 # ── Split style: connection type + model name ─────────────────────────
 ENV_LLM_CONNECTOR_TYPE = "LLM_CONNECTOR_TYPE"
 """Connection type of the answer model (vertex_proxy, vertex_ai, openai, anthropic,
@@ -209,8 +204,3 @@ def required_provider() -> str:
 # auto|strict|off, the CA bundle, the legacy SSL_VERIFY); re-exported here for
 # this package's clients.
 tls_verify = httpx_verify
-
-
-def selected_openai_route() -> str:
-    """The OpenAI route policy: always ``auto``."""
-    return DEFAULT_OPENAI_ROUTE

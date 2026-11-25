@@ -7,7 +7,7 @@ litellm -> Vertex (the same provider the rest of the platform uses).
 Run with the repo-root .env sourced so LLM_FACTORY_* + ADC are present:
 
   set -a; source ../.env; set +a
-  python bench_vlm.py <pdf> [--pages 3]
+  python additional_tools/bench_vlm.py <pdf> [--pages 3]
 """
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ from pathlib import Path
 
 import fitz
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))            # for `shared`
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # for `app`
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # for `app`
 
 
 def hebrew_ratio(s: str) -> float:

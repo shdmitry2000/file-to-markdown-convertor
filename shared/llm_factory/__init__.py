@@ -17,8 +17,7 @@ Architecture:
                      and the claude_code client are archived in archive/llm_factory_legacy/)
     adapters/    — framework adapters (consume LLMClient, produce framework objects)
         pydantic_ai/
-        langchain/
-        openai_compat/  (added in Phase 3)
+        langchain/      (the openai_compat adapter is archived in archive/llm_factory_legacy/)
 
 See README.md and docs/ for usage and configuration.
 """

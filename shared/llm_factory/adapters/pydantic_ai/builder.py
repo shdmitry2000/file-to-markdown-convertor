@@ -31,7 +31,7 @@ def build_pydantic_ai_model(provider: str | None = None, creds: Mapping[str, Any
     """Build a pydantic-ai model from LLM_CONNECTOR_TYPE + LLM_TYPE.
 
     Args:
-        provider: Optional explicit provider string (e.g., "vertex_proxy/gemini-2.5-flash").
+        provider: Optional explicit provider string (e.g., "vertex_proxy/gemini-3.5-flash").
             When omitted, reads LLM_CONNECTOR_TYPE + LLM_TYPE.
         creds: Optional credentials for this model (base_url, connector_id, auth_token,
             project, location; the scheme's own, as provider_profiles names them). A field

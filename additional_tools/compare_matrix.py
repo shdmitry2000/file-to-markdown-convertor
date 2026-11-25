@@ -10,7 +10,7 @@ docling is listed first as the baseline. VLM (Vertex) is included unless --no-vl
 
 Usage (source ../.env first so the VLM/Vertex lane works):
   set -a; source ../.env; set +a
-  python compare_matrix.py <pdf> --text-page 0 --table-page 50 [--no-vlm]
+  python additional_tools/compare_matrix.py <pdf> --text-page 0 --table-page 50 [--no-vlm]
 """
 from __future__ import annotations
 
@@ -75,8 +75,8 @@ def run_liteparse(p: Path) -> str:
 
 def run_vlm(p: Path) -> str:
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # shared
-    sys.path.insert(0, str(Path(__file__).resolve().parent))      # app
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # shared
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))      # app
     from app.converters.vlm import VLMConverter
     return VLMConverter().convert(p)
 

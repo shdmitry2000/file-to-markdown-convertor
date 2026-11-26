@@ -51,6 +51,11 @@ def generation_kwargs(
     kwargs: dict[str, Any] = {
         "temperature": generation.temperature_for(model, params),
         "max_tokens": generation.max_tokens_for(params),
+        # litellm 1.111.0 lists no temperature for some Gemini models on vertex_ai
+        # (gemini-3.5-flash-lite, gemini-3.8-flash) and raises UnsupportedParamsError;
+        # Vertex itself accepts it. Send it anyway: litellm's own allow-list, not a
+        # field of the request.
+        "allowed_openai_params": ["temperature"],
     }
     for field in ("top_p", "top_k", "timeout"):
         value = getattr(params, field, None)
